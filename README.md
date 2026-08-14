@@ -431,7 +431,7 @@ No AC charger exists on the reference install; only units **1** (inverter) and
 
 ## Topology drift detection
 
-If your install is unfinished — panels not yet fitted, a battery pack on order —
+If your install is unfinished — a battery pack on order, an EV charger to come —
 the logger needs to notice hardware appearing rather than silently recording
 zeros.
 
@@ -447,9 +447,25 @@ python3 log.py --check        # diff; exits 1 on any change
 - changes to `inverter_pack_count` / `pv_string_count` / `mppt_count`
 - AC-charger slave ids beginning to answer
 
+**It does not catch PV strings arriving.** All 36 documented string voltage/current
+registers answer `ok` from the moment the inverter is up — the populated channels
+reading a clean `0`, the unpopulated ones the `−1` signed sentinel — so the
+`unsupported → ok` transition never happens for them. `pv_string_count` and
+`mppt_count` report the inverter's MPPT hardware capability, not what is physically
+wired, so they do not move either. On the reference unit, a baseline taken before
+any panel was connected and one taken the same day after the arrays were generating
+differed in **nothing but `captured_at`**. Watch per-string voltage in the archive
+instead — the `inv_ac_dc` block already covers all 36 channels. See
+[Findings](docs/FINDINGS.md) for the two gotchas that follow from this.
+
 **Run it deliberately, not on a schedule** — it is a full-map sweep, so it acts as
 a second Modbus client, and concurrent-client behaviour is unmeasured. After an
 installer visit is the right time.
+
+`--baseline` **overwrites** `<data_dir>/topology-baseline.json` in place, so it is
+only ever "the last baseline taken". If a particular snapshot is worth keeping — the
+state before an installer visit, say — copy it aside under its own name first.
+Retention never prunes it: `keep_days` only touches `*.bin.gz`.
 
 ---
 

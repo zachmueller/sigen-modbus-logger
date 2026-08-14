@@ -87,6 +87,18 @@ handles them; anything new must too.
 8. **A single-phase unit reports three phases anyway.** Phase B/C voltages return
    all-ones, phase B/C currents return −1, and only pv1–pv4 are real out of 36
    documented string channels. Those columns are noise, not zeros.
+9. **The dedicated PV registers lag the power registers when DC arrives.** On the
+   tick the array was first energised, the ESS and grid registers already reflected
+   about a kilowatt of production — recoverable as `ess + load − grid` — while
+   `plant_sigen_photovoltaic_power` and every string voltage still read zero. The
+   string voltages caught up one sample later, the PV power register two. Treat the
+   PV register's first nonzero timestamp as a couple of seconds late, not as the
+   moment of connection.
+10. **MPPT sits at open-circuit voltage for ~30 s before it starts tracking.** After
+   the DC side is energised the strings park at full Voc drawing no current, with PV
+   power at zero, then drop to Vmp and ramp to full output within two samples. Full
+   voltage with no current is the startup self-check, not a fault and not a
+   disconnected string.
 
 ---
 
@@ -190,6 +202,60 @@ being an unexplained hole.
 The soak passed 12/12 gates with latency *improving* over its 30 minutes. Wider
 oscillation only became visible across hours. Soaks establish that nothing is
 structurally broken; they do not characterise slow variation.
+
+### 9. Topology drift detection is blind to the hardware you most expect it to catch
+
+`--baseline`/`--check` were built to notice an unfinished install completing. They
+caught nothing when the arrays were energised — a baseline from before any panel was
+connected and one from after they were generating differed in nothing but
+`captured_at`. Two independent reasons, both structural:
+
+- The 36 string voltage/current registers never *refuse*. They answer `ok` from the
+  moment the inverter is up, so the `unsupported → ok` transition the check looks for
+  cannot occur. Populated channels read a clean `0` before connection; unpopulated
+  ones read the `−1` signed sentinel.
+- `pv_string_count` and `mppt_count` are MPPT hardware capability, not a live count
+  of what is wired. They read their final value with nothing connected at all.
+
+The check remains the right tool for a subsystem that is currently refusing its
+registers — an EV charger, an extra battery pack, an AC-charger slave id. It is the
+wrong tool for anything whose registers already answer. Generalise: a diff over
+*register status* only sees hardware that changes its answer from "no such thing" to
+a value, which is a much narrower class than "hardware appeared".
+
+### 10. Simultaneous energisation looks like staged connection mid-transient
+
+Catching the DC bus charging produced a sample with the strings at wildly different
+voltages — some at roughly half of others. Read naively that says two arrays in two
+different states, i.e. connected at different times.
+
+It says the opposite. Compare each string to **its own** settled Voc rather than to
+the other strings: every one was at the same fraction of it, within 0.3 points. Equal
+fractions mean one switching action charging every input together; independent
+connections would show each string arriving at its own full Voc at its own time.
+Strings legitimately differ in Voc because they differ in module count, so absolute
+voltages across strings are not comparable and the ratio between them is a topology
+fact, not an event.
+
+The corollary is that a single isolator closing is *all* you can see. Panels wired
+with the isolator open are invisible until it closes, so per-array connection times
+are not recoverable from Modbus at all — no cadence would have helped.
+
+### 11. Cutting AC to the inverter is indistinguishable from an outage, and rolls a counter back
+
+An installer isolating the inverter to work on it presents exactly as an unreachable
+device: dead ticks, degraded probing, a multi-hour hole. Two things distinguish it
+afterwards, and both look alarming if you do not expect them:
+
+- The **last sample before the device vanished** carried the cause — `alarm2` bit 4,
+  "Off-grid protection", raised two seconds before the running state went to
+  `STANDBY`. The alarm registers are worth decoding across an outage boundary rather
+  than only when something is obviously wrong.
+- A lifetime accumulator came back **lower than it went away** — a fraction of a kWh
+  of grid import lost across the power cycle, which `--check` duly reports as
+  `1 DROPS` next to the monotonicity assertion. It is the device losing an unflushed
+  increment, not archive corruption. Expect one drop per power cut and do not chase
+  it.
 
 ---
 
