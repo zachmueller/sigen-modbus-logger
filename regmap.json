@@ -1,0 +1,3759 @@
+{
+ "_meta": {
+  "source": "TypQxQ/Sigenergy-Local-Modbus @ main custom_components/sigen/modbusregisterdefinitions.py",
+  "generated_by": "scripts/sigen_regmap_gen.py",
+  "conventions": "gain is a DIVISOR: value = raw / gain. 'ro' = input registers (FC4); 'rw' = holding (FC3); 'wo' = write-only, never read."
+ },
+ "alarm_codes": {
+  "PCS_ALARM_CODES": {
+   "0": "Software version mismatch",
+   "1": "Low insulation resistance",
+   "2": "Over-temperature",
+   "3": "Equipment fault",
+   "4": "System grounding fault",
+   "5": "PV string over-voltage",
+   "6": "PV string reversely connected",
+   "7": "PV string back-filling",
+   "8": "AFCI fault",
+   "9": "Grid power outage",
+   "10": "Grid over-voltage",
+   "11": "Grid under-voltage",
+   "12": "Grid over-frequency",
+   "13": "Grid under-frequency",
+   "14": "Grid voltage imbalance",
+   "15": "DC component of output current out of limit"
+  },
+  "PCS_ALARM_CODES2": {
+   "0": "Leak current out of limit",
+   "1": "Communication abnormal",
+   "2": "System internal protection",
+   "3": "AFCI self-checking circuit fault",
+   "4": "Off-grid protection",
+   "5": "Manual operation protection",
+   "7": "Abnormal phase sequence",
+   "8": "Short circuit to PE",
+   "9": "Soft start failure"
+  },
+  "ESS_ALARM_CODES": {
+   "0": "Software version mismatch",
+   "1": "Low insulation resistance to ground",
+   "2": "Temperature too high",
+   "3": "Equipment fault",
+   "4": "Under-temperature",
+   "5": "Internal protection",
+   "6": "Thermal runaway"
+  },
+  "GATEWAY_ALARM_CODES": {
+   "0": "Software version mismatch",
+   "1": "Temperature too high",
+   "2": "Equipment fault",
+   "3": "Excessive leakage current in off-grid output",
+   "4": "N line grounding fault",
+   "5": "Abnormal phase sequence of grid wiring",
+   "6": "Abnormal phase sequence of inverter wiring",
+   "7": "Grid phase loss"
+  },
+  "AC_CHARGER_ALARM_CODES1": {
+   "0": "Grid overvoltage",
+   "1": "Grid undervoltage",
+   "2": "Overload",
+   "3": "Short circuit",
+   "4": "Charging output overcurrent",
+   "5": "Leak current out of limit",
+   "6": "Grounding fault",
+   "7": "Abnormal phase sequence of grid wiring",
+   "8": "PEN Fault"
+  },
+  "AC_CHARGER_ALARM_CODES2": {
+   "0": "Leak current detection circuit fault",
+   "1": "Relay stuck",
+   "2": "Pilot circuit fault",
+   "3": "Auxiliary power supply module fault",
+   "4": "Electric lock fault",
+   "5": "Lamp panel communication fault"
+  },
+  "AC_CHARGER_ALARM_CODES3": {
+   "0": "Too high internal temperature",
+   "1": "Charging cable fault",
+   "2": "Meter communication fault"
+  },
+  "DC_CHARGER_ALARM_CODES": {
+   "0": "Software version mismatch",
+   "1": "Low insulation resistance to ground",
+   "2": "Over-temperature",
+   "3": "Equipment fault",
+   "4": "Charging fault",
+   "5": "Equipment protection"
+  },
+  "PLANT_ALARM_CODES6": {
+   "0": "Gateway communication abnormal",
+   "1": "Meter communication abnormal",
+   "2": "AC power sensor communication abnormal",
+   "6": "Hard protection against grid-feed power limit exceedance",
+   "8": "Generator failure to start",
+   "10": "CLS fault"
+  },
+  "PLANT_ALARM_CODES7": {
+   "0": "OVGR fault",
+   "1": "RPR fault"
+  }
+ },
+ "enums": {
+  "RunningState": {
+   "0": "STANDBY",
+   "1": "RUNNING",
+   "2": "FAULT",
+   "3": "SHUTDOWN",
+   "7": "ENVIRONMENTAL_ABNORMALITY"
+  },
+  "EMSWorkMode": {
+   "0": "MAX_SELF_CONSUMPTION",
+   "1": "AI_MODE",
+   "2": "TOU",
+   "5": "FULL_FEED_IN_TO_GRID",
+   "6": "VPP_SCHEDULING",
+   "7": "REMOTE_EMS",
+   "9": "CUSTOM"
+  },
+  "RemoteEMSControlMode": {
+   "0": "PCS_REMOTE_CONTROL",
+   "1": "STANDBY",
+   "2": "MAXIMUM_SELF_CONSUMPTION",
+   "3": "COMMAND_CHARGING_GRID_FIRST",
+   "4": "COMMAND_CHARGING_PV_FIRST",
+   "5": "COMMAND_DISCHARGING_PV_FIRST",
+   "6": "COMMAND_DISCHARGING_ESS_FIRST",
+   "7": "RESERVED",
+   "8": "V2G"
+  },
+  "OutputType": {
+   "0": "L_N",
+   "1": "L1_L2_L3",
+   "2": "L1_L2_L3_N",
+   "3": "L1_L2_N"
+  },
+  "ACChargerSystemState": {
+   "0": "SYSTEM_INIT",
+   "1": "A1_A2",
+   "2": "B1",
+   "3": "B2",
+   "4": "C1",
+   "5": "C2",
+   "6": "F",
+   "7": "E"
+  },
+  "DCChargerRunningState": {
+   "0": "IDLE",
+   "1": "OCCUPIED",
+   "2": "PREPARING_COMM",
+   "3": "CHARGING",
+   "4": "FAULT",
+   "5": "SCHEDULED",
+   "6": "ENDED",
+   "7": "UNAVAILABLE",
+   "8": "DISCHARGING",
+   "9": "ALARM",
+   "10": "PREPARING_INSULATION"
+  }
+ },
+ "groups": {
+  "PLANT_RUNNING_INFO_REGISTERS": [
+   {
+    "key": "plant_system_time",
+    "addr": 30000,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1,
+    "unit": "s",
+    "desc": "System time (Epoch seconds)"
+   },
+   {
+    "key": "plant_system_timezone",
+    "addr": 30002,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 1,
+    "unit": "min",
+    "desc": "System timezone"
+   },
+   {
+    "key": "plant_ems_work_mode",
+    "addr": 30003,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "EMS work mode"
+   },
+   {
+    "key": "plant_grid_sensor_status",
+    "addr": 30004,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Grid Sensor Status (0: not connected, 1: connected)"
+   },
+   {
+    "key": "plant_grid_sensor_active_power",
+    "addr": 30005,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Grid Active Power (>0 buy from grid; <0 sell to grid)"
+   },
+   {
+    "key": "plant_grid_sensor_reactive_power",
+    "addr": 30007,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Grid Reactive Power"
+   },
+   {
+    "key": "plant_on_off_grid_status",
+    "addr": 30009,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "On/Off Grid status (0: ongrid, 1: offgrid(auto), 2: offgrid(manual))"
+   },
+   {
+    "key": "plant_max_active_power",
+    "addr": 30010,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Max active power"
+   },
+   {
+    "key": "plant_max_apparent_power",
+    "addr": 30012,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kVA",
+    "desc": "Max apparent power"
+   },
+   {
+    "key": "plant_ess_soc",
+    "addr": 30014,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "Battery State of Charge"
+   },
+   {
+    "key": "plant_phase_a_active_power",
+    "addr": 30015,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Plant phase A active power"
+   },
+   {
+    "key": "plant_phase_b_active_power",
+    "addr": 30017,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Plant phase B active power"
+   },
+   {
+    "key": "plant_phase_c_active_power",
+    "addr": 30019,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Plant phase C active power"
+   },
+   {
+    "key": "plant_phase_a_reactive_power",
+    "addr": 30021,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Plant phase A reactive power"
+   },
+   {
+    "key": "plant_phase_b_reactive_power",
+    "addr": 30023,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Plant phase B reactive power"
+   },
+   {
+    "key": "plant_phase_c_reactive_power",
+    "addr": 30025,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Plant phase C reactive power"
+   },
+   {
+    "key": "plant_general_alarm1",
+    "addr": 30027,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "General Alarm1 (Refer to Appendix2)"
+   },
+   {
+    "key": "plant_general_alarm2",
+    "addr": 30028,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "General Alarm2 (Refer to Appendix3)"
+   },
+   {
+    "key": "plant_general_alarm3",
+    "addr": 30029,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "General Alarm3 (Refer to Appendix4)"
+   },
+   {
+    "key": "plant_general_alarm4",
+    "addr": 30030,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "General Alarm4 (Refer to Appendix5)"
+   },
+   {
+    "key": "plant_active_power",
+    "addr": 30031,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Plant active power"
+   },
+   {
+    "key": "plant_reactive_power",
+    "addr": 30033,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Plant reactive power"
+   },
+   {
+    "key": "plant_sigen_photovoltaic_power",
+    "addr": 30035,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Photovoltaic power"
+   },
+   {
+    "key": "plant_ess_power",
+    "addr": 30037,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS power (<0: discharging, >0: charging)"
+   },
+   {
+    "key": "plant_available_max_active_power",
+    "addr": 30039,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Available max active power"
+   },
+   {
+    "key": "plant_available_min_active_power",
+    "addr": 30041,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Available min active power"
+   },
+   {
+    "key": "plant_available_max_reactive_power",
+    "addr": 30043,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Available max reactive power"
+   },
+   {
+    "key": "plant_available_min_reactive_power",
+    "addr": 30045,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Available min reactive power"
+   },
+   {
+    "key": "plant_ess_available_max_charging_power",
+    "addr": 30047,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Available max charging power"
+   },
+   {
+    "key": "plant_ess_available_max_discharging_power",
+    "addr": 30049,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Available max discharging power"
+   },
+   {
+    "key": "plant_running_state",
+    "addr": 30051,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Plant running state (Refer to Appendix1)"
+   },
+   {
+    "key": "plant_grid_sensor_phase_a_active_power",
+    "addr": 30052,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Grid sensor Phase A active power"
+   },
+   {
+    "key": "plant_grid_sensor_phase_b_active_power",
+    "addr": 30054,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Grid sensor Phase B active power"
+   },
+   {
+    "key": "plant_grid_sensor_phase_c_active_power",
+    "addr": 30056,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Grid sensor Phase C active power"
+   },
+   {
+    "key": "plant_grid_sensor_phase_a_reactive_power",
+    "addr": 30058,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Grid sensor Phase A reactive power"
+   },
+   {
+    "key": "plant_grid_sensor_phase_b_reactive_power",
+    "addr": 30060,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Grid sensor Phase B reactive power"
+   },
+   {
+    "key": "plant_grid_sensor_phase_c_reactive_power",
+    "addr": 30062,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Grid sensor Phase C reactive power"
+   },
+   {
+    "key": "plant_ess_available_max_charging_capacity",
+    "addr": 30064,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Available max charging capacity"
+   },
+   {
+    "key": "plant_ess_available_max_discharging_capacity",
+    "addr": 30066,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Available max discharging capacity"
+   },
+   {
+    "key": "plant_ess_rated_charging_power",
+    "addr": 30068,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Rated charging power"
+   },
+   {
+    "key": "plant_ess_rated_discharging_power",
+    "addr": 30070,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Rated discharging power"
+   },
+   {
+    "key": "plant_general_alarm5",
+    "addr": 30072,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "General Alarm5 (Refer to Appendix11)"
+   },
+   {
+    "key": "plant_ess_rated_energy_capacity",
+    "addr": 30083,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS rated energy capacity"
+   },
+   {
+    "key": "plant_ess_charge_cut_off_soc",
+    "addr": 30085,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "ESS charge Cut-Off SOC"
+   },
+   {
+    "key": "plant_ess_discharge_cut_off_soc",
+    "addr": 30086,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "ESS discharge Cut-Off SOC"
+   },
+   {
+    "key": "plant_ess_soh",
+    "addr": 30087,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "Battery State of Health (weighted average of all ESS devices)"
+   },
+   {
+    "key": "plant_accumulated_pv_energy",
+    "addr": 30088,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Plant PV total generation"
+   },
+   {
+    "key": "plant_daily_consumed_energy",
+    "addr": 30092,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total load daily consumption"
+   },
+   {
+    "key": "plant_accumulated_consumed_energy",
+    "addr": 30094,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total load consumption"
+   },
+   {
+    "key": "plant_smart_load_1_total_consumption",
+    "addr": 30098,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 1] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_2_total_consumption",
+    "addr": 30100,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 2] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_3_total_consumption",
+    "addr": 30102,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 3] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_4_total_consumption",
+    "addr": 30104,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 4] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_5_total_consumption",
+    "addr": 30106,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 5] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_6_total_consumption",
+    "addr": 30108,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 6] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_7_total_consumption",
+    "addr": 30110,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 7] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_8_total_consumption",
+    "addr": 30112,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 8] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_9_total_consumption",
+    "addr": 30114,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 9] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_10_total_consumption",
+    "addr": 30116,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 10] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_11_total_consumption",
+    "addr": 30118,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 11] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_12_total_consumption",
+    "addr": 30120,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 12] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_13_total_consumption",
+    "addr": 30122,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 13] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_14_total_consumption",
+    "addr": 30124,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 14] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_15_total_consumption",
+    "addr": 30126,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 15] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_16_total_consumption",
+    "addr": 30128,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 16] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_17_total_consumption",
+    "addr": 30130,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 17] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_18_total_consumption",
+    "addr": 30132,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 18] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_19_total_consumption",
+    "addr": 30134,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 19] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_20_total_consumption",
+    "addr": 30136,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 20] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_21_total_consumption",
+    "addr": 30138,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 21] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_22_total_consumption",
+    "addr": 30140,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 22] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_23_total_consumption",
+    "addr": 30142,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 23] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_24_total_consumption",
+    "addr": 30144,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "[Smart load 24] Total consumption"
+   },
+   {
+    "key": "plant_smart_load_1_power",
+    "addr": 30146,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 1] Power"
+   },
+   {
+    "key": "plant_smart_load_2_power",
+    "addr": 30148,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 2] Power"
+   },
+   {
+    "key": "plant_smart_load_3_power",
+    "addr": 30150,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 3] Power"
+   },
+   {
+    "key": "plant_smart_load_4_power",
+    "addr": 30152,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 4] Power"
+   },
+   {
+    "key": "plant_smart_load_5_power",
+    "addr": 30154,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 5] Power"
+   },
+   {
+    "key": "plant_smart_load_6_power",
+    "addr": 30156,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 6] Power"
+   },
+   {
+    "key": "plant_smart_load_7_power",
+    "addr": 30158,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 7] Power"
+   },
+   {
+    "key": "plant_smart_load_8_power",
+    "addr": 30160,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 8] Power"
+   },
+   {
+    "key": "plant_smart_load_9_power",
+    "addr": 30162,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 9] Power"
+   },
+   {
+    "key": "plant_smart_load_10_power",
+    "addr": 30164,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 10] Power"
+   },
+   {
+    "key": "plant_smart_load_11_power",
+    "addr": 30166,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 11] Power"
+   },
+   {
+    "key": "plant_smart_load_12_power",
+    "addr": 30168,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 12] Power"
+   },
+   {
+    "key": "plant_smart_load_13_power",
+    "addr": 30170,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 13] Power"
+   },
+   {
+    "key": "plant_smart_load_14_power",
+    "addr": 30172,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 14] Power"
+   },
+   {
+    "key": "plant_smart_load_15_power",
+    "addr": 30174,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 15] Power"
+   },
+   {
+    "key": "plant_smart_load_16_power",
+    "addr": 30176,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 16] Power"
+   },
+   {
+    "key": "plant_smart_load_17_power",
+    "addr": 30178,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 17] Power"
+   },
+   {
+    "key": "plant_smart_load_18_power",
+    "addr": 30180,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 18] Power"
+   },
+   {
+    "key": "plant_smart_load_19_power",
+    "addr": 30182,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 19] Power"
+   },
+   {
+    "key": "plant_smart_load_20_power",
+    "addr": 30184,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 20] Power"
+   },
+   {
+    "key": "plant_smart_load_21_power",
+    "addr": 30186,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 21] Power"
+   },
+   {
+    "key": "plant_smart_load_22_power",
+    "addr": 30188,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 22] Power"
+   },
+   {
+    "key": "plant_smart_load_23_power",
+    "addr": 30190,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 23] Power"
+   },
+   {
+    "key": "plant_smart_load_24_power",
+    "addr": 30192,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "[Smart load 24] Power"
+   },
+   {
+    "key": "plant_third_party_photovoltaic_power",
+    "addr": 30194,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Third Party inverter active power"
+   },
+   {
+    "key": "plant_total_generation_of_third_party_inverter",
+    "addr": 30196,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total generation of third party inverter"
+   },
+   {
+    "key": "plant_accumulated_battery_charge_energy",
+    "addr": 30200,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total charged energy of the ESS"
+   },
+   {
+    "key": "plant_accumulated_battery_discharge_energy",
+    "addr": 30204,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total discharged energy of the ESS"
+   },
+   {
+    "key": "plant_total_charged_energy_of_the_evdc",
+    "addr": 30208,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total charged energy of the EVDC"
+   },
+   {
+    "key": "plant_total_discharged_energy_of_the_evdc",
+    "addr": 30212,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total discharged energy of the EVDC"
+   },
+   {
+    "key": "plant_accumulated_grid_import_energy",
+    "addr": 30216,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total imported energy"
+   },
+   {
+    "key": "plant_accumulated_grid_export_energy",
+    "addr": 30220,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total exported energy"
+   },
+   {
+    "key": "plant_total_energy_output_of_oil_fueled_generator",
+    "addr": 30224,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total energy output of oil-fueled generator"
+   },
+   {
+    "key": "plant_total_energy_consumption_of_common_loads",
+    "addr": 30228,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total energy consumption of common loads"
+   },
+   {
+    "key": "plant_total_charged_energy_of_the_evac",
+    "addr": 30232,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total charged energy of the EVAC"
+   },
+   {
+    "key": "plant_total_generation_of_self_pv",
+    "addr": 30236,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total generation of self PV"
+   },
+   {
+    "key": "plant_total_generation_of_third_party_inverter_2",
+    "addr": 30240,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total generation of third party inverter"
+   },
+   {
+    "key": "plant_total_charged_energy_of_the_ess_2",
+    "addr": 30244,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total charged energy of the ESS"
+   },
+   {
+    "key": "plant_total_discharged_energy_of_the_ess_2",
+    "addr": 30248,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total discharged energy of the ESS"
+   },
+   {
+    "key": "plant_total_charged_energy_of_the_evdc_2",
+    "addr": 30252,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total charged energy of the EVDC"
+   },
+   {
+    "key": "plant_total_discharged_energy_of_the_evdc_2",
+    "addr": 30256,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total discharged energy of the EVDC"
+   },
+   {
+    "key": "plant_total_imported_energy_2",
+    "addr": 30260,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total imported energy"
+   },
+   {
+    "key": "plant_total_exported_energy_2",
+    "addr": 30264,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total exported energy"
+   },
+   {
+    "key": "plant_total_energy_output_of_oil_fueled_generator_2",
+    "addr": 30268,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total energy output of oil-fueled generator"
+   },
+   {
+    "key": "plant_grid_code_rated_frequency",
+    "addr": 30276,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "Hz",
+    "desc": "[Grid code] Rated Frequency"
+   },
+   {
+    "key": "plant_grid_code_rated_voltage",
+    "addr": 30277,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "V",
+    "desc": "[Grid code] Rated Voltage"
+   },
+   {
+    "key": "plant_current_control_command_value",
+    "addr": 30279,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Current control command value (Remote Output Control in Japan)"
+   },
+   {
+    "key": "plant_general_alarm6",
+    "addr": 30280,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Merged Alarm6 (Refer to Appendix 12)"
+   },
+   {
+    "key": "plant_general_alarm7",
+    "addr": 30281,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Merged Alarm7 (Refer to Appendix 13)"
+   },
+   {
+    "key": "plant_general_load_power",
+    "addr": 30282,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "General load power"
+   },
+   {
+    "key": "plant_total_load_power",
+    "addr": 30284,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Total load power"
+   },
+   {
+    "key": "plant_pv_total_daily_generation",
+    "addr": 30272,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "PV total daily generation"
+   },
+   {
+    "key": "plant_pv_generation_previous_day",
+    "addr": 30274,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "PV total generation of previous day"
+   },
+   {
+    "key": "plant_ess_average_cell_temperature",
+    "addr": 30286,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "degC",
+    "desc": "ESS Average cell temperature"
+   }
+  ],
+  "PLANT_PARAMETER_REGISTERS": [
+   {
+    "key": "plant_start_stop",
+    "addr": 40000,
+    "count": 1,
+    "rtype": "wo",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Start/Stop (0: Stop 1: Start)"
+   },
+   {
+    "key": "plant_active_power_fixed_target",
+    "addr": 40001,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Active power fixed adjustment target value"
+   },
+   {
+    "key": "plant_reactive_power_fixed_target",
+    "addr": 40003,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Reactive power fixed adjustment target value. Range: [-60.00 * base value, 60.00 * base value]. Takes effect globally regardless of the EMS operating mode."
+   },
+   {
+    "key": "plant_active_power_percentage_target",
+    "addr": 40005,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Active power percentage adjustment target value. Range: [-100.00, 100.00]"
+   },
+   {
+    "key": "plant_qs_ratio_target",
+    "addr": 40006,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Q/S adjustment target value"
+   },
+   {
+    "key": "plant_power_factor_target",
+    "addr": 40007,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 1000,
+    "unit": "",
+    "desc": "Power factor adjustment target value"
+   },
+   {
+    "key": "plant_phase_a_active_power_fixed_target",
+    "addr": 40008,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Phase A active power fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_b_active_power_fixed_target",
+    "addr": 40010,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Phase B active power fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_c_active_power_fixed_target",
+    "addr": 40012,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Phase C active power fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_a_reactive_power_fixed_target",
+    "addr": 40014,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Phase A reactive power fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_b_reactive_power_fixed_target",
+    "addr": 40016,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Phase B reactive power fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_c_reactive_power_fixed_target",
+    "addr": 40018,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Phase C reactive power fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_a_active_power_percentage_target",
+    "addr": 40020,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Phase A Active power percentage adjustment target value"
+   },
+   {
+    "key": "plant_phase_b_active_power_percentage_target",
+    "addr": 40021,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Phase B Active power percentage adjustment target value"
+   },
+   {
+    "key": "plant_phase_c_active_power_percentage_target",
+    "addr": 40022,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Phase C Active power percentage adjustment target value"
+   },
+   {
+    "key": "plant_phase_a_qs_ratio_target",
+    "addr": 40023,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Phase A Q/S fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_b_qs_ratio_target",
+    "addr": 40024,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Phase B Q/S fixed adjustment target value"
+   },
+   {
+    "key": "plant_phase_c_qs_ratio_target",
+    "addr": 40025,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Phase C Q/S fixed adjustment target value"
+   },
+   {
+    "key": "plant_remote_ems_enable",
+    "addr": 40029,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Remote EMS enable (0: disabled 1: enabled). When enabled, the plant's EMS work mode (30003) will switch to remote EMS."
+   },
+   {
+    "key": "plant_independent_phase_power_control_enable",
+    "addr": 40030,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Independent phase power control enable (0: disabled 1: enabled)"
+   },
+   {
+    "key": "plant_remote_ems_control_mode",
+    "addr": 40031,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Remote EMS control mode"
+   },
+   {
+    "key": "plant_ess_max_charging_limit",
+    "addr": 40032,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS max charging limit"
+   },
+   {
+    "key": "plant_ess_max_discharging_limit",
+    "addr": 40034,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS max discharging limit"
+   },
+   {
+    "key": "plant_pv_max_power_limit",
+    "addr": 40036,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "PV max power limit"
+   },
+   {
+    "key": "plant_grid_point_maximum_export_limitation",
+    "addr": 40038,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "",
+    "desc": "Grid Point Maximum export limitation"
+   },
+   {
+    "key": "plant_grid_maximum_import_limitation",
+    "addr": 40040,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "",
+    "desc": "Grid Point Maximum import limitation"
+   },
+   {
+    "key": "plant_pcs_maximum_export_limitation",
+    "addr": 40042,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "",
+    "desc": "PCS maximum export limitation. Range: [0, 0xFFFFFFFE]. With value 0xFFFFFFFF, register is not valid. Takes effect globally."
+   },
+   {
+    "key": "plant_pcs_maximum_import_limitation",
+    "addr": 40044,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "",
+    "desc": "PCS maximum import limitation. Range: [0, 0xFFFFFFFE]. With value 0xFFFFFFFF, register is not valid. Takes effect globally."
+   },
+   {
+    "key": "plant_backup_soc",
+    "addr": 40046,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "[ESS]Backup SOC. Range: [0,100.0]"
+   },
+   {
+    "key": "plant_charge_cut_off_soc",
+    "addr": 40047,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "[ESS]Charge Cut-Off SOC. Range: [0,100.0]"
+   },
+   {
+    "key": "plant_discharge_cut_off_soc",
+    "addr": 40048,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "[ESS]Discharge Cut-Off SOC. Range: [0,100.0]"
+   },
+   {
+    "key": "plant_active_power_regulation_gradient",
+    "addr": 40049,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "%/s",
+    "desc": "[Grid code] Active power regulation gradient. Range: [0, 5000]"
+   },
+   {
+    "key": "plant_lvrt_enable",
+    "addr": 40051,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] LVRT enable (0: Disable, 1: Enable)"
+   },
+   {
+    "key": "plant_lvrt_reactive_power_comp_factor",
+    "addr": 40052,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "",
+    "desc": "[Grid code] LVRT reactive power compensation factor. Range: [0, 10.0]"
+   },
+   {
+    "key": "plant_lvrt_neg_seq_reactive_power_comp_factor",
+    "addr": 40053,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "",
+    "desc": "[Grid code] LVRT negative-sequence reactive power compensation factor. Range: [0, 10.0]"
+   },
+   {
+    "key": "plant_lvrt_mode",
+    "addr": 40054,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] LVRT mode. Enum: (0, 2, 3, 4, 5)"
+   },
+   {
+    "key": "plant_lvrt_grid_voltage_protection_blocking",
+    "addr": 40055,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] LVRT grid voltage protection blocking (0: Not block, 1: Block)"
+   },
+   {
+    "key": "plant_hvrt_enable",
+    "addr": 40056,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] HVRT enable (0: Disable, 1: Enable)"
+   },
+   {
+    "key": "plant_hvrt_reactive_power_comp_factor",
+    "addr": 40057,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "",
+    "desc": "[Grid code] HVRT reactive power compensation factor. Range: [0, 10.0]"
+   },
+   {
+    "key": "plant_hvrt_neg_seq_reactive_power_comp_factor",
+    "addr": 40058,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "",
+    "desc": "[Grid code] HVRT negative-sequence reactive power compensation factor. Range: [0, 10.0]"
+   },
+   {
+    "key": "plant_hvrt_mode",
+    "addr": 40059,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] HVRT mode. Enum: (0, 2, 3, 4, 5)"
+   },
+   {
+    "key": "plant_hvrt_grid_voltage_protection_blocking",
+    "addr": 40060,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] HVRT grid voltage protection blocking (0: Not block, 1: Block)"
+   },
+   {
+    "key": "plant_over_freq_derating_enable",
+    "addr": 40061,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] Over-frequency derating enable (0: Disable, 1: Enable)"
+   },
+   {
+    "key": "plant_over_freq_derating_power_ramp_rate",
+    "addr": 40062,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "[Grid code] Over-frequency derating power ramp rate. Range: [0, 100.0]"
+   },
+   {
+    "key": "plant_over_freq_derating_trigger_freq",
+    "addr": 40063,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "Hz",
+    "desc": "[Grid code] Over-frequency derating trigger frequency. Range: [1.0*Fn, 1.2*Fn]"
+   },
+   {
+    "key": "plant_over_freq_derating_cutoff_freq",
+    "addr": 40064,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "Hz",
+    "desc": "[Grid code] Over-frequency derating cut-off frequency. Range: [1.0*Fn, 1.2*Fn]"
+   },
+   {
+    "key": "plant_under_freq_power_boost_enable",
+    "addr": 40065,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[Grid code] Under-frequency power boost enable (0: Disable, 1: Enable)"
+   },
+   {
+    "key": "plant_under_freq_power_boost_power_ramp_rate",
+    "addr": 40066,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "[Grid code] Under-frequency power boost power ramp rate. Range: [0, 100.0]"
+   },
+   {
+    "key": "plant_under_freq_power_boost_trigger_freq",
+    "addr": 40067,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "Hz",
+    "desc": "[Grid code] Under-frequency power boost trigger frequency. Range: [0.8*Fn, 1.0*Fn]"
+   },
+   {
+    "key": "plant_under_freq_power_boost_cutoff_freq",
+    "addr": 40068,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "Hz",
+    "desc": "[Grid code] Under-frequency power boost cut-off frequency. Range: [0.8*Fn, 1.0*Fn]"
+   },
+   {
+    "key": "plant_pcc_power_factor_grid_import",
+    "addr": 40157,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 1000,
+    "unit": "",
+    "desc": "PCC Power factor adjustment (Grid import). Range: (-1, -0.8] \u222a [0.8, 1]"
+   },
+   {
+    "key": "plant_pcc_power_factor_grid_export",
+    "addr": 40158,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 1000,
+    "unit": "",
+    "desc": "PCC Power factor adjustment (Grid export). Range: (-1, -0.8] \u222a [0.8, 1]"
+   },
+   {
+    "key": "plant_grid_power_loss_lockout_alarm_clear",
+    "addr": 40159,
+    "count": 1,
+    "rtype": "wo",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Grid Power Loss Lockout Alarm Clear (1 = clear)"
+   }
+  ],
+  "PLANT_ESS_PREHEATING_REGISTERS": [
+   {
+    "key": "plant_ess_preheating_enable",
+    "addr": 50000,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "ESS preheating enable (0: disable, 1: enable)"
+   },
+   {
+    "key": "plant_ess_preheating_mode",
+    "addr": 50001,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "ESS preheating mode (0: automatic, 1: manual)"
+   },
+   {
+    "key": "plant_ess_preheating_advance_enable",
+    "addr": 50002,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "ESS preheating advance enable (0: disable, 1: enable)"
+   }
+  ],
+  "INVERTER_RUNNING_INFO_REGISTERS": [
+   {
+    "key": "inverter_model_type",
+    "addr": 30500,
+    "count": 15,
+    "rtype": "ro",
+    "dtype": "STRING",
+    "gain": 1,
+    "unit": "",
+    "desc": "Model Type"
+   },
+   {
+    "key": "inverter_serial_number",
+    "addr": 30515,
+    "count": 10,
+    "rtype": "ro",
+    "dtype": "STRING",
+    "gain": 1,
+    "unit": "",
+    "desc": "Serial Number"
+   },
+   {
+    "key": "inverter_machine_firmware_version",
+    "addr": 30525,
+    "count": 15,
+    "rtype": "ro",
+    "dtype": "STRING",
+    "gain": 1,
+    "unit": "",
+    "desc": "Firmware Version"
+   },
+   {
+    "key": "inverter_rated_active_power",
+    "addr": 30540,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Rated Active Power"
+   },
+   {
+    "key": "inverter_max_apparent_power",
+    "addr": 30542,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kVA",
+    "desc": "Max. Apparent Power"
+   },
+   {
+    "key": "inverter_max_active_power",
+    "addr": 30544,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Max. Active Power"
+   },
+   {
+    "key": "inverter_max_absorption_power",
+    "addr": 30546,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Max. Absorption Power"
+   },
+   {
+    "key": "inverter_rated_battery_capacity",
+    "addr": 30548,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Rated Battery Capacity"
+   },
+   {
+    "key": "inverter_ess_rated_charge_power",
+    "addr": 30550,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Rated Charge Power"
+   },
+   {
+    "key": "inverter_ess_rated_discharge_power",
+    "addr": 30552,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Rated Discharge Power"
+   },
+   {
+    "key": "inverter_ess_daily_charge_energy",
+    "addr": 30566,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Daily Charge Energy"
+   },
+   {
+    "key": "inverter_ess_accumulated_charge_energy",
+    "addr": 30568,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Accumulated Charge Energy"
+   },
+   {
+    "key": "inverter_ess_daily_discharge_energy",
+    "addr": 30572,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Daily Discharge Energy"
+   },
+   {
+    "key": "inverter_ess_accumulated_discharge_energy",
+    "addr": 30574,
+    "count": 4,
+    "rtype": "ro",
+    "dtype": "U64",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Accumulated Discharge Energy"
+   },
+   {
+    "key": "inverter_running_state",
+    "addr": 30578,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Running State (Refer to Appendix 1)"
+   },
+   {
+    "key": "inverter_max_active_power_adjustment_value",
+    "addr": 30579,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Max. Active Power Adjustment Value"
+   },
+   {
+    "key": "inverter_min_active_power_adjustment_value",
+    "addr": 30581,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Min. Active Power Adjustment Value"
+   },
+   {
+    "key": "inverter_max_reactive_power_adjustment_value_fed",
+    "addr": 30583,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Max. Reactive Power Adjustment Value Fed to AC Terminal"
+   },
+   {
+    "key": "inverter_max_reactive_power_adjustment_value_absorbed",
+    "addr": 30585,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Max. Reactive Power Adjustment Value Absorbed from AC Terminal"
+   },
+   {
+    "key": "inverter_active_power",
+    "addr": 30587,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Active Power"
+   },
+   {
+    "key": "inverter_reactive_power",
+    "addr": 30589,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Reactive Power"
+   },
+   {
+    "key": "inverter_ess_max_battery_charge_power",
+    "addr": 30591,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Max. Battery Charge Power"
+   },
+   {
+    "key": "inverter_ess_max_battery_discharge_power",
+    "addr": 30593,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Max. Battery Discharge Power"
+   },
+   {
+    "key": "inverter_ess_available_battery_charge_energy",
+    "addr": 30595,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Available Battery Charge Energy"
+   },
+   {
+    "key": "inverter_ess_available_battery_discharge_energy",
+    "addr": 30597,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "ESS Available Battery Discharge Energy"
+   },
+   {
+    "key": "inverter_ess_charge_discharge_power",
+    "addr": 30599,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "ESS Charge/Discharge Power"
+   },
+   {
+    "key": "inverter_ess_battery_soc",
+    "addr": 30601,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "Battery State of Charge"
+   },
+   {
+    "key": "inverter_ess_battery_soh",
+    "addr": 30602,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "Battery State of Health"
+   },
+   {
+    "key": "inverter_ess_average_cell_temperature",
+    "addr": 30603,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "degC",
+    "desc": "Battery Average Cell Temperature"
+   },
+   {
+    "key": "inverter_ess_average_cell_voltage",
+    "addr": 30604,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1000,
+    "unit": "V",
+    "desc": "Battery Average Cell Voltage"
+   },
+   {
+    "key": "inverter_alarm1",
+    "addr": 30605,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm1 (Refer to Appendix 2)"
+   },
+   {
+    "key": "inverter_alarm2",
+    "addr": 30606,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm2 (Refer to Appendix 3)"
+   },
+   {
+    "key": "inverter_alarm3",
+    "addr": 30607,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm3 (Refer to Appendix 4)"
+   },
+   {
+    "key": "inverter_alarm4",
+    "addr": 30608,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm4 (Refer to Appendix 5)"
+   },
+   {
+    "key": "inverter_alarm5",
+    "addr": 30609,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm5 (Refer to Appendix 11)"
+   },
+   {
+    "key": "inverter_ess_maximum_battery_temperature",
+    "addr": 30620,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "degC",
+    "desc": "Battery Maximum Temperature"
+   },
+   {
+    "key": "inverter_ess_minimum_battery_temperature",
+    "addr": 30621,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "degC",
+    "desc": "Battery Minimum Temperature"
+   },
+   {
+    "key": "inverter_ess_maximum_battery_cell_voltage",
+    "addr": 30622,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1000,
+    "unit": "V",
+    "desc": "Battery Maximum Cell Voltage"
+   },
+   {
+    "key": "inverter_ess_minimum_battery_cell_voltage",
+    "addr": 30623,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1000,
+    "unit": "V",
+    "desc": "Battery Minimum Cell Voltage"
+   },
+   {
+    "key": "inverter_rated_grid_voltage",
+    "addr": 31000,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "Rated Grid Voltage"
+   },
+   {
+    "key": "inverter_rated_grid_frequency",
+    "addr": 31001,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "Hz",
+    "desc": "Rated Grid Frequency"
+   },
+   {
+    "key": "inverter_grid_frequency",
+    "addr": 31002,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 100,
+    "unit": "Hz",
+    "desc": "Grid Frequency"
+   },
+   {
+    "key": "inverter_pcs_internal_temperature",
+    "addr": 31003,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "degC",
+    "desc": "PCS Internal Temperature"
+   },
+   {
+    "key": "inverter_output_type",
+    "addr": 31004,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Output Type (0: L/N, 1: L1/L2/L3, 2: L1/L2/L3/N, 3: L1/L2/N)"
+   },
+   {
+    "key": "inverter_ab_line_voltage",
+    "addr": 31005,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "V",
+    "desc": "A-B Line Voltage"
+   },
+   {
+    "key": "inverter_bc_line_voltage",
+    "addr": 31007,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "V",
+    "desc": "B-C Line Voltage"
+   },
+   {
+    "key": "inverter_ca_line_voltage",
+    "addr": 31009,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "V",
+    "desc": "C-A Line Voltage"
+   },
+   {
+    "key": "inverter_phase_a_voltage",
+    "addr": 31011,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "V",
+    "desc": "Phase A Voltage"
+   },
+   {
+    "key": "inverter_phase_b_voltage",
+    "addr": 31013,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "V",
+    "desc": "Phase B Voltage"
+   },
+   {
+    "key": "inverter_phase_c_voltage",
+    "addr": 31015,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "V",
+    "desc": "Phase C Voltage"
+   },
+   {
+    "key": "inverter_phase_a_current",
+    "addr": 31017,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 100,
+    "unit": "A",
+    "desc": "Phase A Current"
+   },
+   {
+    "key": "inverter_phase_b_current",
+    "addr": 31019,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 100,
+    "unit": "A",
+    "desc": "Phase B Current"
+   },
+   {
+    "key": "inverter_phase_c_current",
+    "addr": 31021,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 100,
+    "unit": "A",
+    "desc": "Phase C Current"
+   },
+   {
+    "key": "inverter_power_factor",
+    "addr": 31023,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1000,
+    "unit": "",
+    "desc": "Power Factor"
+   },
+   {
+    "key": "inverter_pack_count",
+    "addr": 31024,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "PACK Count"
+   },
+   {
+    "key": "inverter_pv_string_count",
+    "addr": 31025,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "PV String Count"
+   },
+   {
+    "key": "inverter_mppt_count",
+    "addr": 31026,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "MPPT Count"
+   },
+   {
+    "key": "inverter_pv1_voltage",
+    "addr": 31027,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV1 Voltage"
+   },
+   {
+    "key": "inverter_pv1_current",
+    "addr": 31028,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV1 Current"
+   },
+   {
+    "key": "inverter_pv2_voltage",
+    "addr": 31029,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV2 Voltage"
+   },
+   {
+    "key": "inverter_pv2_current",
+    "addr": 31030,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV2 Current"
+   },
+   {
+    "key": "inverter_pv3_voltage",
+    "addr": 31031,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV3 Voltage"
+   },
+   {
+    "key": "inverter_pv3_current",
+    "addr": 31032,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV3 Current"
+   },
+   {
+    "key": "inverter_pv4_voltage",
+    "addr": 31033,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV4 Voltage"
+   },
+   {
+    "key": "inverter_pv4_current",
+    "addr": 31034,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV4 Current"
+   },
+   {
+    "key": "inverter_pv_power",
+    "addr": 31035,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "PV Power"
+   },
+   {
+    "key": "inverter_insulation_resistance",
+    "addr": 31037,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1000,
+    "unit": "M\u03a9",
+    "desc": "Insulation Resistance"
+   },
+   {
+    "key": "inverter_startup_time",
+    "addr": 31038,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1,
+    "unit": "s",
+    "desc": "Startup Time"
+   },
+   {
+    "key": "inverter_shutdown_time",
+    "addr": 31040,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1,
+    "unit": "s",
+    "desc": "Shutdown Time"
+   },
+   {
+    "key": "inverter_pv5_voltage",
+    "addr": 31042,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV5 Voltage"
+   },
+   {
+    "key": "inverter_pv5_current",
+    "addr": 31043,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV5 Current"
+   },
+   {
+    "key": "inverter_pv6_voltage",
+    "addr": 31044,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV6 Voltage"
+   },
+   {
+    "key": "inverter_pv6_current",
+    "addr": 31045,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV6 Current"
+   },
+   {
+    "key": "inverter_pv7_voltage",
+    "addr": 31046,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV7 Voltage"
+   },
+   {
+    "key": "inverter_pv7_current",
+    "addr": 31047,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV7 Current"
+   },
+   {
+    "key": "inverter_pv8_voltage",
+    "addr": 31048,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV8 Voltage"
+   },
+   {
+    "key": "inverter_pv8_current",
+    "addr": 31049,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV8 Current"
+   },
+   {
+    "key": "inverter_pv9_voltage",
+    "addr": 31050,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV9 Voltage"
+   },
+   {
+    "key": "inverter_pv9_current",
+    "addr": 31051,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV9 Current"
+   },
+   {
+    "key": "inverter_pv10_voltage",
+    "addr": 31052,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV10 Voltage"
+   },
+   {
+    "key": "inverter_pv10_current",
+    "addr": 31053,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV10 Current"
+   },
+   {
+    "key": "inverter_pv11_voltage",
+    "addr": 31054,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV11 Voltage"
+   },
+   {
+    "key": "inverter_pv11_current",
+    "addr": 31055,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV11 Current"
+   },
+   {
+    "key": "inverter_pv12_voltage",
+    "addr": 31056,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV12 Voltage"
+   },
+   {
+    "key": "inverter_pv12_current",
+    "addr": 31057,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV12 Current"
+   },
+   {
+    "key": "inverter_pv13_voltage",
+    "addr": 31058,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV13 Voltage"
+   },
+   {
+    "key": "inverter_pv13_current",
+    "addr": 31059,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV13 Current"
+   },
+   {
+    "key": "inverter_pv14_voltage",
+    "addr": 31060,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV14 Voltage"
+   },
+   {
+    "key": "inverter_pv14_current",
+    "addr": 31061,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV14 Current"
+   },
+   {
+    "key": "inverter_pv15_voltage",
+    "addr": 31062,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV15 Voltage"
+   },
+   {
+    "key": "inverter_pv15_current",
+    "addr": 31063,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV15 Current"
+   },
+   {
+    "key": "inverter_pv16_voltage",
+    "addr": 31064,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV16 Voltage"
+   },
+   {
+    "key": "inverter_pv16_current",
+    "addr": 31065,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV16 Current"
+   },
+   {
+    "key": "inverter_pv17_voltage",
+    "addr": 31066,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV17 Voltage"
+   },
+   {
+    "key": "inverter_pv17_current",
+    "addr": 31067,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV17 Current"
+   },
+   {
+    "key": "inverter_pv18_voltage",
+    "addr": 31068,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV18 Voltage"
+   },
+   {
+    "key": "inverter_pv18_current",
+    "addr": 31069,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV18 Current"
+   },
+   {
+    "key": "inverter_pv19_voltage",
+    "addr": 31070,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV19 Voltage"
+   },
+   {
+    "key": "inverter_pv19_current",
+    "addr": 31071,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV19 Current"
+   },
+   {
+    "key": "inverter_pv20_voltage",
+    "addr": 31072,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV20 Voltage"
+   },
+   {
+    "key": "inverter_pv20_current",
+    "addr": 31073,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV20 Current"
+   },
+   {
+    "key": "inverter_pv21_voltage",
+    "addr": 31074,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV21 Voltage"
+   },
+   {
+    "key": "inverter_pv21_current",
+    "addr": 31075,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV21 Current"
+   },
+   {
+    "key": "inverter_pv22_voltage",
+    "addr": 31076,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV22 Voltage"
+   },
+   {
+    "key": "inverter_pv22_current",
+    "addr": 31077,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV22 Current"
+   },
+   {
+    "key": "inverter_pv23_voltage",
+    "addr": 31078,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV23 Voltage"
+   },
+   {
+    "key": "inverter_pv23_current",
+    "addr": 31079,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV23 Current"
+   },
+   {
+    "key": "inverter_pv24_voltage",
+    "addr": 31080,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV24 Voltage"
+   },
+   {
+    "key": "inverter_pv24_current",
+    "addr": 31081,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV24 Current"
+   },
+   {
+    "key": "inverter_pv25_voltage",
+    "addr": 31082,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV25 Voltage"
+   },
+   {
+    "key": "inverter_pv25_current",
+    "addr": 31083,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV25 Current"
+   },
+   {
+    "key": "inverter_pv26_voltage",
+    "addr": 31084,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV26 Voltage"
+   },
+   {
+    "key": "inverter_pv26_current",
+    "addr": 31085,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV26 Current"
+   },
+   {
+    "key": "inverter_pv27_voltage",
+    "addr": 31086,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV27 Voltage"
+   },
+   {
+    "key": "inverter_pv27_current",
+    "addr": 31087,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV27 Current"
+   },
+   {
+    "key": "inverter_pv28_voltage",
+    "addr": 31088,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV28 Voltage"
+   },
+   {
+    "key": "inverter_pv28_current",
+    "addr": 31089,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV28 Current"
+   },
+   {
+    "key": "inverter_pv29_voltage",
+    "addr": 31090,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV29 Voltage"
+   },
+   {
+    "key": "inverter_pv29_current",
+    "addr": 31091,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV29 Current"
+   },
+   {
+    "key": "inverter_pv30_voltage",
+    "addr": 31092,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV30 Voltage"
+   },
+   {
+    "key": "inverter_pv30_current",
+    "addr": 31093,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV30 Current"
+   },
+   {
+    "key": "inverter_pv31_voltage",
+    "addr": 31094,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV31 Voltage"
+   },
+   {
+    "key": "inverter_pv31_current",
+    "addr": 31095,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV31 Current"
+   },
+   {
+    "key": "inverter_pv32_voltage",
+    "addr": 31096,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV32 Voltage"
+   },
+   {
+    "key": "inverter_pv32_current",
+    "addr": 31097,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV32 Current"
+   },
+   {
+    "key": "inverter_pv33_voltage",
+    "addr": 31098,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV33 Voltage"
+   },
+   {
+    "key": "inverter_pv33_current",
+    "addr": 31099,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV33 Current"
+   },
+   {
+    "key": "inverter_pv34_voltage",
+    "addr": 31100,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV34 Voltage"
+   },
+   {
+    "key": "inverter_pv34_current",
+    "addr": 31101,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV34 Current"
+   },
+   {
+    "key": "inverter_pv35_voltage",
+    "addr": 31102,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV35 Voltage"
+   },
+   {
+    "key": "inverter_pv35_current",
+    "addr": 31103,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV35 Current"
+   },
+   {
+    "key": "inverter_pv36_voltage",
+    "addr": 31104,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "PV36 Voltage"
+   },
+   {
+    "key": "inverter_pv36_current",
+    "addr": 31105,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "A",
+    "desc": "PV36 Current"
+   },
+   {
+    "key": "inverter_active_power_fixed_value_adjustment_feedback",
+    "addr": 30613,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Active power fixed value adjustment feedback"
+   },
+   {
+    "key": "inverter_reactive_power_fixed_value_adjustment_feedback",
+    "addr": 30615,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Reactive power fixed value adjustment feedback"
+   },
+   {
+    "key": "inverter_active_power_percentage_adjustment_feedback",
+    "addr": 30617,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Active power percentage adjustment feedback"
+   },
+   {
+    "key": "inverter_reactive_power_qs_adjustment_feedback",
+    "addr": 30618,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Reactive power Q/S adjustment feedback"
+   },
+   {
+    "key": "inverter_power_factor_adjustment_feedback",
+    "addr": 30619,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "S16",
+    "gain": 1000,
+    "unit": "",
+    "desc": "Power factor adjustment feedback"
+   },
+   {
+    "key": "inverter_daily_pv_energy",
+    "addr": 31509,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "PV daily generation"
+   },
+   {
+    "key": "inverter_accumulated_pv_energy",
+    "addr": 31511,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "PV total generation"
+   }
+  ],
+  "INVERTER_PARAMETER_REGISTERS": [
+   {
+    "key": "inverter_start_stop",
+    "addr": 40500,
+    "count": 1,
+    "rtype": "wo",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Start/Stop inverter (0: Stop 1: Start)"
+   },
+   {
+    "key": "inverter_active_power_fixed_adjustment",
+    "addr": 41501,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Active power fixed value adjustment"
+   },
+   {
+    "key": "inverter_reactive_power_fixed_adjustment",
+    "addr": 41503,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kvar",
+    "desc": "Reactive power fixed value adjustment"
+   },
+   {
+    "key": "inverter_active_power_percentage_adjustment",
+    "addr": 41505,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Active power percentage adjustment"
+   },
+   {
+    "key": "inverter_reactive_power_qs_adjustment",
+    "addr": 41506,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 100,
+    "unit": "%",
+    "desc": "Reactive power Q/S adjustment"
+   },
+   {
+    "key": "inverter_power_factor_adjustment",
+    "addr": 41507,
+    "count": 1,
+    "rtype": "rw",
+    "dtype": "S16",
+    "gain": 1000,
+    "unit": "",
+    "desc": "Power factor adjustment"
+   }
+  ],
+  "AC_CHARGER_RUNNING_INFO_REGISTERS": [
+   {
+    "key": "ac_charger_system_state",
+    "addr": 32000,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "System states according to IEC61851-1 definition"
+   },
+   {
+    "key": "ac_charger_total_energy_consumed",
+    "addr": 32001,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total energy consumed"
+   },
+   {
+    "key": "ac_charger_charging_power",
+    "addr": 32003,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Charging power"
+   },
+   {
+    "key": "ac_charger_rated_power",
+    "addr": 32005,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Rated power"
+   },
+   {
+    "key": "ac_charger_rated_current",
+    "addr": 32007,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 100,
+    "unit": "A",
+    "desc": "Rated current"
+   },
+   {
+    "key": "ac_charger_rated_voltage",
+    "addr": 32009,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "Rated voltage"
+   },
+   {
+    "key": "ac_charger_input_breaker_rated_current",
+    "addr": 32010,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 100,
+    "unit": "A",
+    "desc": "AC-Charger input breaker rated current"
+   },
+   {
+    "key": "ac_charger_alarm1",
+    "addr": 32012,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm1"
+   },
+   {
+    "key": "ac_charger_alarm2",
+    "addr": 32013,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm2"
+   },
+   {
+    "key": "ac_charger_alarm3",
+    "addr": 32014,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Alarm3"
+   }
+  ],
+  "AC_CHARGER_PARAMETER_REGISTERS": [
+   {
+    "key": "ac_charger_start_stop",
+    "addr": 42000,
+    "count": 1,
+    "rtype": "wo",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "Start/Stop AC Charger (0: Start 1: Stop)"
+   },
+   {
+    "key": "ac_charger_output_current",
+    "addr": 42001,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "A",
+    "desc": "Charger output current ([6, X] X is the smaller value between the rated current and the AC-Charger input breaker rated current.)"
+   }
+  ],
+  "DC_CHARGER_RUNNING_INFO_REGISTERS": [
+   {
+    "key": "dc_charger_vehicle_battery_voltage",
+    "addr": 31500,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "V",
+    "desc": "DC Charger Vehicle Battery Voltage"
+   },
+   {
+    "key": "dc_charger_charging_current",
+    "addr": 31501,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "A",
+    "desc": "DC Charger Charging Current"
+   },
+   {
+    "key": "dc_charger_output_power",
+    "addr": 31502,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "S32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "DC Charger Output Power"
+   },
+   {
+    "key": "dc_charger_vehicle_soc",
+    "addr": 31504,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "%",
+    "desc": "DC Charger Vehicle SOC"
+   },
+   {
+    "key": "dc_charger_current_charging_capacity",
+    "addr": 31505,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "DC Charger Current Charging Capacity (Single Time)"
+   },
+   {
+    "key": "dc_charger_current_charging_duration",
+    "addr": 31507,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1,
+    "unit": "s",
+    "desc": "DC Charger Current Charging Duration (Single Time)"
+   },
+   {
+    "key": "dc_charger_running_state",
+    "addr": 31513,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "[DC Charger] Running state (Refer to Appendix 14)"
+   },
+   {
+    "key": "dc_charger_discharging_current",
+    "addr": 31514,
+    "count": 1,
+    "rtype": "ro",
+    "dtype": "U16",
+    "gain": 10,
+    "unit": "A",
+    "desc": "Discharging current"
+   },
+   {
+    "key": "dc_charger_current_discharging_capacity",
+    "addr": 31515,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Current discharging capacity (single time)"
+   },
+   {
+    "key": "dc_charger_current_discharging_duration",
+    "addr": 31517,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1,
+    "unit": "s",
+    "desc": "Current discharging duration (single time)"
+   },
+   {
+    "key": "dc_charger_total_charging_capacity",
+    "addr": 31519,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total charging capacity"
+   },
+   {
+    "key": "dc_charger_total_discharging_capacity",
+    "addr": 31521,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 100,
+    "unit": "kWh",
+    "desc": "Total discharging capacity"
+   },
+   {
+    "key": "dc_charger_rated_charging_power",
+    "addr": 31523,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Rated charging power"
+   },
+   {
+    "key": "dc_charger_rated_discharging_power",
+    "addr": 31525,
+    "count": 2,
+    "rtype": "ro",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Rated discharging power"
+   }
+  ],
+  "DC_CHARGER_PARAMETER_REGISTERS": [
+   {
+    "key": "dc_charger_start_stop",
+    "addr": 41000,
+    "count": 1,
+    "rtype": "wo",
+    "dtype": "U16",
+    "gain": 1,
+    "unit": "",
+    "desc": "DC Charger Start/Stop (0: Start 1: Stop)"
+   },
+   {
+    "key": "dc_charger_max_charging_power_limit",
+    "addr": 41002,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Max charging power limit [0, rated]"
+   },
+   {
+    "key": "dc_charger_max_discharging_power_limit",
+    "addr": 41004,
+    "count": 2,
+    "rtype": "rw",
+    "dtype": "U32",
+    "gain": 1000,
+    "unit": "kW",
+    "desc": "Max discharging power limit [0, rated]"
+   }
+  ]
+ }
+}

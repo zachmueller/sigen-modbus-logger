@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent alternative to launchd.plist.template, for a host that auto-logins.
+     An agent only runs inside a login session, so on a headless machine with no
+     auto-login it will NOT come back after an unattended reboot -- which is why the
+     LaunchDaemon is the default. Install to ~/Library/LaunchAgents and load with
+     `launchctl bootstrap gui/$(id -u)`. No UserName key: an agent already runs as
+     the logged-in user. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@LABEL@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PYTHON@</string>
+		<string>-u</string>
+		<string>@INSTALL_DIR@/log.py</string>
+		<string>--seconds</string>
+		<string>0</string>
+		<string>--out</string>
+		<string>@DATA_DIR@</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>@INSTALL_DIR@</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>@LOG_DIR@/sigen.log</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG_DIR@/sigen.err</string>
+</dict>
+</plist>

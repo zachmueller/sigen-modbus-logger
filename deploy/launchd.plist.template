@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by deploy/install-daemon.sh via `config.py --render`. Do not install
+     this file directly: the placeholders below are filled from config.json. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@LABEL@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PYTHON@</string>
+		<!-- -u or stdout buffering hides the 5-minute heartbeat entirely -->
+		<string>-u</string>
+		<string>@INSTALL_DIR@/log.py</string>
+		<string>--seconds</string>
+		<string>0</string>
+		<string>--out</string>
+		<string>@DATA_DIR@</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>@INSTALL_DIR@</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- So a crash loop cannot hot-spin -->
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<!-- Run as a normal user, not root: nothing here needs privilege -->
+	<key>UserName</key>
+	<string>@USER@</string>
+	<!-- Interactive so macOS does not throttle a latency-sensitive polling loop -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>@LOG_DIR@/sigen.log</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG_DIR@/sigen.err</string>
+</dict>
+</plist>

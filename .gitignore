@@ -1,0 +1,20 @@
+# Local configuration: inverter address, install paths, launchd label. Never commit.
+config.json
+
+# Captured data. Manifests carry the unit's model, serial and the address polled,
+# so an archive identifies a specific installation -- see manifest_identity.
+data/
+logs/
+*.bin
+*.bin.gz
+*.manifest.json
+topology-baseline.json
+
+# Full-map dumps: dump.py --json writes the serial number in plain text. Rooted, so
+# the redacted excerpt under examples/ is still committable.
+/dump-snapshot*.json
+/*.dump.json
+
+__pycache__/
+*.py[cod]
+.DS_Store

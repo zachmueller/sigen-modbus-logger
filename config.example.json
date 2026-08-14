@@ -1,0 +1,31 @@
+{
+ "_": "Copy to config.json and edit. Every key below is optional except host: drop the ones you do not want to override and config.py's default applies. Keys starting with _ are ignored, so this line can stay. null means 'use the default'.",
+
+ "host": "192.168.1.50",
+ "port": 502,
+ "timeout_s": 6.0,
+
+ "plant_unit": 247,
+ "inverter_unit": 1,
+
+ "install_dir": "~/sigen",
+ "data_dir": null,
+ "log_dir": null,
+
+ "python": "/usr/bin/python3",
+ "launchd_label": "local.sigen-logger",
+ "run_as_user": "youruser",
+
+ "fast_period_s": 2,
+ "rotate_minutes": 60,
+ "keep_days": 0,
+
+ "degrade_after": 5,
+ "degrade_probe_s": 30,
+ "recycle_s": 3600,
+ "max_lag_s": 5,
+ "gap_log_quiet_s": 60,
+ "bucket_s": 300,
+
+ "manifest_identity": true
+}
