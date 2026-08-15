@@ -26,13 +26,19 @@
   <div class="freshness" id="freshness" role="status" aria-live="polite"></div>
 </header>
 
-<!-- Filters: one row, above everything they scope. -->
+<!-- Filters: one row, above everything they scope.
+
+     data-live-only marks a control that needs the server to answer it. An exported
+     snapshot has no server, so applySnapshotMode() hides everything carrying the
+     attribute rather than leaving dead buttons on the page. The chips beside them
+     have no attribute and stay: bucket width and stride are how the numbers in the
+     file were made, and they are as true in an export as they are here. -->
 <div class="filters" id="filters">
-  <div class="group" role="group" aria-label="Window length">
+  <div class="group" role="group" aria-label="Window length" data-live-only>
     <span class="glabel">Window</span>
     <div class="presets" id="presets"></div>
   </div>
-  <div class="group" role="group" aria-label="Move through history">
+  <div class="group" role="group" aria-label="Move through history" data-live-only>
     <span class="glabel">History</span>
     <button id="back" title="Back half a window (left arrow)">←</button>
     <button id="fwd" title="Forward half a window (right arrow)">→</button>
@@ -40,7 +46,7 @@
     <label class="stack"><span class="tiny">End of window</span>
       <input type="datetime-local" id="endat" step="1"></label>
   </div>
-  <div class="group">
+  <div class="group" data-live-only>
     <span class="glabel">Updates</span>
     <label class="check"><input type="checkbox" id="live" checked> <span>Live (10 s)</span></label>
     <button id="reload" title="Reload now">Reload</button>
@@ -49,16 +55,22 @@
     <span class="chip" id="chip-bucket" hidden></span>
     <span class="chip" id="chip-stride" hidden></span>
     <span class="chip warn" id="chip-warming" hidden></span>
-    <a class="chip link" id="csv" download>Download CSV</a>
+    <a class="chip link" id="csv" download data-live-only>Download CSV</a>
+    <a class="chip link" href="#share" data-live-only>Save snapshot</a>
     <!-- Only shown when the page is reached through an SSH tunnel, i.e. on
          localhost. It hands off to the Stop app via a URL scheme, because the
          tunnel lives on THIS machine and the server does not. -->
-    <a class="chip link" id="close-tunnel" href="sigen-stop://close" hidden
+    <a class="chip link" id="close-tunnel" href="sigen-stop://close" hidden data-live-only
        title="Closes the SSH tunnel on this Mac (Sigen Viewer Stop)">Close tunnel</a>
   </div>
 </div>
 
 <p class="notice" id="disconnected" hidden></p>
+
+<!-- Only an exported snapshot fills this in: on the live page there is nothing to
+     say, and in a file that someone else opens a day later there is a great deal —
+     starting with the fact that none of it is current. -->
+<p class="notice" id="snapshot-banner" hidden></p>
 
 <p class="hint" id="hint">
   Arrow keys move through history; <kbd>+</kbd>/<kbd>−</kbd> zoom; <kbd>n</kbd> jumps to now.
@@ -89,7 +101,7 @@
         one axis; a mixed-unit selection becomes one chart per unit rather than a
         second y-axis.</p>
     </div>
-    <div class="picker">
+    <div class="picker" data-live-only>
       <label class="stack grow"><span class="tiny">Search fields</span>
         <input type="search" id="field-search" placeholder="soc, temperature, alarm, 31027…"
                autocomplete="off"></label>
@@ -97,8 +109,33 @@
         <span>include duplicate registers</span></label>
       <span class="tiny" id="field-count"></span>
     </div>
-    <ul class="results" id="field-results"></ul>
-    <div class="chosen" id="field-chosen"></div>
+    <ul class="results" id="field-results" data-live-only></ul>
+    <div class="chosen" id="field-chosen" data-live-only></div>
+  </section>
+
+  <!-- Writing the view out. There are no filters here on purpose: the window and
+       the panels already on screen ARE the export, so what you send is what you
+       checked. An exported file hides this card — it cannot re-export itself. -->
+  <section class="card" id="share" data-live-only>
+    <div class="card-head">
+      <h2>Save this view</h2>
+      <p class="note">One HTML file with these charts and their numbers inside it —
+        it opens with no server, no network and no Python, so it can be emailed to
+        someone who cannot reach this viewer. Narrow the window to the interesting
+        minutes first; the export is exactly what is on screen.</p>
+    </div>
+    <!-- maxlength matches serve.py's MAX_NOTE_CHARS: the note travels in the query
+         string, and the server truncates rather than refuse, so the limit is stated
+         here where it can still be seen. -->
+    <label class="stack"><span class="tiny">Note for whoever opens it (optional)</span>
+      <textarea id="snapshot-note" rows="2" maxlength="2000"
+                placeholder="pv3 falls to zero most afternoons around 15:40 while the other three strings hold — see the PV string current panel."></textarea></label>
+    <div class="card-foot">
+      <span id="snapshot-summary"></span>
+      <div class="spacer"></div>
+      <a class="btn" id="snapshot-dl" download>Save snapshot</a>
+    </div>
+    <p class="note" id="snapshot-privacy"></p>
   </section>
 </main>
 

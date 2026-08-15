@@ -21,6 +21,10 @@ Two things worth knowing about the design:
   - The page asks for a window, not for files. Bucket width, stride and which
     files to read are series.py's business, and every one of them is reported back
     so the page can say how the numbers were made.
+  - Any view can be written out as ONE self-contained HTML file (/api/snapshot),
+    for sending to someone who cannot reach this server -- an installer, say. It
+    inlines the same app.js and charts.js this page uses, fed an embedded payload
+    instead of fetch, so there is no second renderer to drift. See snapshot.py.
 
 Host, port, bind address and the default window come from config.json; see
 config.py. CLI flags override it.
@@ -38,6 +42,7 @@ from urllib.parse import urlparse, parse_qs
 import config
 import decode
 import series
+import snapshot
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
@@ -188,6 +193,24 @@ ENERGY_TILES = [
 
 MAX_RAW_CSV_ROWS = 200000
 
+# A snapshot is meant to be emailed, and the bucket ladder already bounds a window
+# to ~900 points however long it is, so this is a backstop against a pathological
+# view (many custom fields at the finest bucket), not the normal limit. Over it, the
+# page is told to narrow the view rather than handed a file that will bounce.
+MAX_SNAPSHOT_BYTES = 8_000_000
+MAX_NOTE_CHARS = 2000
+
+# Which /api/meta keys a snapshot carries. An allowlist, like STATIC: this file
+# leaves the house, so a key has to be added here deliberately to travel in one.
+# Everything omitted is either server-side bookkeeping the page never draws
+# (live_fields, bucket_ladder, samples_per_bucket) or provenance about the archive
+# as a whole rather than this window (plans, started_at). Identity is NOT decided
+# here -- meta() has already withheld or included it per web_show_identity.
+SNAPSHOT_META_KEYS = ("ok", "now", "data_dir", "default_hours", "panels",
+                      "energy_tiles", "catalog", "plan_hash", "manifest",
+                      "fast_period_s", "device", "blocks", "extent", "tz",
+                      "host", "port")
+
 
 def panel_keys(ids=None):
     """Fields the named panels need, in a stable order."""
@@ -214,7 +237,22 @@ def decimals_for(gain):
 
 
 def round_list(values, dec):
-    return [None if v is None else round(v, dec) for v in values]
+    """Rounded to the register's own resolution, with integral results as ints.
+
+    round(241.3, 0) is 241.0, which JSON writes as "241.0": two bytes spent on a
+    decimal point and a zero nobody reads. Over 900 buckets of min/mean/max that is
+    ~8% of a window, which matters to a snapshot that has to fit in an email. The
+    number is unchanged -- JSON has one number type, and the page formats every value
+    to the register's decimals before showing it either way.
+    """
+    out = []
+    for v in values:
+        if v is None:
+            out.append(None)
+            continue
+        r = round(v, dec)
+        out.append(int(r) if r == int(r) else r)
+    return out
 
 
 # ----------------------------------------------------------------- the endpoints
@@ -480,6 +518,74 @@ class Viewer:
             rows.append("# skipped: " + ", ".join(f"{k} ({why})" for k, why in missing))
         return "\n".join(rows) + "\n"
 
+    # -- /api/snapshot -----------------------------------------------------
+
+    def snapshot(self, q):
+        """The view on screen as one self-contained HTML file: (text, filename).
+
+        Takes the SAME query as /api/window and /api/csv -- the page builds all
+        three from one windowURL() -- so the export is the view on screen by
+        construction: those panels, those custom fields, that window. Widening it
+        means expanding a panel, not learning a second set of parameters.
+
+        Trimmed, not complete. This file is meant to be sent to someone: what it
+        holds should be what they were pointed at, and every field beyond that is
+        bytes in their inbox and telemetry nobody decided to show them. Identity is
+        not decided here -- meta() has already withheld it unless
+        web_show_identity is set.
+        """
+        with self.decode_lock:
+            # All three under one lock, so the payload describes a single instant
+            # rather than three of them with a live poll in between.
+            win = self.window(q)
+            meta = self.meta()
+            latest = self.latest()
+
+        out = {k: meta[k] for k in SNAPSHOT_META_KEYS if k in meta}
+        ids = _list(q, "panels")
+        scoped = bool(ids) and "all" not in ids
+        keep = set(ids) if scoped else {p["id"] for p in meta["panels"]} | {"energy"}
+        if scoped:
+            out["panels"] = [p for p in meta["panels"] if p["id"] in keep]
+            if "energy" not in keep:
+                out["energy_tiles"] = []
+        if "health" not in keep:
+            # Tick latency is read by one panel. With that panel not in the file,
+            # three 900-long arrays and their note are payload nothing can draw --
+            # 5% of a window. The per-bucket record and empty counts stay: every
+            # tooltip quotes them, and the hatching is derived from them.
+            win["health"] = {k: v for k, v in win["health"].items()
+                             if not k.startswith("latency_") and k != "note"}
+        # The catalogue is ~259 register descriptions and enum tables. The page uses
+        # it only for the fields it draws -- gain, unit, enum labels -- so a snapshot
+        # carries those and drops the rest.
+        drawn = set(win["series"])
+        out["catalog"] = [c for c in meta["catalog"] if c["key"] in drawn]
+        # The footer prints the data directory. Here that is an absolute path under
+        # someone's home directory, and a login name is not part of reading a chart.
+        out["data_dir"] = os.path.basename(meta["data_dir"].rstrip(os.sep)) or "archive"
+
+        payload = {
+            "version": snapshot.PAYLOAD_VERSION,
+            "exported_at": time.time(),
+            "note": (q.get("note", [""])[0] or "").strip()[:MAX_NOTE_CHARS],
+            "view": {
+                "expanded": [p["id"] for p in out["panels"]],
+                "custom": [k for k in _list(q, "fields")
+                           if k not in win["unknown_fields"]],
+                "hours": round((win["end"] - win["start"]) / 3600.0, 6),
+                "end": win["end"],
+            },
+            "api": {"meta": out, "window": win, "latest": latest},
+        }
+        text = snapshot.render(payload)
+        size = len(text.encode())
+        if size > MAX_SNAPSHOT_BYTES:
+            raise Http(400, f"that view makes a {size / 1e6:.1f} MB file, past the "
+                            f"{MAX_SNAPSHOT_BYTES / 1e6:.0f} MB export limit. Narrow "
+                            f"the window, collapse a panel, or drop a custom field.")
+        return text, snapshot.filename(win["start"], win["end"])
+
     # -- --check -----------------------------------------------------------
 
     def report(self):
@@ -566,6 +672,12 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/csv":
                 return self._text(viewer.csv(q), "text/csv; charset=utf-8",
                                   filename="sigen-window.csv")
+            if route == "/api/snapshot":
+                text, name = viewer.snapshot(q)
+                # An attachment, not a page: it is a file to keep and send, and
+                # rendering it in place would look like the live viewer while being
+                # a frozen copy of it.
+                return self._text(text, "text/html; charset=utf-8", filename=name)
             if route == "/api/stats":
                 return self._json({"cache": viewer.cache.stats(),
                                    "warming": viewer.warmer.pending(),

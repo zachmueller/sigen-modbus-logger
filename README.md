@@ -175,6 +175,7 @@ python3 config.py --render deploy/launchd.plist.template
 | `dump.py` | One-shot full-map decode: what every documented register returns on this unit. |
 | `serve.py` | The local web viewer: an HTTP server that plots the archive. Never opens a Modbus connection. |
 | `series.py` | Archive index, bucket aggregation and health scan behind the viewer. Not a CLI. |
+| `snapshot.py` | Packages one view as a single self-contained HTML file, for sending to someone who cannot reach the viewer. Not a CLI. |
 | `web/` | The viewer's page: one HTML file, one stylesheet, two scripts. No framework, no CDN. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
 | `regmap.json` | The register map: 358 fields, 10 alarm appendices, 6 enums. Generated, not hand-written. |
@@ -188,7 +189,7 @@ python3 config.py --render deploy/launchd.plist.template
 | `deploy/viewer.plist.template` | The viewer's LaunchDaemon definition. `ProcessType: Background`, so the logger wins any contention. |
 | `deploy/launchagent.plist.template` | LaunchAgent alternative, for a host that *does* auto-login. |
 | `tests/test_offline.py` | The whole capture/decode path against a fake device. No hardware, no network. |
-| `tests/test_web.py` | The viewer: index, aggregation, health, HTTP. Asserts it can never become a second Modbus client. |
+| `tests/test_web.py` | The viewer: index, aggregation, health, HTTP, snapshot export. Asserts it can never become a second Modbus client. |
 | `examples/` | A redacted excerpt of `dump.py --json` output. |
 
 The Python files sit flat at the repository root on purpose: Python puts the
@@ -491,10 +492,12 @@ viewer is broken" from "that directory has no archive in it".
 | Plant state | Running state, grid connection and EMS work mode as labelled bands; all six alarm words OR-ed over each bucket. |
 | Capture health | Tick latency median/p95/max per bucket, with outage and no-record spans shaded. |
 | Custom chart | Any of the ~259 captured fields. Fields sharing a unit share an axis; a mixed-unit pick becomes one chart per unit. |
+| Save this view | Writes what is on screen to one self-contained HTML file, with a note for whoever opens it. See "Sending a view to someone" below. |
 
 Arrow keys move through history, `+`/`−` zoom, `n` jumps to now. Focus a chart and
 the arrows move its crosshair instead. The window is in the URL, so a view can be
-bookmarked or sent to someone.
+bookmarked or sent to anyone who can reach the viewer — and to anyone who cannot,
+as a self-contained file.
 
 ### Windows, buckets and stride
 
@@ -551,6 +554,49 @@ the socket timeout, not the device's, so it would swamp any bucket it landed in
 (see [Findings 7](docs/FINDINGS.md)). Bucket max is exact; median and p95 come from
 up to 64 samples per bucket.
 
+### Sending a view to someone
+
+Something looks wrong and the installer needs to see it. A screenshot loses the
+tooltips, the min–max and the provenance; a CSV loses the picture. So **Save this
+view** — the card at the bottom of the page, or the chip in the filter row — writes
+the view on screen to **one HTML file** that opens with no server, no network and no
+Python. Narrow the window to the minutes that matter first, and type a sentence
+saying what to look at; the note appears at the top of the file.
+
+```sh
+curl -s 'http://localhost:8787/api/snapshot?hours=0.5&panels=strings,power,energy&note=pv3+drops+out' \
+     -o snap.html          # what the button does
+```
+
+What the file holds, and what it does not:
+
+- **The view, not the archive.** The panels that were expanded, the custom fields
+  that were picked, that window. Nothing else travels: the field catalogue is cut
+  from ~259 entries to the fields actually drawn, and a collapsed panel is absent
+  rather than empty. Widening the export means expanding a panel first.
+- **The same charts, still interactive.** `app.js` and `charts.js` are inlined
+  byte for byte and handed the payload the page would have fetched, so the crosshair,
+  the tooltips, the min–max bands, the outage hatching and the per-panel table view
+  all work offline. There is no second renderer to drift, and a test asserts it.
+- **Labelled as frozen.** A banner names the window and the export time, ages read
+  `12 s old at export` rather than as if they were now, and every control that would
+  need the server — presets, history, live, CSV, the field picker — is *removed*
+  rather than left in place doing nothing.
+- **No identity, unless you asked for it.** The file carries the model, the plan
+  hash and the block plan; the serial, firmware and inverter address are withheld
+  exactly as `/api/meta` withholds them, i.e. unless `web_show_identity` is true.
+  The archive's directory path is never included, since on the capture host it names
+  a login. The share card states which of these applies before you download.
+- **Small enough to email.** The bucket ladder bounds any window to ~900 points, so
+  size follows the *number of fields*, not the span: measured at 721 buckets, the
+  default three panels are **202 KB** and every panel at once is **357 KB** — of which
+  **93 KB is the page code**, the same in every export. A week costs about what two
+  hours costs. The payload is written with compact separators and integral values
+  without a trailing `.0` (~17% together); the card estimates the size before you
+  download, and the server refuses past 8 MB rather than hand over something that
+  will bounce. Panels you did not export cost nothing, and the three tick-latency
+  arrays are dropped unless Capture health was one of them.
+
 ### The API
 
 Plain JSON, same-origin, no CORS header — so a hostile page on your LAN cannot read
@@ -562,6 +608,7 @@ your archive through your browser.
 | `/api/window?hours=6&end=…&panels=…&fields=…` | The bucket grid, per-field min/mean/max, health, window energy, bucket width, stride, timezone change points. |
 | `/api/latest` | Newest good sample, with data-age and record-age reported separately. |
 | `/api/csv?…` | The window as CSV; `&raw=1` for per-record rows in `decode.py`'s shape. |
+| `/api/snapshot?…` | The same window as one self-contained HTML file, served as an attachment. Takes `/api/window`'s parameters plus `&note=`. |
 | `/api/stats` | Cache hit counts and warm-thread state. |
 
 Which fields make up which chart lives in `PANELS` at the top of `serve.py`, so a

@@ -25,6 +25,7 @@ import gzip
 import io
 import json
 import os
+import re
 import socket
 import struct
 import sys
@@ -32,6 +33,7 @@ import threading
 import time
 import unittest
 from http.client import HTTPConnection
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,6 +43,7 @@ import lib             # noqa: E402
 import log             # noqa: E402
 import series          # noqa: E402
 import serve           # noqa: E402
+import snapshot        # noqa: E402
 from test_offline import ArchiveFixture, base_cfg   # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -141,7 +144,7 @@ class TestViewerIsReadOnly(unittest.TestCase):
         return out
 
     def test_viewer_never_constructs_a_modbus_client(self):
-        for name in ("series.py", "serve.py"):
+        for name in ("series.py", "serve.py", "snapshot.py"):
             used = self.used_names(name)
             self.assertNotIn("Modbus", used,
                              f"{name} would become a second client of the inverter")
@@ -151,13 +154,13 @@ class TestViewerIsReadOnly(unittest.TestCase):
     def test_viewer_modules_do_not_import_the_transport(self):
         # lib is imported for decode primitives; importing socket in serve.py is
         # only gethostname. What must never appear is a read of the device.
-        for name in ("series.py", "serve.py"):
+        for name in ("series.py", "serve.py", "snapshot.py"):
             used = self.used_names(name)
             self.assertNotIn("sweep", used)        # dump.sweep polls every register
             self.assertNotIn("identity_block", used)
 
     def test_no_write_function_codes(self):
-        for name in ("series.py", "serve.py"):
+        for name in ("series.py", "serve.py", "snapshot.py"):
             with open(os.path.join(HERE, name)) as fh:
                 src = fh.read()
             for fc in ("5", "6", "15", "16"):
@@ -570,7 +573,10 @@ class TestPanelContract(unittest.TestCase):
 
 # ----------------------------------------------------------------------- HTTP
 
-class TestHTTP(ViewerFixture):
+class HTTPFixture(ViewerFixture):
+    """A viewer serving the fixture archive on a loopback port. No test methods:
+    subclassing a TestCase that has them runs them again per subclass."""
+
     def start(self, **over):
         cfg = dict(config.DEFAULTS)
         cfg.update({"host": None, "data_dir": self.tmp, "web_default_hours": 6})
@@ -593,7 +599,8 @@ class TestHTTP(ViewerFixture):
         self.httpd.server_close()
         self.thread.join(timeout=5)
 
-    def get(self, path):
+    def fetch(self, path):
+        """(status, headers, body)."""
         conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
             # putrequest, not request(): the raw path must reach the server
@@ -601,9 +608,13 @@ class TestHTTP(ViewerFixture):
             conn.putrequest("GET", path, skip_accept_encoding=True)
             conn.endheaders()
             r = conn.getresponse()
-            return r.status, r.getheader("Content-Type"), r.read()
+            return r.status, dict(r.getheaders()), r.read()
         finally:
             conn.close()
+
+    def get(self, path):
+        status, headers, body = self.fetch(path)
+        return status, headers.get("Content-Type"), body
 
     def json(self, path):
         status, ctype, body = self.get(path)
@@ -626,6 +637,8 @@ class TestHTTP(ViewerFixture):
                            self.data_records(now - n * 2, n, step=2))
         return now
 
+
+class TestHTTP(HTTPFixture):
     def test_the_page_and_its_assets_are_served(self):
         self.seed()
         self.start()
@@ -760,6 +773,208 @@ class TestHTTP(ViewerFixture):
         out = self.capture_stdout(viewer.report)
         self.assertIn("plan       08c047b8", out)
         self.assertIn("plottable", out)
+
+
+class TestSnapshot(HTTPFixture):
+    """One view, written out as one file that opens anywhere.
+
+    Every way this can be wrong is quiet, and every one of them is discovered by the
+    person the file was sent to rather than by whoever sent it: a stylesheet still
+    pointing at a server they cannot reach, a note that ends the script element and
+    leaves the payload on screen as text, a serial number nobody meant to send, or an
+    hour-old reading presented as the latest one.
+    """
+
+    VIEW = "?hours=1&panels=soc,energy"
+
+    def export(self, query=None):
+        status, headers, body = self.fetch("/api/snapshot" + (query or self.VIEW))
+        self.assertEqual(status, 200, body[:400])
+        return headers, body.decode()
+
+    def payload(self, html):
+        m = re.search(r"window\.SIGEN_SNAPSHOT = (\{.*?\});</script>", html, re.S)
+        self.assertIsNotNone(m, "no payload in the exported file")
+        return json.loads(m.group(1))
+
+    def test_the_export_is_one_file_that_fetches_nothing(self):
+        self.seed()
+        self.start()
+        headers, html = self.export()
+        self.assertIn("text/html", headers["Content-Type"])
+        self.assertIn("attachment", headers["Content-Disposition"])
+        self.assertRegex(headers["Content-Disposition"],
+                         r'filename="sigen-snapshot-\d{8}T\d{4}-\d{8}T\d{4}\.html"')
+        for ref in ('src="/', 'href="/', "url(/"):
+            self.assertNotIn(ref, html,
+                             f"{ref} needs the server the reader cannot reach")
+        # www.w3.org is the SVG namespace, which is a name and never fetched.
+        outside = [u for u in re.findall(r'https?://[^\s"\')]+', html)
+                   if not u.startswith("http://www.w3.org")]
+        self.assertEqual(outside, [], "an exported file must reference nothing outside")
+        self.assertIn("<style>", html)
+
+    def test_the_export_and_the_page_share_one_renderer(self):
+        # The whole design rests on this: a snapshot looks like the screen because it
+        # IS the screen, fed a payload instead of fetch(). A forked copy of app.js
+        # would drift, and only the person who was sent the file would ever see it.
+        self.seed()
+        self.start()
+        _, html = self.export()
+        for name in ("app.js", "charts.js", "style.css"):
+            with open(os.path.join(HERE, "web", name)) as fh:
+                self.assertIn(fh.read(), html, f"{name} is not inlined verbatim")
+
+    def test_the_payload_is_what_the_three_endpoints_answer(self):
+        self.seed()
+        self.start()
+        _, html = self.export()
+        p = self.payload(html)
+        self.assertEqual(p["version"], snapshot.PAYLOAD_VERSION)
+        self.assertGreater(p["exported_at"], 0)
+        self.assertTrue(p["api"]["meta"]["ok"])
+        self.assertTrue(p["api"]["latest"]["ok"])
+        self.assertEqual(p["view"]["expanded"], ["soc"])
+        w = p["api"]["window"]
+        self.assertIn("plant_ess_soc", w["series"])
+        self.assertEqual(len(w["t"]), len(w["series"]["plant_ess_soc"]["mean"]))
+        self.assertEqual(len(w["t"]), len(w["health"]["records"]))
+        self.assertIn("plant_accumulated_grid_import_energy", w["energy"])
+
+    def test_the_export_is_trimmed_to_the_view(self):
+        self.seed()
+        self.start()
+        _, html = self.export()
+        p = self.payload(html)
+        meta = p["api"]["meta"]
+        self.assertEqual([x["id"] for x in meta["panels"]], ["soc"])
+        self.assertNotIn("inverter_pv1_current", html,
+                         "a panel that was collapsed must not travel")
+        drawn = set(p["api"]["window"]["series"])
+        self.assertTrue({c["key"] for c in meta["catalog"]} <= drawn)
+        self.assertGreater(len(self.json("/api/meta")["catalog"]), 200)
+        self.assertLess(len(meta["catalog"]), 20, "the catalogue is not trimmed")
+        for key in ("live_fields", "bucket_ladder", "samples_per_bucket", "plans",
+                    "started_at"):
+            self.assertNotIn(key, meta, "a snapshot carries only what the page draws")
+
+    def test_the_export_withholds_identity_unless_asked_for(self):
+        # Same rule as /api/meta, and it matters more here: this file leaves the LAN.
+        self.seed()
+        self.start()
+        _, html = self.export()
+        self.assertNotIn("TESTSERIAL", html)
+        self.assertIn("withheld", html)
+        self.stop()
+        self.start(web_show_identity=True)
+        _, html = self.export()
+        self.assertIn("TESTSERIAL", html)
+
+    def test_the_export_does_not_carry_the_archive_path(self):
+        # The footer prints the data directory, which on the capture host is an
+        # absolute path under someone's home. A login name is not part of a chart.
+        self.seed()
+        self.start()
+        _, html = self.export()
+        self.assertNotIn(self.tmp, html)
+        self.assertEqual(self.payload(html)["api"]["meta"]["data_dir"],
+                         os.path.basename(self.tmp))
+
+    def test_a_note_travels_with_the_view_and_cannot_end_the_script(self):
+        self.seed()
+        self.start()
+        evil = "</script><script>alert(1)</script>"
+        _, html = self.export(self.VIEW + "&note=" + quote(evil))
+        self.assertNotIn("<script>alert(1)", html)
+        self.assertEqual(self.payload(html)["note"], evil,
+                         "the note must survive escaping unchanged")
+        self.assertEqual(html.count("<script>"), 3,
+                         "the payload, charts.js and app.js -- and nothing else")
+
+    def test_an_oversized_export_is_refused_with_a_reason(self):
+        self.seed()
+        self.start()
+        real = serve.MAX_SNAPSHOT_BYTES
+        serve.MAX_SNAPSHOT_BYTES = 1000
+        self.addCleanup(lambda: setattr(serve, "MAX_SNAPSHOT_BYTES", real))
+        status, _, body = self.get("/api/snapshot" + self.VIEW)
+        self.assertEqual(status, 400)
+        self.assertIn("Narrow the window", json.loads(body)["error"])
+
+    def test_an_export_without_the_health_panel_drops_the_latency_arrays(self):
+        # Three 900-long arrays only one panel can draw. What must NOT be dropped is
+        # the per-bucket record and empty counts: every tooltip quotes them, and the
+        # outage hatching is derived from them.
+        self.seed()
+        self.start()
+        health = self.payload(self.export()[1])["api"]["window"]["health"]
+        for key in ("latency_median", "latency_p95", "latency_max", "note"):
+            self.assertNotIn(key, health)
+        for key in ("records", "empty", "no_data", "no_records", "covered"):
+            self.assertIn(key, health)
+        with_health = self.payload(
+            self.export("?hours=1&panels=soc,health,energy")[1])["api"]["window"]
+        self.assertIn("latency_median", with_health["health"])
+        self.assertIn("note", with_health["health"])
+
+    def test_app_js_and_the_payload_agree_on_the_routes(self):
+        # The contract between snapshot.py and web/app.js. Renaming one side without
+        # the other has to fail here rather than in a file already sent to someone.
+        self.seed()
+        self.start()
+        _, html = self.export()
+        with open(os.path.join(HERE, "web", "app.js")) as fh:
+            js = fh.read()
+        self.assertIn("window." + snapshot.GLOBAL, js)
+        mapped = set(re.findall(r"'/api/\w+': '(\w+)'", js))
+        self.assertEqual(mapped, set(self.payload(html)["api"]))
+
+
+class TestWireFormat(unittest.TestCase):
+    """How a value is written, which is not the same question as what it is."""
+
+    def test_an_integral_value_is_written_without_a_decimal_point(self):
+        # "241.0" spends two bytes on a point and a zero the page never shows, and a
+        # window is tens of thousands of values. The number does not change.
+        self.assertEqual(serve.round_list([241.3, None, 3.5, 0.0, -0.0], 0),
+                         [241, None, 4, 0, 0])
+        self.assertEqual(serve.round_list([1.2345, 2.0], 3), [1.234, 2])
+        self.assertEqual(json.dumps(serve.round_list([241.3], 0)), "[241]")
+
+    def test_rounding_still_follows_the_registers_own_resolution(self):
+        self.assertEqual(serve.decimals_for(1000), 3)
+        self.assertEqual(serve.decimals_for(1), 0)
+        self.assertEqual(serve.round_list([3.14159], 2), [3.14])
+
+
+class TestSnapshotPackaging(unittest.TestCase):
+    """The string work, without an archive or a server behind it."""
+
+    def test_a_payload_cannot_end_the_script_element(self):
+        for evil in ("</script>", "<!--", "a\u2028b", "x & y"):
+            text = snapshot.json_literal({"x": evil})
+            for ch in ("<", ">", "&", "\u2028"):
+                self.assertNotIn(ch, text)
+            self.assertEqual(json.loads(text)["x"], evil,
+                             "escaped JSON must parse back to exactly the same text")
+
+    def test_an_index_html_that_cannot_be_inlined_is_an_error(self):
+        # Rather than a file that renders unstyled on someone else's machine.
+        payload = {"exported_at": time.time(), "note": "",
+                   "api": {"meta": {"plan_hash": "abc", "manifest": "m.json",
+                                    "device": {}},
+                           "window": {"start": 1786600000.0, "end": 1786603600.0}}}
+        real = snapshot._read
+        snapshot._read = (lambda name: "<html>no tags here</html>"
+                          if name == "index.html" else real(name))
+        self.addCleanup(lambda: setattr(snapshot, "_read", real))
+        with self.assertRaises(ValueError) as caught:
+            snapshot.render(payload)
+        self.assertIn("snapshot.py", str(caught.exception))
+
+    def test_the_filename_says_which_window_it_holds(self):
+        name = snapshot.filename(1786600000.0, 1786603600.0)
+        self.assertRegex(name, r"^sigen-snapshot-\d{8}T\d{4}-\d{8}T\d{4}\.html$")
 
 
 class TestIncrementalOpenFile(ViewerFixture):

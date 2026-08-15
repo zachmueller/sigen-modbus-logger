@@ -21,6 +21,18 @@
 const C = Charts;
 const $ = (id) => document.getElementById(id);
 
+// An exported snapshot (see snapshot.py). serve.py writes the payload this page
+// would have fetched into the file and inlines THIS script unchanged, so a shared
+// file renders through the same code as the screen it was taken from -- there is no
+// second viewer to drift. Two things follow, and applySnapshotMode() enforces both:
+// nothing may be fetched, and nothing may claim to be current.
+const SNAP = window.SIGEN_SNAPSHOT || null;
+
+// The export's fixed overhead, for the "about N KB" the share card quotes before
+// anyone commits to a download: app.js, charts.js and style.css inlined, plus the
+// block plan and the rest of the provenance, which do not vary with the window.
+const SNAPSHOT_CODE_KB = 96;
+
 const PRESETS = [
   { label: '15m', hours: 0.25 }, { label: '1h', hours: 1 },
   { label: '6h', hours: 6 }, { label: '24h', hours: 24 },
@@ -66,7 +78,7 @@ async function boot() {
   if (!state.expanded.size) {
     for (const p of state.meta.panels) if (!p.collapsed) state.expanded.add(p.id);
   }
-  if (!hashHas('h')) state.hours = state.meta.default_hours || 6;
+  if (!SNAP && !hashHas('h')) state.hours = state.meta.default_hours || 6;
   buildPresets();
   buildPanelCards();
   buildPicker();
@@ -77,6 +89,18 @@ async function boot() {
 }
 
 function readHash() {
+  if (SNAP) {
+    // A snapshot's view is the one it was exported with, whatever the URL says: it
+    // has no server to ask for another, and a panel that was open when the file was
+    // written has to be open when it is read -- including one PANELS marks collapsed.
+    const v = SNAP.view || {};
+    state.hours = v.hours || null;
+    state.end = v.end || null;
+    state.expanded = new Set(v.expanded || []);
+    state.custom = (v.custom || []).slice();
+    state.live = false;
+    return;
+  }
   const q = new URLSearchParams(location.hash.replace(/^#/, ''));
   if (q.has('h')) state.hours = q.get('h') === 'all' ? null : parseFloat(q.get('h'));
   if (q.has('end')) state.end = parseFloat(q.get('end')) || null;
@@ -90,6 +114,7 @@ function hashHas(k) {
 }
 
 function writeHash() {
+  if (SNAP) return;                  // there is no view to restore in a file:// URL
   const q = new URLSearchParams();
   q.set('h', state.hours === null ? 'all' : String(state.hours));
   if (state.end) q.set('end', String(Math.round(state.end)));
@@ -100,10 +125,22 @@ function writeHash() {
 }
 
 async function getJSON(url) {
+  if (SNAP) return snapshotJSON(url);
   const r = await fetch(url, { cache: 'no-store' });
   const body = await r.json().catch(() => null);
   if (!r.ok) throw new Error((body && body.error) || (r.status + ' ' + r.statusText));
   return body;
+}
+
+// The one place a snapshot differs from the live page: the answers come out of the
+// file. A route the payload does not carry is an error rather than an empty page --
+// an export missing its window must say so, not look like a quiet night.
+function snapshotJSON(url) {
+  const key = { '/api/meta': 'meta', '/api/window': 'window',
+                '/api/latest': 'latest' }[url.split('?')[0]];
+  const got = key && SNAP.api && SNAP.api[key];
+  if (!got) throw new Error('this snapshot carries no payload for ' + url);
+  return got;
 }
 
 function fatal(msg) {
@@ -148,6 +185,15 @@ function windowSpanS() {
 }
 
 function wireControls() {
+  // A resize and a light/dark switch are re-renders of what is already here, so
+  // they are wired in a snapshot too.
+  window.addEventListener('resize', debounce(() => renderCharts(), 150));
+  if (window.matchMedia) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    if (mq.addEventListener) mq.addEventListener('change', () => renderCharts());
+  }
+  // Everything below needs a server to answer it.
+  if (SNAP) return applySnapshotMode();
   $('back').onclick = () => pan(-0.5);
   $('fwd').onclick = () => pan(0.5);
   $('now').onclick = () => { state.end = null; setLive(true); refresh(); };
@@ -166,11 +212,7 @@ function wireControls() {
     // The click is allowed to proceed; this only updates the page around it.
     btn.addEventListener('click', () => tunnelClosing());
   }
-  window.addEventListener('resize', debounce(() => renderCharts(), 150));
-  if (window.matchMedia) {
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    if (mq.addEventListener) mq.addEventListener('change', () => renderCharts());
-  }
+  $('snapshot-note').addEventListener('input', debounce(() => renderShare(), 200));
   document.addEventListener('keydown', (ev) => {
     const t = ev.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
@@ -182,6 +224,73 @@ function wireControls() {
     else if (ev.key === 'n') { state.end = null; setLive(true); refresh(); }
     else if (ev.key === 'l') setLive(!state.live);
   });
+}
+
+// ------------------------------------------- writing a view out, and reading one
+
+// A snapshot is a frozen copy of one view. Every control that would ask a server
+// for a different one is removed rather than left in place doing nothing, and
+// anything that was merely current when the file was written has to say so -- a
+// file read tomorrow must not present yesterday's reading as the latest one.
+// Everything that still works offline stays: the crosshair, the tooltips, the table
+// views, and Show/Hide, which only re-draws what is already in the file.
+function applySnapshotMode() {
+  const win = SNAP.api.window;
+  for (const el of document.querySelectorAll('[data-live-only]')) el.hidden = true;
+  document.querySelector('.brand h1').textContent += ' — snapshot';
+  $('hint').textContent =
+    'Hover a chart, or focus it and use the arrow keys, for exact values; Table '
+    + 'shows the numbers behind a panel. Nothing here is fetched, so nothing else moves.';
+  if (!state.custom.length) $('custom-card').hidden = true;
+  else document.querySelector('#custom-card .note').textContent =
+    'The extra fields this view was built with.';
+  const box = $('snapshot-banner');
+  box.hidden = false;
+  C.clear(box);
+  box.appendChild(C.el('strong', { text: 'A static snapshot. ' }));
+  box.appendChild(document.createTextNode(
+    C.fmtTime(win.start, win.tz, 'full') + ' → ' + C.fmtTime(win.end, win.tz, 'full')
+    + ' ' + C.zoneName(win.tz) + ' on the capture host\'s clock, exported '
+    + C.fmtTime(SNAP.exported_at, win.tz, 'full') + '. It holds this window and these '
+    + 'panels only — the live viewer has the rest — and it cannot be panned, zoomed '
+    + 'or refreshed. The headline numbers are the last good sample before the export, '
+    + 'not now.'));
+  if (SNAP.note) {
+    box.appendChild(C.el('p', { style: { margin: '0.35rem 0 0' } }, [
+      C.el('strong', { text: 'From the sender: ' }),
+      document.createTextNode(SNAP.note)]));
+  }
+}
+
+// What the export will contain, said before it is made: a file you are about to
+// send someone should be one whose shape you knew.
+function renderShare() {
+  const win = state.win, dev = state.meta.device || {};
+  if (!win) return;
+  const note = $('snapshot-note').value.trim();
+  $('snapshot-dl').href = '/api/snapshot' + windowURL(note ? { note: note } : null);
+  // An estimate, and labelled as one: the size is exact only once the server has
+  // built the file. What varies is the window, the last sample, and the catalogue
+  // entries for the fields actually drawn -- the export carries no others.
+  const drawn = new Set(Object.keys(win.series));
+  let bytes = JSON.stringify(win).length + JSON.stringify(state.latest || {}).length;
+  for (const c of state.meta.catalog) {
+    if (drawn.has(c.key)) bytes += JSON.stringify(c).length;
+  }
+  const panels = state.expanded.size;
+  $('snapshot-summary').textContent =
+    fmtDuration(Math.round(win.end - win.start)) + ' to ' +
+    C.fmtTime(win.end, win.tz, 'full') + ' · ' + panels +
+    (panels === 1 ? ' panel' : ' panels') + ' · ' + drawn.size + ' fields · ' +
+    win.t.length + ' buckets of ' + fmtDuration(win.bucket_s) + ' · about ' +
+    (Math.round(bytes / 1024) + SNAPSHOT_CODE_KB) + ' KB';
+  $('snapshot-privacy').textContent =
+    (dev.withheld
+      ? 'It carries the model, the plan hash, the block plan and these charts; '
+        + dev.withheld + '.'
+      : 'It carries this unit\'s serial, firmware and the inverter\'s address, '
+        + 'because web_show_identity is set.')
+    + ' The archive\'s directory path is never included.';
 }
 
 // -- closing the tunnel from the page
@@ -278,7 +387,7 @@ function zoom(factor) {
 function schedule() {
   if (state.timer) clearInterval(state.timer);
   state.timer = null;
-  if (state.live) state.timer = setInterval(() => refresh(true), 10000);
+  if (state.live && !SNAP) state.timer = setInterval(() => refresh(true), 10000);
 }
 
 function debounce(fn, ms) {
@@ -351,9 +460,13 @@ function renderAll() {
   const warm = $('chip-warming');
   if (win.pending_files) {
     warm.hidden = false;
+    // A snapshot taken while the server was still reading cold files is permanently
+    // partial: there is nothing left to re-ask, so it says that instead of promising
+    // a reload that will never come.
     warm.textContent = 'partial: ' + win.pending_files + ' file(s) still being read — ' +
-                       'reloading shortly';
-    setTimeout(() => refresh(true), 3000);
+                       (SNAP ? 'this view was exported before they finished'
+                             : 'reloading shortly');
+    if (!SNAP) setTimeout(() => refresh(true), 3000);
   } else if (win.unreadable && win.unreadable.length) {
     // Usually keep_days pruning a file mid-request. Say which, rather than
     // showing a window that is quietly missing a chunk.
@@ -363,8 +476,10 @@ function renderAll() {
   } else {
     warm.hidden = true;
   }
-  $('csv').href = '/api/csv' + windowURL();
-  $('endat').value = C.toLocalInput(win.end, win.tz);
+  if (!SNAP) {
+    $('csv').href = '/api/csv' + windowURL();
+    $('endat').value = C.toLocalInput(win.end, win.tz);
+  }
 
   renderFreshness();
   renderLiveTiles();
@@ -372,6 +487,7 @@ function renderAll() {
   renderPanels();
   renderCustom();
   renderFooter();
+  if (!SNAP) renderShare();
 }
 
 function renderProvenance() {
@@ -390,6 +506,10 @@ function renderFreshness() {
   C.clear(host);
   if (!l) return;
   const alarms = Object.keys(l.alarms || {});
+  // In a snapshot every age was measured when the file was written, not now. Saying
+  // "data 12 s old" in a file read a week later is the one lie this page must not
+  // tell, so the ages carry when they were taken.
+  const when = SNAP ? ' at export' : '';
   let cls = 'ok', text = '';
   if (!l.ok) {
     cls = 'bad';
@@ -397,15 +517,16 @@ function renderFreshness() {
   } else if (l.logger_stalled) {
     // Only a genuinely absent record means the capture itself stopped.
     cls = 'bad';
-    text = 'no record for ' + fmtAge(l.record_age_s) + ' — the logger may have stopped';
+    text = 'no record for ' + fmtAge(l.record_age_s) + when +
+           ' — the logger may have stopped';
   } else if (!l.device_answering) {
     // The logger is fine; the device is not. Keeping these apart is the whole
     // point (FINDINGS 7).
     cls = 'serious';
-    text = 'device not answering for ' + fmtAge(l.data_age_s) +
+    text = 'device not answering for ' + fmtAge(l.data_age_s) + when +
            ' — logger healthy, still probing';
   } else {
-    text = 'data ' + fmtAge(l.data_age_s) + ' old';
+    text = 'data ' + fmtAge(l.data_age_s) + ' old' + when;
   }
   host.appendChild(C.el('span', { class: 'pill ' + cls }, [
     C.el('span', { class: 'dot' }), document.createTextNode(text)]));
@@ -717,7 +838,9 @@ function bucketFoot(win, i, aggregated) {
 
 function renderLatencyPanel(c, win) {
   const h = win.health;
-  const has = h.latency_median.some((v) => v !== null && v !== undefined);
+  // A snapshot exported without this panel drops the latency arrays, so read them
+  // defensively: an absent series is "no latency here", not a crash.
+  const has = (h.latency_median || []).some((v) => v !== null && v !== undefined);
   if (!has) {
     c.chartHost.appendChild(C.el('p', { class: 'note',
       text: 'No records returned data in this window.' }));
@@ -863,6 +986,10 @@ function renderTable(c, win, series, panel) {
 // -- custom charts
 
 function buildPicker() {
+  // Nothing to pick from in a snapshot: it carries the fields it was exported with
+  // and there is no server to fetch another. applySnapshotMode() hides the controls;
+  // the charts for the fields already chosen are rendered by renderCustom().
+  if (SNAP) return;
   const search = $('field-search');
   const render = () => renderResults(search.value);
   search.addEventListener('input', debounce(render, 120));
@@ -1011,6 +1138,16 @@ function renderFooter() {
     'Read-only: this page decodes bytes already on disk and never polls the ' +
     'inverter. Times are the capture host\'s local clock.' +
     (m.device && m.device.withheld ? ' Identity withheld: ' + m.device.withheld + '.' : '') }));
+  if (SNAP) {
+    host.appendChild(C.el('p', { text:
+      'Exported ' + C.fmtTime(SNAP.exported_at, win.tz, 'full') + ' ' +
+      C.zoneName(win.tz) + ' by serve.py, holding the ' + m.panels.length +
+      (m.panels.length === 1 ? ' panel' : ' panels') + ' and ' +
+      Object.keys(win.series).length + ' fields that were on screen. The archive it ' +
+      'came from covers far more fields and a longer history; this file fetches ' +
+      'nothing and cannot be refreshed, so anything it does not contain needs a new ' +
+      'export from the viewer.' }));
+  }
   if (m.device && m.device.why) {
     host.appendChild(C.el('p', { text: 'Device model unknown: ' + m.device.why }));
   }
