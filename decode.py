@@ -35,6 +35,7 @@ import lib
 
 HEADER = ">dHH"
 HEADER_LEN = struct.calcsize(HEADER)
+FORMAT = "sigen-raw-1"   # log.FORMAT, restated so a reader needs only this file
 
 DEFAULT_FIELDS = [
     "plant_system_time",
@@ -116,27 +117,41 @@ def check_plan_hash(manifest, paths):
                  f"Decode each series with the manifest written alongside it.")
 
 
+def records_from(manifest, path, offset=0):
+    """Yield (ts, latency_ms, {block_index: bytes}) from one file.
+
+    `offset` must be a record boundary -- the byte count after a previous complete
+    record. It exists so a reader that has already seen the head of the still-open
+    file can resume rather than re-read it; records are append-only, so anything
+    before a boundary can never change. Seeking a .gz still decompresses from the
+    start, so only pass an offset for a plain file.
+    """
+    size = {b["index"]: b["bytes"] for b in manifest["blocks"]}
+    with open_maybe_gz(path) as fh:
+        if offset:
+            fh.seek(offset)
+        while True:
+            head = fh.read(HEADER_LEN)
+            if len(head) < HEADER_LEN:
+                break  # clean EOF, or a record torn by a kill: stop here
+            ts, mask, latency = struct.unpack(HEADER, head)
+            present = [i for i in sorted(size) if mask >> i & 1]
+            need = sum(size[i] for i in present)
+            payload = fh.read(need)
+            if len(payload) < need:
+                break  # truncated final record
+            out, off = {}, 0
+            for i in present:
+                out[i] = payload[off:off + size[i]]
+                off += size[i]
+            yield ts, latency, out
+
+
 def records(manifest, paths):
     """Yield (ts, latency_ms, {block_index: bytes}) per record, in file order."""
-    blocks = manifest["blocks"]
-    size = {b["index"]: b["bytes"] for b in blocks}
     for path in paths:
-        with open_maybe_gz(path) as fh:
-            while True:
-                head = fh.read(HEADER_LEN)
-                if len(head) < HEADER_LEN:
-                    break  # clean EOF, or a record torn by a kill: stop here
-                ts, mask, latency = struct.unpack(HEADER, head)
-                present = [i for i in sorted(size) if mask >> i & 1]
-                need = sum(size[i] for i in present)
-                payload = fh.read(need)
-                if len(payload) < need:
-                    break  # truncated final record
-                out, off = {}, 0
-                for i in present:
-                    out[i] = payload[off:off + size[i]]
-                    off += size[i]
-                yield ts, latency, out
+        for rec in records_from(manifest, path):
+            yield rec
 
 
 def resolve(manifest, bundle, keys):
@@ -526,7 +541,7 @@ def main():
     paths = positional[1:]
     if not paths:
         sys.exit("no .bin/.bin.gz files given")
-    if manifest.get("format") != "sigen-raw-1":
+    if manifest.get("format") != FORMAT:
         sys.exit(f"unknown archive format {manifest.get('format')!r}")
     # Record filenames carry the block-plan fingerprint. Decoding a file written
     # under a different plan would misread cadences and possibly field offsets, so

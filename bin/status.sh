@@ -20,6 +20,18 @@ count() {
 }
 printf "  gap: %s   degraded: %s   recovered: %s\n" \
   "$(count '\[gap\]')" "$(count '\[degraded\]')" "$(count '\[recovered\]')"
+echo "=== viewer ($SIGEN_WEB_LAUNCHD_LABEL) ==="
+# The viewer is a separate daemon and reads the archive only -- it is never a
+# second Modbus client -- so "not loaded" here says nothing about capture health.
+launchctl print "system/${SIGEN_WEB_LAUNCHD_LABEL}" 2>/dev/null \
+  | grep -E "^	state|^	pid|last exit code" || echo "not loaded"
+if nc -z 127.0.0.1 "$SIGEN_WEB_PORT" 2>/dev/null; then
+  printf "  listening on %s:%s\n" "$SIGEN_WEB_BIND" "$SIGEN_WEB_PORT"
+else
+  printf "  nothing listening on port %s\n" "$SIGEN_WEB_PORT"
+fi
+tail -3 "$SIGEN_LOG_DIR/viewer.err" 2>/dev/null | sed 's/^/  err: /' || true
+
 echo "=== archive ==="
 printf "  files: %s   size: %s\n" \
   "$(ls "$SIGEN_DATA_DIR"/*.bin* 2>/dev/null | wc -l | tr -d ' ')" \

@@ -54,6 +54,13 @@ Worth reading once before pointing this at your own hardware.
   model, serial number and the address polled. Set `"manifest_identity": false`
   before sharing raw archives — decoding needs none of it. `dump.py --json`
   writes the serial in plain text too; `.gitignore` covers both by default.
+- **The viewer is a second exposure, not a second client.** `serve.py` reads the
+  archive on disk and never opens a Modbus connection, so it costs the inverter
+  nothing. But it serves plain HTTP with no authentication, bound to `0.0.0.0` by
+  default: anyone who can reach the host can read your telemetry. Its API withholds
+  the serial, firmware and inverter address unless `web_show_identity` is true. Bind
+  it to `127.0.0.1` and tunnel if your LAN is not trusted, and **never
+  port-forward it.**
 - **Your inverter is grid-tied equipment.** Polling it is passive, but this
   software comes with no warranty of any kind (see [LICENSE](LICENSE)), and how
   your installer or utility feels about third-party clients is between you and
@@ -70,6 +77,8 @@ python3 config.py --show                # confirm what resolved
 python3 dump.py                         # decode every documented register, once
 python3 log.py --seconds 60             # capture 60 s into ./data
 python3 decode.py data/*.manifest.json data/*.bin --last
+
+python3 serve.py                        # then open http://localhost:8787
 ```
 
 Every script takes the host as an optional first positional argument, which
@@ -131,6 +140,11 @@ then `~/.config/sigen/config.json`.
 | `gap_log_quiet_s` | `60` | Collapse repeated `[gap]` lines to one per this interval. |
 | `bucket_s` | `300` | Heartbeat and soak-bucket width. |
 | `manifest_identity` | `true` | Record model/serial/host in manifests. |
+| `web_port` | `8787` | Viewer port. Above 1024, so the viewer needs no privilege. |
+| `web_bind` | `0.0.0.0` | Viewer bind address. `127.0.0.1` to require an SSH tunnel. |
+| `web_launchd_label` | `local.sigen-viewer` | Viewer daemon label. Must differ from `launchd_label`. |
+| `web_default_hours` | `6` | Default lookback when the page opens. |
+| `web_show_identity` | `false` | Let the viewer's API report serial, firmware and the inverter's address. |
 
 `keep_days` is retention, and it is narrower than it looks: on **rotation** only,
 any `*.bin.gz` older than N days is deleted. It never touches the open `.bin`,
@@ -159,14 +173,22 @@ python3 config.py --render deploy/launchd.plist.template
 | `log.py` | The logger. Tiered raw capture, topology drift detection, soak harness. |
 | `decode.py` | Offline decode of the raw archive into CSV/JSONL/derived series. |
 | `dump.py` | One-shot full-map decode: what every documented register returns on this unit. |
+| `serve.py` | The local web viewer: an HTTP server that plots the archive. Never opens a Modbus connection. |
+| `series.py` | Archive index, bucket aggregation and health scan behind the viewer. Not a CLI. |
+| `web/` | The viewer's page: one HTML file, one stylesheet, two scripts. No framework, no CDN. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
 | `regmap.json` | The register map: 358 fields, 10 alarm appendices, 6 enums. Generated, not hand-written. |
-| `bin/status.sh` | Health check: daemon state, recent heartbeats, gap/degraded counts, archive size. No sudo. |
+| `bin/status.sh` | Health check: logger and viewer daemon state, recent heartbeats, gap/degraded counts, archive size. No sudo. |
 | `bin/latest.sh` | Newest values, vertically. The "is it working right now?" view. No sudo. |
-| `deploy/install-daemon.sh`, `uninstall-daemon.sh` | LaunchDaemon install/removal. Needs sudo. |
+| `bin/tunnel.sh` | Run on the *viewing* machine: SSH-forwards the viewer to `localhost`, for a laptop that cannot route to the LAN address. |
+| `deploy/install-launcher.sh` | Run on a viewing **Mac**: generates a Spotlight-launchable `.app` that opens the tunnel and the page in one keystroke. |
+| `deploy/install-daemon.sh`, `uninstall-daemon.sh` | LaunchDaemon install/removal for the logger. Needs sudo. |
+| `deploy/install-viewer.sh`, `uninstall-viewer.sh` | The same for the viewer. Separate daemon, so restarting it cannot interrupt capture. |
 | `deploy/launchd.plist.template` | LaunchDaemon definition, rendered from config at install time. |
+| `deploy/viewer.plist.template` | The viewer's LaunchDaemon definition. `ProcessType: Background`, so the logger wins any contention. |
 | `deploy/launchagent.plist.template` | LaunchAgent alternative, for a host that *does* auto-login. |
 | `tests/test_offline.py` | The whole capture/decode path against a fake device. No hardware, no network. |
+| `tests/test_web.py` | The viewer: index, aggregation, health, HTTP. Asserts it can never become a second Modbus client. |
 | `examples/` | A redacted excerpt of `dump.py --json` output. |
 
 The Python files sit flat at the repository root on purpose: Python puts the
@@ -429,6 +451,227 @@ No AC charger exists on the reference install; only units **1** (inverter) and
 
 ---
 
+## `serve.py` — the local web viewer
+
+```
+serve.py [--port N] [--bind ADDR] [--data-dir DIR] [--check] [--verbose]
+```
+
+A single page that plots what the house and the inverter have been doing, decoded
+on demand from the archive already on disk. Defaults to the last
+`web_default_hours` and scrolls back over the whole series.
+
+**It never touches the inverter.** It imports the decode half of the toolchain and
+nothing else; `lib.Modbus` is never constructed, and `tests/test_web.py` asserts
+that with an AST scan rather than a grep, so the docstring saying so cannot be what
+satisfies the test. That matters because the device should have exactly one client
+— the logger — and concurrent-client behaviour is unmeasured.
+
+```sh
+python3 serve.py                    # config.json's port and bind address
+python3 serve.py --check            # what it can see, without serving. Debug a deploy.
+python3 serve.py --data-dir data/1hz-20260814   # view a superseded series
+```
+
+`--check` prints the plan hash, the archive extent, how many fields are plottable,
+and how long the default window takes to build — the quickest way to tell "the
+viewer is broken" from "that directory has no archive in it".
+
+### What is on the page
+
+| | |
+|---|---|
+| Live strip | PV, load, battery, grid, SOC and plant state, each with a sparkline over the window. Values are the newest **good** sample, labelled `last known good` when the device is not answering. |
+| Energy this window | Differences of the device's own lifetime counters — the independent cross-check, not an integral of the power series. |
+| Power flow | Grid, load, battery and PV on one kW axis, with the sign conventions on the card. |
+| Battery SOC | Its own chart. Never a second y-axis on the power plot. |
+| PV strings | Per-string current, and voltage behind a toggle. `pv1..pv4` only: the other 32 documented channels return the −1 absent marker here. |
+| Grid quality | Frequency, phase A voltage and power factor, as separate small charts. |
+| Temperatures | PCS internal and average cell, both °C, so one axis is honest. |
+| Plant state | Running state, grid connection and EMS work mode as labelled bands; all six alarm words OR-ed over each bucket. |
+| Capture health | Tick latency median/p95/max per bucket, with outage and no-record spans shaded. |
+| Custom chart | Any of the ~259 captured fields. Fields sharing a unit share an axis; a mixed-unit pick becomes one chart per unit. |
+
+Arrow keys move through history, `+`/`−` zoom, `n` jumps to now. Focus a chart and
+the arrows move its crosshair instead. The window is in the URL, so a view can be
+bookmarked or sent to someone.
+
+### Windows, buckets and stride
+
+The page asks for a *window*; how to build it is `series.py`'s business, and every
+choice it makes is reported back and shown in the filter row.
+
+- **Bucket width** comes from a fixed ladder (…30 s, 60 s, 120 s, 300 s…) targeting
+  ~900 points, so 6 h → 30 s, 24 h → 120 s, 7 d → 900 s. A ladder rather than
+  span÷900 means panning and re-polling land on cache entries that already exist.
+- Each bucket carries **min, mean and max**, so one point per 30 s of 0.5 Hz data
+  still shows the spikes. The line is the mean; the min–max is in the tooltip, the
+  table view and the CSV.
+- Buckets are keyed on **absolute epoch**, so a bucket straddling two archive files
+  is assembled exactly from both.
+- **Stride**: at most 64 records are decoded per bucket, which is what makes a
+  month-long window cost about what a six-hour one costs. It only engages when a
+  bucket holds more than 64 records (from 600 s buckets upward at 0.5 Hz), it never
+  skips a slow-tier record, and the filter row says `sampled 1 record in N` when it
+  is on. Nothing is dropped silently.
+- **Cache**: per file, per field, per bucket width. A rotated `.bin.gz` can never
+  change, so its summary is final. The open `.bin` is **extended, not re-read** — it
+  grows every couple of seconds, so its summary carries the byte offset it reached
+  and resumes from there. Records are append-only, which is what makes that sound.
+- If a window needs more cold decoding than the warm budget (3 s), the server
+  returns what it has, says `pending_files`, finishes the rest on a background
+  thread, and the page labels itself partial and re-asks. Files are read
+  newest-first, so a partial answer is the recent end of the window.
+- **Decoding is serialised** across every request thread and the warm thread. The
+  server is threaded so a slow window cannot block the page's assets, but decoding
+  is CPU-bound and the logger has a 2 s tick to hit on the same host.
+
+Measured on the reference host (26 files, 4 MB, 0.5 Hz, 34 fields):
+
+| | |
+|---|---|
+| Live poll, 6 h window, steady | **0.15 s** (0.70 s before the open file was read incrementally) |
+| `/api/latest` | 0.03 s |
+| First 24 h view, everything cold | 3.1 s for 5 of 26 files, rest warmed in the background |
+| 24 h view once warm | 0.24 s |
+
+### Reading a gap correctly
+
+The three cases the page keeps apart, because they have different causes and the
+same blank space:
+
+| On screen | Means |
+|---|---|
+| Line **breaks** | More consecutive buckets are empty than the field's own cadence explains. Never a straight line drawn through an outage. |
+| Orange hatch, "device not answering" | Records were written, with no blocks in them — the logger is healthy and the inverter is not. |
+| Grey hatch, "no records" | Nothing was written at all: the logger stopped, or files were moved or pruned. |
+
+Latency is quoted over records that **returned data**; an outage probe's latency is
+the socket timeout, not the device's, so it would swamp any bucket it landed in
+(see [Findings 7](docs/FINDINGS.md)). Bucket max is exact; median and p95 come from
+up to 64 samples per bucket.
+
+### The API
+
+Plain JSON, same-origin, no CORS header — so a hostile page on your LAN cannot read
+your archive through your browser.
+
+| Endpoint | Returns |
+|---|---|
+| `/api/meta` | Plan hash, archive extent, block plan, the panel definitions, and the field catalogue with units, cadences, enum labels and duplicate markers. |
+| `/api/window?hours=6&end=…&panels=…&fields=…` | The bucket grid, per-field min/mean/max, health, window energy, bucket width, stride, timezone change points. |
+| `/api/latest` | Newest good sample, with data-age and record-age reported separately. |
+| `/api/csv?…` | The window as CSV; `&raw=1` for per-record rows in `decode.py`'s shape. |
+| `/api/stats` | Cache hit counts and warm-thread state. |
+
+Which fields make up which chart lives in `PANELS` at the top of `serve.py`, so a
+new chart is a dict there, not new JavaScript. A test asserts every field named in
+it is actually covered by the block plan — otherwise a typo would render an empty
+chart that looks like a quiet night.
+
+### Exposure and privacy
+
+A wildcard `web_bind` listens on **both IPv4 and IPv6** — one `AF_INET6` socket with
+`IPV6_V6ONLY` cleared. That is not a detail: macOS prefers IPv6 for a `.local` name,
+so a v4-only listener refuses the browser's first attempt while `curl` silently falls
+back and appears to prove the server fine ([Findings 12](docs/FINDINGS.md)). The
+startup banner states which families the socket accepts. An explicit address is
+honoured as given: `127.0.0.1` is v4-only, `::1` is v6-only.
+
+`web_bind` defaults to `0.0.0.0`, so **anyone who can reach the host on `web_port`
+can read your telemetry**. That is usually what you want on a home LAN and is why
+the API withholds the unit's serial, firmware and the inverter's address unless
+`web_show_identity` is true — a manifest identifies an installation, and none of it
+is needed to read a chart.
+
+There is no authentication and no TLS. Do not port-forward it, for the same reason
+you do not port-forward the inverter.
+
+### When the browser cannot reach it: `bin/tunnel.sh`
+
+A **managed laptop** — corporate VPN, content filter, MDM proxy policy — can refuse
+RFC1918 destinations outright. The browser reports `ERR_ADDRESS_UNREACHABLE` for both
+the `.local` name *and* the raw IP, while `curl` on the same machine, `ssh` to the
+same host, and any other device on the LAN all work. Nothing reaches the server, so
+its log stays empty and it looks dead.
+
+Run this **on the viewing machine** and the browser only ever talks to `127.0.0.1`:
+
+```sh
+bin/tunnel.sh youruser@yourhost.local          # then open http://localhost:8787/
+bin/tunnel.sh youruser@yourhost.local 8787 9000   # if 8787 is taken locally
+```
+
+It needs no sudo, changes nothing on the capture host, and leaves `web_bind` as it
+is — other devices keep using the LAN address. For a stricter setup, set
+`"web_bind": "127.0.0.1"` so the tunnel is the *only* way in.
+
+### One keystroke on a Mac: `deploy/install-launcher.sh`
+
+Typing an `ssh` command every time is friction that stops you looking at the data.
+This generates **two** small apps in `~/Applications`, both of which Spotlight
+indexes:
+
+```sh
+deploy/install-launcher.sh youruser@yourhost.local           # Sigen Viewer + Sigen Viewer Stop
+deploy/install-launcher.sh youruser@yourhost.local 8787 9000 "Solar"
+```
+
+| Cmd-Space, then | Does |
+|---|---|
+| `sigen` | Opens the tunnel if needed, then the page. |
+| `sigen stop` | Closes the tunnel. |
+
+**Opening** is idempotent, and the reuse check is over an SSH **control socket**
+(`ssh -O check`) rather than "is anything listening on 8787" — something else on
+that port is not a thing to hand a browser. So:
+
+- our tunnel already up → just opens the page (a second launch is instant);
+- a tunnel *you* started with `bin/tunnel.sh` → reused, identified by asking
+  `/api/stats` whether the thing on the port really is the viewer;
+- port held by something that is not the viewer → says so, and suggests a rebuild
+  on another port;
+- nothing there → `ssh -M -S … -f -N -L …`, waits for the forward, opens the page.
+  Cold start to page in under a second on the reference setup.
+
+**Closing** is explicit: `sigen stop` does `ssh -O exit` on our own tunnel, or falls
+back to matching the forward on the command line for one started by hand, and
+notifies either way. From a terminal, `pkill -f sigen-viewer-8787` does the same.
+The tunnel also ends by itself when the network drops (`ServerAliveInterval 30 × 3`).
+
+**Or close it from the page.** A `Close tunnel` chip appears in the filter row
+whenever the viewer is reached over `localhost` — i.e. only when there is a tunnel to
+close. It cannot ask the server to do it (the server is on the capture host and
+cannot touch your Mac), so it hands off to `sigen-stop://`, a URL scheme the Stop app
+registers. The first click raises the browser's one-time *"Open Sigen Viewer Stop?"*
+prompt; allow it. The page then stops polling, says what it is showing is now a
+snapshot, and tells you how to reopen. If nothing handles the scheme it says *that*
+instead and resumes polling — it re-checks for up to 16 s rather than assuming, so
+answering the prompt slowly is not reported as a failure.
+
+> Only the closer registers a scheme. Any page you visit can trigger a registered
+> one, and "close a localhost forward to my own machine" is harmless to hand out,
+> whereas "open an SSH connection to my home machine and pop a browser tab" is not.
+> Reopening stays a Spotlight keystroke.
+
+> **There is no idle auto-close, and that is a deliberate retreat.** One was built
+> and measured: launchd owns a Spotlight-launched app as a job and tears the job
+> down when the app exits, killing a watcher process the app spawned within a second
+> or two — even with `setsid()` in its own session. It survived only when the
+> executable was run from a terminal. `ControlPersist` is no help either: with a
+> `-N` master its idle timer never starts. Doing it properly means a LaunchAgent on
+> the viewing Mac, which is more footprint than a launcher deserves. See
+> [Findings 14](docs/FINDINGS.md).
+
+Both apps are `LSUIElement`, so they take no Dock slot and steal no focus, and both
+log to `~/Library/Logs/sigen-viewer.log`. `BatchMode=yes` is set on the SSH call: a
+GUI app has no terminal, so it fails visibly in a dialog rather than hanging on a
+hidden password prompt. They are generated rather than committed — the host, user
+and ports belong to your installation. Uninstall with
+`rm -rf ~/Applications/"Sigen Viewer.app" ~/Applications/"Sigen Viewer Stop.app"`.
+
+---
+
 ## Topology drift detection
 
 If your install is unfinished — a battery pack on order, an EV charger to come —
@@ -491,6 +734,19 @@ sudo deploy/install-daemon.sh      # renders the plist, installs root:wheel 644,
 sudo deploy/uninstall-daemon.sh    # boots out and removes; leaves the archive
 ```
 
+The viewer is a **second, separate daemon**, so restarting it — which you will do
+whenever you change the page — cannot interrupt capture, and a crash in it cannot
+take the logger down:
+
+```sh
+sudo deploy/install-viewer.sh      # needs web_launchd_label and web_port in config.json
+sudo deploy/uninstall-viewer.sh
+```
+
+It runs `ProcessType: Background` and `os.nice(5)`s itself, so the logger — which is
+`Interactive` and latency-sensitive — wins any contention for CPU. `web_port` must
+be above 1024; the viewer runs as `run_as_user`, not root.
+
 The plist sets `KeepAlive` to restart on crash, `ThrottleInterval: 30` so a crash
 loop can't hot-spin, `ProcessType: Interactive` so macOS doesn't throttle a
 latency-sensitive polling loop, and `python3 -u` so the heartbeat isn't buffered
@@ -528,8 +784,10 @@ presses the button.
 
 ```sh
 bin/latest.sh                          # newest record, vertical
-bin/status.sh                          # daemon state, heartbeats, archive size
+bin/status.sh                          # both daemons, heartbeats, archive size
 tail -f <log_dir>/sigen.log
+tail -f <log_dir>/viewer.log           # the viewer logs errors and page loads only
+python3 serve.py --check               # what the viewer sees in the archive
 ```
 
 Log lines worth grepping: `[gap]` (schedule rebase after a stall), `[degraded]`
@@ -580,6 +838,17 @@ updating.
 | Flood of `[gap]` lines, `retries` climbing | The device is unreachable. Confirm with `ping` / `nc -z host 502`. Expected during installer work or a power-down; capture resumes by itself. |
 | `[degraded]` with no `[recovered]` | Still unreachable. Empty records (mask 0) continue to mark the outage in the archive. |
 | Heartbeat silent but records accumulating | Only possible if `bucket_s` and `fast_period_s` interact badly. Emission is on bucket transition. |
+| Viewer says "The viewer has nothing to show" | `data_dir` holds no `*-<planhash>.bin` **and** matching `*.manifest.json` pair. It does not recurse — point `--data-dir` at the subdirectory to view a moved series. |
+| Viewer crash-loops, `viewer.err` says `cannot bind` | Something already holds `web_port` — usually an older viewer under a previous `web_launchd_label`. `pgrep -f serve.py`, and boot out the old label. |
+| Browser says **connection refused**, but `curl` to the same URL works | An IPv4-only listener, refusing the IPv6 address mDNS advertises for a `.local` name. A wildcard bind is dual-stack now; the startup banner says `socket accepts IPv4 and IPv6`. If it says `IPv4`, that is the bug — see [Findings 12](docs/FINDINGS.md). |
+| Browser says **`ERR_ADDRESS_UNREACHABLE`** for the `.local` name | The browser picked an IPv6 address from mDNS that this client cannot route to. Use the raw IPv4 address — the startup banner prints it. |
+| `ERR_ADDRESS_UNREACHABLE` for the **raw IP too** | The client has no route to that network at all: a VPN or content filter capturing RFC1918, or a different subnet. Not a server problem — the viewer's log will show no request. Use `bin/tunnel.sh`. |
+| Viewer log shows **no requests at all** from the machine you are on | The connection is not arriving. Check in this order: raw IP instead of the name, then `bin/tunnel.sh`. The server is fine if another device or `curl` on the host works. |
+| Chart shows "partial: N file(s) still being read" | A cold window bigger than the 8 s warm budget. The rest is being summarised in the background; the page re-asks on its own. Only happens once per file. |
+| `sampled 1 record in N` chip appears | Expected above ~10 min buckets: at most 64 records per bucket are decoded. Zoom in for exact min/max. |
+| Viewer shows a straight line where you expected a gap | It should not — report it. Lines break when the empty run exceeds the field's cadence; a joined line means the gap was shorter than that. |
+| Viewer values differ from `bin/latest.sh` | `latest.sh` prints the newest record; the page's tiles print the newest record that **carried data**, and label it `last known good`. They differ exactly during an outage. |
+| Page loads but every chart is empty | Check the window: panning back past the start of the archive is legal and shows nothing. Press **Now**. |
 
 ---
 

@@ -67,6 +67,16 @@ DEFAULTS = {
     "gap_log_quiet_s": 60,
     "bucket_s": 300,
 
+    # --- the local viewer (serve.py) --------------------------------------
+    # The viewer reads the archive on disk and never opens a Modbus client, so
+    # exposing it costs the inverter nothing. What it does expose is your
+    # telemetry, hence web_show_identity.
+    "web_port": 8787,
+    "web_bind": "0.0.0.0",     # "127.0.0.1" to require an SSH tunnel
+    "web_launchd_label": "local.sigen-viewer",
+    "web_default_hours": 6,
+    "web_show_identity": False,
+
     # --- privacy ----------------------------------------------------------
     # Manifests carry model/serial/firmware so an archive can be traced to the
     # unit that produced it. Set false before sharing raw archives.
@@ -75,14 +85,16 @@ DEFAULTS = {
 
 INT_KEYS = ("port", "plant_unit", "inverter_unit", "fast_period_s",
             "rotate_minutes", "keep_days", "degrade_after", "degrade_probe_s",
-            "recycle_s", "max_lag_s", "gap_log_quiet_s", "bucket_s")
+            "recycle_s", "max_lag_s", "gap_log_quiet_s", "bucket_s",
+            "web_port", "web_default_hours")
 FLOAT_KEYS = ("timeout_s",)
-BOOL_KEYS = ("manifest_identity",)
+BOOL_KEYS = ("manifest_identity", "web_show_identity")
 PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 
 # Keys exported to sh by --sh, as SIGEN_<UPPER>.
 SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
-           "launchd_label", "run_as_user", "fast_period_s")
+           "launchd_label", "run_as_user", "fast_period_s",
+           "web_port", "web_bind", "web_launchd_label")
 
 
 class ConfigError(SystemExit):
@@ -185,6 +197,11 @@ def load(require_host=True, overrides=None):
                           "per second)")
     if cfg["degrade_after"] < 1:
         raise ConfigError("degrade_after must be >= 1")
+    if not 1 <= cfg["web_port"] <= 65535:
+        raise ConfigError(f"web_port {cfg['web_port']} is not a TCP port; "
+                          "use something above 1024 so the viewer needs no root")
+    if cfg["web_default_hours"] < 1:
+        raise ConfigError("web_default_hours must be >= 1")
     return cfg
 
 
@@ -211,6 +228,7 @@ def render(cfg, template):
                           '"run_as_user": "<your login>" to config.json.')
     subs = {
         "@LABEL@": cfg["launchd_label"],
+        "@WEB_LABEL@": cfg["web_launchd_label"],
         "@PYTHON@": cfg["python"],
         "@INSTALL_DIR@": cfg["install_dir"],
         "@DATA_DIR@": cfg["data_dir"],

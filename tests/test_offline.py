@@ -566,7 +566,8 @@ class TestReadOnly(unittest.TestCase):
 
     def test_no_source_file_issues_a_write_function_code(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for name in ("lib.py", "log.py", "dump.py", "decode.py"):
+        for name in ("lib.py", "log.py", "dump.py", "decode.py", "series.py",
+                     "serve.py"):
             with open(os.path.join(here, name)) as fh:
                 src = fh.read()
             for fc in (" 5,", " 6,", " 15,", " 16,"):

@@ -259,6 +259,195 @@ afterwards, and both look alarming if you do not expect them:
 
 ---
 
+## Reading the archive back is cheap; reading it back *repeatedly* needs care
+
+Measured on the capture host, decoding straight out of the rotated `.bin.gz` files:
+
+| Work | Cost |
+|---|---|
+| 6 h, 11,651 records, 30 fields → CSV (`decode.py`) | **0.46 s** |
+| 6 h, 21 fields, bucketed to 720 points (`series.py`, cold) | **~0.2 s** |
+| the same window again, per-file summaries cached | **~3 ms** |
+
+So an interactive viewer over a day of data needs no index and no database. What it
+does need is a bound on work that does not grow with the window, because the archive
+does: at 0.5 Hz it is ~43,000 records/day, so a year is ~15.8 M records and decoding
+every one of them per page load is minutes, not milliseconds.
+
+Two properties give that bound, and both are worth stating because the obvious
+implementations of each are subtly wrong:
+
+- **At most 64 records are decoded per bucket** (`series.SAMPLES_PER_BUCKET`), so
+  cost tracks the ~900 points a screen can show, not the span. The stride must come
+  from the bucket width and the manifest's cadence *only* — never from the requested
+  window — or the same file summarises differently depending on how it was asked
+  for, and the cache silently stops being a cache. It must also use **ceiling**
+  division: flooring left 75 samples in a 600 s bucket, quietly breaking the bound
+  it exists to enforce.
+- **Bucket keys are absolute** (`ts // bucket_s`), not offsets from the window
+  start. Panning then re-uses cached summaries instead of re-slicing every file, and
+  a bucket that straddles two archive files is assembled exactly from both. With
+  window-relative keys the straddling bucket loses whichever half arrives second,
+  which reads as a small dip in the data rather than as a bug.
+
+One more constraint, from the archive format rather than from performance: records
+are **variable length** — the bitmask decides how long each one is — so there is
+nothing to seek to. Any question about a time range costs a walk of every record
+header in the overlapping files. That is why immutability of a rotated `.bin.gz` is
+load-bearing.
+
+### The open file is the expensive one, and the obvious cache key makes it worse
+
+Keying a summary on `(path, size, mtime)` is right for a rotated file and quietly
+wrong for the one being written. It changes every couple of seconds, so every poll
+invalidated the entry and re-decoded up to an hour of records to learn what the last
+five said: **0.70 s of CPU per 10 s poll**, continuously, on the host whose logger has
+a 2 s tick to hit.
+
+Records are append-only, so the fix is to carry the byte offset the summary reached
+and resume from there — 0.70 s → **0.15 s**, and what remains is assembling the
+response rather than decoding. Two things this needs to be correct:
+
+- **Every field of the open file must share one offset.** Extending only the fields a
+  caller happened to ask for, while advancing the shared resume marker, leaves the
+  others stranded at the old offset — they then skip the records in between and read
+  low forever. So a field added mid-poll rebuilds them all together.
+- **The offset must be the byte after the last COMPLETE record.** A torn final record
+  (a hard kill mid-write) is not counted, so the next poll re-reads those bytes, by
+  which time they are usually a whole record.
+
+### One core, whatever the browser does
+
+The viewer is a threaded server, so N simultaneous requests decoded on N cores. Three
+concurrent 6-hour windows during a deploy took the logger's 5-minute median from
+~90 ms to **164 ms** and one tick to **1943 ms** — past its own 1800 ms soak gate,
+though with zero retries, zero failures and no records lost. Decoding is now
+serialised behind one re-entrant lock shared with the background warmer, so the
+viewer costs at most one niced core no matter how many tabs are open.
+
+The general lesson, and the reason this is in Findings rather than a commit message:
+**a reader that shares a host with a real-time writer is not free.** Measure it
+against the writer's own metric — here, `decode.py --latency` on the archive the
+logger is still writing — not against the reader's response times.
+
+### The viewer groups by plan hash itself rather than calling `check_plan_hash()`
+
+`decode.py`'s guard `sys.exit()`s on a mismatch, which is right for a CLI and
+unavailable to a server. So `series.discover()` groups files by the hash in their
+filename and pairs each group with its own manifest, which makes a mixed-plan decode
+*impossible* instead of *fatal*. The viewer then opens the plan holding the newest
+record and says so on the page; a superseded series in a subdirectory is viewed by
+pointing `--data-dir` at it.
+
+Generalise: a guard that aborts the process is a guard a long-running reader cannot
+use. Prefer making the bad state unrepresentable to detecting it late.
+
+### 12. "It is listening" is not "it is reachable", and curl hides the difference
+
+The viewer's first deploy served nothing to a browser while every command-line check
+passed. `launchctl` said `state = running`, `lsof` showed `TCP *:8787 (LISTEN)`,
+`curl http://yourhost.local:8787/api/latest` returned live JSON — and Chrome said
+connection refused.
+
+The listener was IPv4-only, because `ThreadingHTTPServer` is `AF_INET` and binding
+`0.0.0.0` means only v4. mDNS advertises the host's AAAA records alongside its A
+record, and macOS prefers IPv6, so a browser opening a `.local` name tries
+`fe80::…` first and gets an immediate RST from a v4-only socket.
+
+What made it hard to see is that **curl succeeded**: Happy Eyeballs falls back to the
+next address after a refusal, so `curl -v` quietly reported
+`Trying [fe80::…] … Connection refused` and then `Connected to 192.168.1.42`, exit
+code 0. Every diagnostic that used curl confirmed a working server.
+
+Two transferable rules:
+
+- A wildcard bind should open an `AF_INET6` socket with `IPV6_V6ONLY` cleared, which
+  accepts both families on one socket. An explicit address is honoured as given —
+  asking for `127.0.0.1` means only that.
+- When a service works from the shell and not from an application, compare *which
+  address each one connected to* before anything else. `curl -v | grep Trying` and
+  `lsof -nP -iTCP:<port>` answer it in one line each: if lsof says `IPv4` and curl
+  says it tried `[…]` first, that is the bug. The viewer now prints
+  `socket accepts IPv4 and IPv6` at startup so the claim is on the record rather
+  than inferred.
+
+### 13. The server log answers "is it me or them?" before any theory does
+
+Fixing the dual-stack bug did not fix the reported symptom: a managed work laptop
+still showed `ERR_ADDRESS_UNREACHABLE`, first for the `.local` name and then for the
+raw `192.168.1.42` too. Meanwhile the same page loaded fine from `curl`, from an
+automated Chrome with a throwaway profile on that same laptop, and over IPv4, the
+IPv6 ULA and the IPv6 link-local address individually.
+
+The measurement that ended the guessing was one line — every distinct client address
+the viewer had ever logged:
+
+```
+grep -oE '\[2026[^]]*\] [0-9a-f.:]+' logs/viewer.log | awk '{print $3}' | sort | uniq -c
+```
+
+One address: the machine running the tests. **Not a single request from the browser
+had ever arrived.** That excludes the server, the socket, the firewall and the
+address family in one step, and it does so without a hypothesis — everything after
+that is on the client. `ERR_ADDRESS_UNREACHABLE` on a raw RFC1918 address is the
+kernel or a filter saying there is no route: a VPN or content-filter policy that
+captures private ranges, or simply a different subnet.
+
+Two lessons, and the second is the one worth keeping:
+
+- **`ERR_CONNECTION_REFUSED` and `ERR_ADDRESS_UNREACHABLE` are different diagnoses.**
+  Refused means something answered; unreachable means nothing was even attempted on
+  the wire. The first fix (dual-stack) addressed a refusal. The second symptom was
+  never the same bug, and treating "the browser still cannot see it" as evidence the
+  first fix failed would have sent the search back to the server.
+- **A reader can be perfectly healthy and still unreachable, and only the server's
+  own log distinguishes those.** So the viewer logs page loads and errors while
+  suppressing successful API polls: quiet enough to run for months, loud enough that
+  "did anything arrive?" is answerable. `bin/tunnel.sh` is the answer once the client
+  is the problem — it rides the SSH connection that demonstrably works, so the
+  browser only ever talks to `127.0.0.1`.
+
+### 14. launchd reaps what a Spotlight-launched app spawns, and a race hides it
+
+The viewer's Mac launcher was meant to close its SSH tunnel after an idle period, via
+a small watcher process the app started alongside the tunnel. It did not work, and
+the way it failed is the interesting part.
+
+`ssh -f` — forked into the background by the same script, from the same app —
+survived indefinitely: still forwarding 95 seconds later, and after that for as long
+as it was left. The watcher, a `/bin/sh` loop, was dead within a second or two of
+every launch. Adding `nohup` changed nothing, which is expected: it only ignores
+SIGHUP. Adding a proper `setsid()` via a Python double-fork changed nothing either,
+which is *not* what the textbook predicts — a new session should escape a process
+group teardown. Verified from both directions: run the app's executable from a
+terminal and the watcher lives; launch the identical bundle from Spotlight
+(`open -a`) and it does not.
+
+Two traps sat on top of each other:
+
+- **A race made it look intermittent.** The launcher forks the watcher and then
+  `exec`s `open`; launchd tears down the job when that exits. Adding a single log
+  line before the fork shifted the timing by a few milliseconds and the watcher
+  survived — once. Long enough to believe the fix worked. Adding a *deterministic*
+  wait (poll `pgrep` until the marker appears, proving the child had exec'd) removed
+  the race and showed the truth: the watcher is confirmed running, and is then killed
+  anyway.
+- **`ControlPersist` is not an idle timeout for a forward.** Its timer measures time
+  with no *multiplexed clients*; a `-N` master has none, so the timer never starts. A
+  master with `ControlPersist=30s` was still alive 70 s later with no traffic — while
+  a master under continuous load stayed up too. It answers neither question.
+
+So the feature was removed rather than shipped broken, and closing is explicit: a
+second Spotlight app that does `ssh -O exit`. Doing it properly needs a LaunchAgent,
+because launchd will not kill what launchd owns.
+
+The transferable rule: **background work started by a GUI app is not yours to keep.**
+If it must outlive the launch, it has to be owned by launchd (an agent), not merely
+detached — and when a lifetime bug looks intermittent, add a barrier that proves the
+thing exists before you conclude anything from it surviving once.
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is
@@ -286,5 +475,14 @@ afterwards, and both look alarming if you do not expect them:
   groups are swept and reported, and this unit refuses most of them.
 - **Reboot survival is configured but unobserved.** The LaunchDaemon is correct for
   it — root:wheel 644, not in the disabled list — but no reboot has been tested.
+- **The viewer is unproven past a few days of archive.** Its per-file summary cache
+  is in memory only, so a restart re-warms lazily, and nothing has been measured
+  against a month or a year of files. If deep history gets slow, the fix is an
+  on-disk summary cache — rotated files are immutable, so one is safe to keep — not
+  a coarser bucket ladder.
+- **The viewer's effect on capture latency has not been measured.** It is
+  `ProcessType: Background`, nices itself, and serialises decoding on one thread,
+  but "the logger is unaffected" is a design argument, not an observation. Watch
+  `decode.py --latency` across a period of heavy browsing before believing it.
 - The smart-load span `30124..30199` is deliberately uncaptured, and `30163+124` is
   rejected by the device, so folding it in would need a 4th request.

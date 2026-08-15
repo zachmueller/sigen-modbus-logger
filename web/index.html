@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<!--
+  The local viewer's one page. Served by serve.py from this directory; nothing is
+  fetched from anywhere else, so it works on a host with no internet at all.
+
+  No framework and no chart library on purpose: the rest of this repository is
+  stdlib-only Python with nothing to install, and a viewer that needed a CDN
+  would be the one part of it that stops working offline.
+-->
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>SigenStor telemetry</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body class="viz-root">
+
+<header class="topbar">
+  <div class="brand">
+    <h1>SigenStor telemetry</h1>
+    <p class="sub" id="provenance">reading the archive…</p>
+  </div>
+  <div class="freshness" id="freshness" role="status" aria-live="polite"></div>
+</header>
+
+<!-- Filters: one row, above everything they scope. -->
+<div class="filters" id="filters">
+  <div class="group" role="group" aria-label="Window length">
+    <span class="glabel">Window</span>
+    <div class="presets" id="presets"></div>
+  </div>
+  <div class="group" role="group" aria-label="Move through history">
+    <span class="glabel">History</span>
+    <button id="back" title="Back half a window (left arrow)">←</button>
+    <button id="fwd" title="Forward half a window (right arrow)">→</button>
+    <button id="now" title="Jump to the newest data (n)">Now</button>
+    <label class="stack"><span class="tiny">End of window</span>
+      <input type="datetime-local" id="endat" step="1"></label>
+  </div>
+  <div class="group">
+    <span class="glabel">Updates</span>
+    <label class="check"><input type="checkbox" id="live" checked> <span>Live (10 s)</span></label>
+    <button id="reload" title="Reload now">Reload</button>
+  </div>
+  <div class="group grow right">
+    <span class="chip" id="chip-bucket" hidden></span>
+    <span class="chip" id="chip-stride" hidden></span>
+    <span class="chip warn" id="chip-warming" hidden></span>
+    <a class="chip link" id="csv" download>Download CSV</a>
+    <!-- Only shown when the page is reached through an SSH tunnel, i.e. on
+         localhost. It hands off to the Stop app via a URL scheme, because the
+         tunnel lives on THIS machine and the server does not. -->
+    <a class="chip link" id="close-tunnel" href="sigen-stop://close" hidden
+       title="Closes the SSH tunnel on this Mac (Sigen Viewer Stop)">Close tunnel</a>
+  </div>
+</div>
+
+<p class="notice" id="disconnected" hidden></p>
+
+<p class="hint" id="hint">
+  Arrow keys move through history; <kbd>+</kbd>/<kbd>−</kbd> zoom; <kbd>n</kbd> jumps to now.
+  Focus a chart and the arrows move its crosshair instead.
+</p>
+
+<main>
+  <!-- Live strip: a handful of headline numbers, so stat tiles rather than a chart. -->
+  <section class="tiles" id="live-tiles" aria-label="Latest values"></section>
+
+  <!-- Window totals, from the device's own lifetime counters. -->
+  <section class="card" id="energy-card">
+    <div class="card-head">
+      <h2>Energy this window</h2>
+      <p class="note">Differences of the device's lifetime counters over the window —
+        the independent cross-check on the power series, not an integral of it.</p>
+    </div>
+    <div class="tiles compact" id="energy-tiles"></div>
+  </section>
+
+  <div id="panels"></div>
+
+  <!-- Ad-hoc charts over anything the capture blocks cover. -->
+  <section class="card" id="custom-card">
+    <div class="card-head">
+      <h2>Custom chart</h2>
+      <p class="note">Any of the captured register fields. Fields sharing a unit go on
+        one axis; a mixed-unit selection becomes one chart per unit rather than a
+        second y-axis.</p>
+    </div>
+    <div class="picker">
+      <label class="stack grow"><span class="tiny">Search fields</span>
+        <input type="search" id="field-search" placeholder="soc, temperature, alarm, 31027…"
+               autocomplete="off"></label>
+      <label class="check"><input type="checkbox" id="show-dupes">
+        <span>include duplicate registers</span></label>
+      <span class="tiny" id="field-count"></span>
+    </div>
+    <ul class="results" id="field-results"></ul>
+    <div class="chosen" id="field-chosen"></div>
+  </section>
+</main>
+
+<footer id="footer"></footer>
+
+<div class="tooltip" id="tooltip" role="tooltip" hidden></div>
+
+<script src="/charts.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -16,6 +16,13 @@
  "launchd_label": "local.sigen-logger",
  "run_as_user": "youruser",
 
+ "__viewer": "serve.py, the local web viewer. It only reads the archive on disk -- it never opens a Modbus client. web_bind 0.0.0.0 means anyone on your LAN can read your telemetry; use 127.0.0.1 and an SSH tunnel if you would rather they could not.",
+ "web_port": 8787,
+ "web_bind": "0.0.0.0",
+ "web_launchd_label": "local.sigen-viewer",
+ "web_default_hours": 6,
+ "web_show_identity": false,
+
  "fast_period_s": 2,
  "rotate_minutes": 60,
  "keep_days": 0,

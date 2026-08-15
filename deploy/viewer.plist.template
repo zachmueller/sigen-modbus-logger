@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The local web viewer, rendered by deploy/install-viewer.sh via
+     `config.py --render`. Do not install this file directly: the placeholders are
+     filled from config.json.
+
+     A separate daemon from the logger on purpose. The viewer reads the archive and
+     never opens a Modbus connection, so restarting it cannot interrupt capture, and
+     a crash in it cannot take the logger down. Port and bind address come from
+     config.json (web_port, web_bind), read by serve.py at startup. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@WEB_LABEL@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PYTHON@</string>
+		<!-- -u so the request log is not buffered away -->
+		<string>-u</string>
+		<string>@INSTALL_DIR@/serve.py</string>
+		<string>--data-dir</string>
+		<string>@DATA_DIR@</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>@INSTALL_DIR@</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- So a crash loop cannot hot-spin -->
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<!-- Run as a normal user, not root: the viewer needs no privilege, and
+	     web_port must be above 1024 for that to hold -->
+	<key>UserName</key>
+	<string>@USER@</string>
+	<!-- Background, NOT Interactive: the logger is the latency-sensitive process on
+	     this host and must win any contention. serve.py also nices itself. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@LOG_DIR@/viewer.log</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG_DIR@/viewer.err</string>
+</dict>
+</plist>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Sigen viewer">
+  <!-- A power trace on a rounded surface. Same palette roles as the charts. -->
+  <rect width="32" height="32" rx="7" fill="#1a1a19"/>
+  <path d="M3 22 L9 22 L12 11 L16 26 L20 8 L23 17 L29 17" fill="none" stroke="#eda100"
+        stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
