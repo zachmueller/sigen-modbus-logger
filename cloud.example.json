@@ -1,0 +1,23 @@
+{
+ "_": "Copy to cloud.json and edit. cloud.json is NOT committed: it holds an account id, a domain, a Google client id and other people's email addresses, and this repository is public. Keys starting with _ are ignored, so these lines can stay. Nothing here is a secret in the cryptographic sense -- the one actual secret, the Google OAuth client secret, is never stored at all: it is passed as a NoEcho CloudFormation parameter at deploy time and re-entered on each deploy.",
+
+ "__aws": "Where it deploys. Everything is us-east-1: Lambda@Edge and ACM certificates must live there, so using one region throughout removes every cross-region stack reference. profile is a named ~/.aws profile -- credentials never sit in this tree.",
+ "account_id": "000000000000",
+ "region": "us-east-1",
+ "profile": "sigen",
+
+ "__site": "The public face. domain must be a subdomain you can delegate: the deploy creates a Route53 hosted zone for it and prints the nameservers to add at your registrar, so the parent zone's own records -- MX especially -- are never touched.",
+ "domain": "solar.example.com",
+ "bucket": "sigen-telemetry-example",
+
+ "__capture": "The capture host's timezone, as an IANA name. The archive's filenames, heartbeats and axis labels are all in the capture host's local clock, and series.tz_runs() reads time.localtime() -- so the ingest Lambda runs with TZ set to this, or it would label the data in UTC. Tiles themselves are partitioned on UTC boundaries regardless; only the labels are local.",
+ "capture_tz": "Pacific/Auckland",
+
+ "__auth": "Google sign-in, via a Cognito user pool with Google as the identity provider. allowed_emails is the read allowlist, checked in the viewer-request Lambda@Edge against the verified id token's email claim -- Cognito will authenticate any Google account, so this list is what actually gates the site. auth_domain_prefix must be globally unique and may not contain 'aws', 'amazon' or 'cognito'.",
+ "google_client_id": "000000000000-xxxxxxxxxxxxxxxxxxxxxxxxxxxx.apps.googleusercontent.com",
+ "auth_domain_prefix": "example-solar-auth",
+ "allowed_emails": [
+  "you@example.com",
+  "someone@example.com"
+ ]
+}

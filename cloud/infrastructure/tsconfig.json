@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "lib": ["es2022"],
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "inlineSourceMap": true,
+    "inlineSources": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "exclude": ["node_modules", "cdk.out"]
+}

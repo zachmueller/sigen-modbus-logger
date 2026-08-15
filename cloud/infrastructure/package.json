@@ -1,0 +1,24 @@
+{
+  "name": "sigen-cloud-infrastructure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "CDK app for the hosted Sigenergy telemetry viewer. The only Node in this repository, and it runs only at deploy time -- the logger and the local viewer stay stdlib-only Python.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc --noEmit",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "aws-cdk": "2.1136.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.6.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.265.0",
+    "constructs": "^10.0.0"
+  }
+}

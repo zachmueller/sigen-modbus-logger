@@ -15,6 +15,17 @@ topology-baseline.json
 /dump-snapshot*.json
 /*.dump.json
 
+# Cloud deployment: account id, bucket, domain, Google client id and the read
+# allowlist -- i.e. other people's email addresses. This repository is public.
+# cloud.example.json carries the same keys with placeholder values and IS committed.
+cloud.json
+
+# Synthesized CloudFormation. cdk.out embeds cloud.json's values in the templates and
+# in the Lambda assets, so it leaks everything cloud.json does.
+cloud/infrastructure/cdk.out/
+cloud/infrastructure/node_modules/
+cloud/**/*.template.json
+
 __pycache__/
 *.py[cod]
 .DS_Store
