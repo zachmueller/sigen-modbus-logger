@@ -566,21 +566,37 @@ def tz_runs(grid):
 
 
 def window(series, start, end, keys, bucket_s=None, cache=None,
-           warm_budget_s=WARM_BUDGET_S, warmer=None):
+           warm_budget_s=WARM_BUDGET_S, warmer=None, end_exclusive=False):
     """Bucketed min/mean/max for `keys` over [start, end).
 
     Files are read NEWEST FIRST so that when the budget runs out, what came back
     is the recent end of the window rather than a random slice of it. Whatever is
     left is reported as pending_files and handed to `warmer`; the caller can say
     so and re-ask. Nothing is silently dropped.
+
+    `end_exclusive` drops the bucket starting exactly at `end`. _grid() is
+    END-INCLUSIVE, which is right for the viewer -- a window ending "now" should
+    show the bucket now falls in -- but wrong for tiling: two adjacent spans would
+    both contain the boundary bucket, so concatenating them duplicates a point, and
+    a counter's last_value would be read from the span after this one. Dropping it
+    HERE rather than truncating the arrays afterwards is what makes the counters
+    exact: first_value, last_value and reset are derived below from the accumulators
+    this index selects.
+
+    Only meaningful when `end` is on a bucket boundary. When it is not, the final
+    bucket is genuinely part of the span and is kept either way.
     """
     keys = [k for k in dict.fromkeys(keys)]
     span_s = max(1.0, end - start)
     if bucket_s is None:
         bucket_s = choose_bucket(span_s, series.fast_period_s)
     grid = _grid(start, end, bucket_s)
+    if end_exclusive and len(grid) > 1 and end % bucket_s == 0:
+        grid.pop()
     index = {t: i for i, t in enumerate(grid)}
 
+    # Files are still selected over the FULL span: a file whose first record lands in
+    # the dropped bucket still holds records belonging to the buckets we are keeping.
     order = series.files_for(start, end)[::-1]     # newest first
     merged = {k: {} for k in keys}
     health = {}

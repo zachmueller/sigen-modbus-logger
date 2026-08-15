@@ -42,6 +42,7 @@ import lib             # noqa: E402
 import log             # noqa: E402
 import series          # noqa: E402
 import serve           # noqa: E402
+import tiles           # noqa: E402
 from test_offline import ArchiveFixture, base_cfg   # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -131,8 +132,10 @@ class TestViewerIsReadOnly(unittest.TestCase):
     """
 
     # Every module on the read side. One list, so a new one is covered by all three
-    # assertions below rather than by whichever the author remembered.
-    MODULES = ("series.py", "serve.py")
+    # assertions below rather than by whichever the author remembered. tiles.py is here
+    # because it also runs in the ingest Lambda, where a Modbus client would be pointed
+    # at a LAN address it cannot reach -- but the guarantee is the same one either way.
+    MODULES = ("series.py", "serve.py", "tiles.py")
 
     def used_names(self, name):
         with open(os.path.join(HERE, name)) as fh:
@@ -446,6 +449,246 @@ class TestEnergy(ViewerFixture):
         e = series.energy(w, [self.KEY])
         self.assertTrue(e[self.KEY]["reset"])
         self.assertGreaterEqual(e[self.KEY]["kwh"], 0.0)
+
+
+# ---------------------------------------------------------------------- tiles
+
+class TestTiles(ViewerFixture):
+    """Precomputed tiles must say exactly what a live window says.
+
+    The hosted viewer reads static tiles; serve.py decodes on demand. Both feed the
+    SAME web/app.js, so if the two paths disagree about one archive, both pages render,
+    both look plausible, and only a careful side-by-side would ever show it. That is
+    what these assert, and it is the invariant the whole hosted design rests on.
+
+    Tile spans here are 300 s at 30 s buckets rather than the real hour/day/month, so
+    the arithmetic is exercised without generating an hour of records. The arithmetic
+    is the part that goes wrong.
+    """
+
+    SOC = "plant_ess_soc"
+    KWH = "plant_accumulated_grid_import_energy"
+
+    def setUp(self):
+        super().setUp()
+        # 300 s aligned, so tile boundaries land on bucket boundaries as UTC ones do.
+        self.base = float((1786600000 // 300) * 300)
+        self.bucket = 30
+        self.span = 300
+
+    def seed_walking(self, n=300, step=2):
+        """`n` records with SOC and a lifetime counter both moving, so min/mean/max
+        differ per bucket and the counter has a real first/last per tile."""
+        recs = []
+        for i in range(n):
+            self.set_scaled(self.SOC, 20.0 + i * 0.1)
+            self.set_scaled(self.KWH, 100.0 + i * 0.01)
+            recs.append((self.base + i * step, self.full_mask(), 100 + (i % 7),
+                         self.block_payload()))
+        self.write_records("20260814T090000", recs)
+        return self.series_of()
+
+    def catalog_of(self, s):
+        return {c["key"]: c for c in series.catalog(s)}
+
+    def tile(self, s, cat, i):
+        start = self.base + i * self.span
+        return tiles.build_from_series(
+            s, cat, start, start + self.span, self.bucket,
+            field_keys=[self.SOC], counter_keys=[self.KWH], cache=self.cache)
+
+    # -- the boundary rule -------------------------------------------------
+
+    def test_adjacent_tiles_do_not_share_a_bucket(self):
+        # _grid() is END-INCLUSIVE, which is right for a viewer and wrong for tiling.
+        # Without end_exclusive the two tiles below would both carry the bucket at
+        # base+300, so a concatenated series repeats a point at every tile boundary.
+        s = self.seed_walking()
+        cat = self.catalog_of(s)
+        a, b = self.tile(s, cat, 0), self.tile(s, cat, 1)
+        self.assertEqual(a["n"], self.span // self.bucket)
+        self.assertEqual(b["n"], self.span // self.bucket)
+        a_t = [a["start"] + i * a["bucket_s"] for i in range(a["n"])]
+        b_t = [b["start"] + i * b["bucket_s"] for i in range(b["n"])]
+        self.assertEqual(set(a_t) & set(b_t), set(), "tiles overlap by a bucket")
+        self.assertEqual(a_t[-1] + self.bucket, b_t[0], "tiles must tile, with no gap")
+
+    def test_end_exclusive_leaves_an_unaligned_window_alone(self):
+        # The final bucket of a window that does not end on a boundary is genuinely
+        # part of the span. Only an exactly-aligned end is the next tile's business.
+        s = self.seed_walking(n=60)
+        for kw in ({}, {"end_exclusive": True}):
+            w = series.window(s, self.base, self.base + 305, [self.SOC],
+                              bucket_s=self.bucket, cache=series.SummaryCache(), **kw)
+            self.assertEqual(len(w["t"]), 11, kw)
+
+    def test_a_misaligned_span_is_refused_not_silently_shifted(self):
+        # A tile whose arrays do not line up with `n` draws every chart one bucket out,
+        # per tile, cumulatively. Better to refuse at build time.
+        s = self.seed_walking(n=60)
+        cat = self.catalog_of(s)
+        win = series.window(s, self.base, self.base + self.span, [self.SOC],
+                            bucket_s=self.bucket, cache=self.cache)   # no end_exclusive
+        with self.assertRaises(ValueError) as caught:
+            tiles.build(win, cat, s.plan_hash, self.base, self.base + self.span,
+                        self.bucket, [self.SOC], [])
+        self.assertIn("end_exclusive", str(caught.exception))
+
+    # -- the differential -------------------------------------------------
+
+    def test_concatenated_tiles_equal_one_live_window(self):
+        s = self.seed_walking()
+        cat = self.catalog_of(s)
+        a, b = self.tile(s, cat, 0), self.tile(s, cat, 1)
+
+        # What serve.py would answer for the same span, through the same shaper.
+        whole = series.window(s, self.base, self.base + 2 * self.span, [self.SOC, self.KWH],
+                              bucket_s=self.bucket, cache=series.SummaryCache(),
+                              warm_budget_s=0, end_exclusive=True)
+        live = tiles.columns(whole, cat, [self.SOC])
+
+        for field in ("mean", "min", "max"):
+            joined = a["series"][self.SOC][field] + b["series"][self.SOC][field]
+            self.assertEqual(joined, live[self.SOC][field],
+                             f"{field}: tiles disagree with a live window")
+        self.assertEqual(a["series"][self.SOC]["unit"], live[self.SOC]["unit"])
+        self.assertEqual(a["series"][self.SOC]["cadence_s"], live[self.SOC]["cadence_s"])
+
+        # Health too: the outage hatching and every tooltip's record count come from it.
+        for field in ("records", "empty"):
+            self.assertEqual(a["health"][field] + b["health"][field],
+                             whole["health"][field], field)
+        self.assertEqual(a["records"] + b["records"], whole["records"])
+
+    def test_counters_compose_across_tiles(self):
+        # A window total is last(last tile) - first(first tile). If the boundary bucket
+        # leaked, tile A's `last` would be read from tile B and the total would be wrong
+        # by one bucket's worth of energy.
+        s = self.seed_walking()
+        cat = self.catalog_of(s)
+        a, b = self.tile(s, cat, 0), self.tile(s, cat, 1)
+        whole = series.window(s, self.base, self.base + 2 * self.span, [self.KWH],
+                              bucket_s=self.bucket, cache=series.SummaryCache(),
+                              warm_budget_s=0, end_exclusive=True)
+        want = series.energy(whole, [self.KWH])[self.KWH]
+
+        self.assertAlmostEqual(a["counters"][self.KWH]["first"], want["first"], places=6)
+        self.assertAlmostEqual(b["counters"][self.KWH]["last"], want["last"], places=6)
+        composed = b["counters"][self.KWH]["last"] - a["counters"][self.KWH]["first"]
+        self.assertAlmostEqual(composed, want["kwh"], places=3)
+        # And the counter travels as endpoints, never as a line: 20 points of a lifetime
+        # counter is payload nothing draws.
+        self.assertNotIn(self.KWH, a["series"])
+
+    def test_a_reset_across_a_tile_boundary_is_visible_to_the_reader(self):
+        # Neither tile can see it from inside: A ends high, B starts low, and each is
+        # internally monotonic. So `first`/`last` have to be raw endpoints, which is what
+        # lets whoever concatenates compare B.first against A.last (FINDINGS 11).
+        recs = []
+        for i in range(300):
+            kwh = 100.0 + i * 0.01 if i < 150 else 50.0 + (i - 150) * 0.01
+            self.set_scaled(self.KWH, kwh)
+            self.set_scaled(self.SOC, 20.0)
+            recs.append((self.base + i * 2, self.full_mask(), 100, self.block_payload()))
+        self.write_records("20260814T090000", recs)
+        s = self.series_of()
+        cat = self.catalog_of(s)
+        a, b = self.tile(s, cat, 0), self.tile(s, cat, 1)
+        self.assertFalse(a["counters"][self.KWH]["reset"], "A is monotonic internally")
+        self.assertFalse(b["counters"][self.KWH]["reset"], "B is monotonic internally")
+        self.assertLess(b["counters"][self.KWH]["first"], a["counters"][self.KWH]["last"],
+                        "the step back has to be detectable at the seam")
+
+    # -- shape -------------------------------------------------------------
+
+    def test_a_tile_omits_the_grid_and_says_how_to_rebuild_it(self):
+        s = self.seed_walking()
+        a = self.tile(s, self.catalog_of(s), 0)
+        self.assertNotIn("t", a, "t is start + i * bucket_s; sending it is ~10 KB wasted")
+        for key in ("v", "plan", "bucket_s", "start", "n", "series", "counters",
+                    "health", "covered", "records"):
+            self.assertIn(key, a)
+        self.assertEqual(a["v"], tiles.TILE_VERSION)
+        self.assertEqual(a["plan"], s.plan_hash)
+        self.assertEqual(len(a["series"][self.SOC]["mean"]), a["n"])
+
+    def test_covered_is_clamped_to_the_tile(self):
+        # A tile is self-contained: `covered` tells the reader which buckets are inside
+        # the archive at all, and a span reaching past the tile would make that call
+        # about data this tile does not hold.
+        s = self.seed_walking()
+        a = self.tile(s, self.catalog_of(s), 0)
+        for lo, hi in a["covered"]:
+            self.assertGreaterEqual(lo, a["start"])
+            self.assertLessEqual(hi, a["start"] + a["n"] * a["bucket_s"])
+
+    def test_an_absent_field_ships_as_empty_not_as_nulls(self):
+        # `empty` means captured-but-nothing-there: the field's BLOCK was absent from
+        # every record in the span. That happens for real -- a slow-tier block that did
+        # not fire in this window, or one that failed -- and over a day tile carrying the
+        # whole catalogue it is the difference between three 288-long null arrays per
+        # field and one boolean.
+        #
+        # Note it is NOT what the unit's 32 unpopulated PV channels do: those return the
+        # -1 absent marker, which decodes to a legal -0.01 reading, so they ship as a flat
+        # line. serve.PANELS excludes them by name rather than relying on this.
+        absent = "inverter_rated_active_power"      # in inv_battery, block index 3
+        keep = [i for i in range(len(self.tiers)) if i != 3]
+        mask = sum(1 << i for i in keep)
+        recs = []
+        for i in range(60):
+            self.set_scaled(self.SOC, 20.0 + i * 0.1)
+            recs.append((self.base + i * 2, mask, 100, self.block_payload(keep)))
+        self.write_records("20260814T090000", recs)
+        s = self.series_of()
+        cat = self.catalog_of(s)
+        self.assertIn(absent, cat, "fixture no longer covers the inv_battery block")
+        a = tiles.build_from_series(s, cat, self.base, self.base + self.span,
+                                    self.bucket, field_keys=[self.SOC, absent],
+                                    counter_keys=[], cache=self.cache)
+        self.assertTrue(a["series"][absent]["empty"])
+        self.assertNotIn("mean", a["series"][absent])
+        # And the field that WAS present is unaffected -- "empty" is per field.
+        self.assertEqual(len(a["series"][self.SOC]["mean"]), a["n"])
+
+    def test_a_partial_tile_is_refused_rather_than_written_as_whole(self):
+        # The warm budget exists to keep an interactive request responsive. An ingest run
+        # has nothing to be responsive to, and a tile missing a file would be cached
+        # immutably with a hole in it.
+        s = self.seed_walking(n=60)
+        cat = self.catalog_of(s)
+        real = series.window
+
+        def stingy(*a, **kw):
+            out = real(*a, **kw)
+            out["pending_files"] = 1
+            return out
+        series.window = stingy
+        self.addCleanup(lambda: setattr(series, "window", real))
+        with self.assertRaises(ValueError) as caught:
+            tiles.build_from_series(s, cat, self.base, self.base + self.span,
+                                    self.bucket, [self.SOC], [])
+        self.assertIn("partial tile", str(caught.exception))
+
+    def test_bucket_width_maps_to_a_tile_span(self):
+        # Hour tiles carry the panel fields at fine widths; from 120 s up a tile spans a
+        # UTC day and carries the whole catalogue, where the per-field cost has collapsed.
+        self.assertEqual(tiles.granularity_for(1), tiles.HOUR)
+        self.assertEqual(tiles.granularity_for(30), tiles.HOUR)
+        self.assertEqual(tiles.granularity_for(60), tiles.HOUR)
+        self.assertEqual(tiles.granularity_for(120), tiles.DAY)
+        self.assertEqual(tiles.granularity_for(1800), tiles.DAY)
+        self.assertEqual(tiles.granularity_for(3600), tiles.MONTH)
+        self.assertEqual(tiles.granularity_for(86400), tiles.MONTH)
+
+    def test_every_ladder_width_divides_a_utc_day(self):
+        # This is what makes UTC-aligned tiles concatenate: a width that did not divide
+        # 86400 would straddle the day boundary, and the seam would be a duplicated or
+        # missing bucket once a day rather than something anyone would notice.
+        for b in series.BUCKET_LADDER:
+            self.assertEqual(86400 % b, 0, f"{b}s does not divide a UTC day")
+            if tiles.granularity_for(b) == tiles.HOUR:
+                self.assertEqual(3600 % b, 0, f"{b}s does not divide a UTC hour")
 
 
 # --------------------------------------------------------------------- latest
@@ -856,15 +1099,15 @@ class TestWireFormat(unittest.TestCase):
     def test_an_integral_value_is_written_without_a_decimal_point(self):
         # "241.0" spends two bytes on a point and a zero the page never shows, and a
         # window is tens of thousands of values. The number does not change.
-        self.assertEqual(serve.round_list([241.3, None, 3.5, 0.0, -0.0], 0),
+        self.assertEqual(tiles.round_list([241.3, None, 3.5, 0.0, -0.0], 0),
                          [241, None, 4, 0, 0])
-        self.assertEqual(serve.round_list([1.2345, 2.0], 3), [1.234, 2])
-        self.assertEqual(json.dumps(serve.round_list([241.3], 0)), "[241]")
+        self.assertEqual(tiles.round_list([1.2345, 2.0], 3), [1.234, 2])
+        self.assertEqual(json.dumps(tiles.round_list([241.3], 0)), "[241]")
 
     def test_rounding_still_follows_the_registers_own_resolution(self):
-        self.assertEqual(serve.decimals_for(1000), 3)
-        self.assertEqual(serve.decimals_for(1), 0)
-        self.assertEqual(serve.round_list([3.14159], 2), [3.14])
+        self.assertEqual(tiles.decimals_for(1000), 3)
+        self.assertEqual(tiles.decimals_for(1), 0)
+        self.assertEqual(tiles.round_list([3.14159], 2), [3.14])
 
 
 class TestIncrementalOpenFile(ViewerFixture):

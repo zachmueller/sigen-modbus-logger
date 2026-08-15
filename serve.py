@@ -42,6 +42,7 @@ from urllib.parse import urlparse, parse_qs
 import config
 import decode
 import series
+import tiles
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
@@ -208,35 +209,6 @@ def panel_keys(ids=None):
     return list(dict.fromkeys(keys))
 
 
-def decimals_for(gain):
-    """Digits worth printing: the register's own resolution, not float noise."""
-    try:
-        g = int(gain or 1)
-    except (TypeError, ValueError):
-        return 3
-    return max(0, len(str(g)) - 1) if g > 1 else 0
-
-
-def round_list(values, dec):
-    """Rounded to the register's own resolution, with integral results as ints.
-
-    round(241.3, 0) is 241.0, which JSON writes as "241.0": two bytes spent on a
-    decimal point and a zero nobody reads. Over 900 buckets of min/mean/max that is
-    ~8% of a window -- and the same columns are what a hosted deployment ships as
-    precomputed tiles, where it is bytes over the wire on every visit. The number is
-    unchanged: JSON has one number type, and the page formats every value to the
-    register's decimals before showing it either way.
-    """
-    out = []
-    for v in values:
-        if v is None:
-            out.append(None)
-            continue
-        r = round(v, dec)
-        out.append(int(r) if r == int(r) else r)
-    return out
-
-
 # ----------------------------------------------------------------- the endpoints
 
 class Viewer:
@@ -369,34 +341,13 @@ class Viewer:
         out["extent"] = {"first_ts": first, "last_ts": last}
         out["warming"] = self.warmer.pending()
         out["unknown_fields"] = unknown
-        # A lifetime counter is on screen as one number, not 720 points, so its
-        # arrays are dropped unless something asked for the field by name. Same for
-        # a series with nothing in the window at all: "empty" says so in one field
-        # instead of 720 nulls, which is a third of the payload at night.
-        tiles = {t["key"] for t in ENERGY_TILES} - set(extra)
-        out["series"] = {}
-        for key in keys:
-            col = win["series"].get(key)
-            if col is None:
-                continue
-            meta = cat.get(key, {})
-            dec = decimals_for(meta.get("gain", 1))
-            item = {"unit": col["unit"], "cadence_s": col["cadence_s"]}
-            if key in tiles and not keep_tiles:
-                item["tile_only"] = True
-            elif all(v is None for v in col["mean"]):
-                item["empty"] = True
-            elif meta.get("alarm_table"):
-                item["bits"] = col["bits"]
-            elif meta.get("enum"):
-                item["last"] = col["last"]
-                item["min"] = col["min"]
-                item["max"] = col["max"]
-            else:
-                item["mean"] = round_list(col["mean"], dec)
-                item["min"] = round_list(col["min"], dec)
-                item["max"] = round_list(col["max"], dec)
-            out["series"][key] = item
+        # A lifetime counter is on screen as one number, not 720 points, so its arrays
+        # are dropped unless something asked for the field by name. tiles.columns() owns
+        # that rule and the other four, because the hosted viewer's precomputed tiles
+        # have to come out identically -- see tiles.py.
+        counter_keys = ({t["key"] for t in ENERGY_TILES} - set(extra)
+                        if not keep_tiles else frozenset())
+        out["series"] = tiles.columns(win, cat, keys, counter_keys)
         out["energy"] = series.energy(win, [t["key"] for t in ENERGY_TILES])
         pv = out["energy"].get("plant_accumulated_pv_energy", {}).get("kwh")
         ex = out["energy"].get("plant_accumulated_grid_export_energy", {}).get("kwh")
