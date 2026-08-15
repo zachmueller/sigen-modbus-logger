@@ -59,41 +59,64 @@ Everything is `us-east-1`. Not a preference: Lambda@Edge can only be published t
 CloudFront can only attach a certificate from there, so using one region throughout
 means no stack ever references another across a region boundary.
 
-### 1–3. DNS, with you in the middle
+### DNS: two CNAMEs, added by hand
 
-The site lives on a **delegated subdomain**. The parent zone stays wherever it is and
-its own records — apex, `MX`, SPF, DKIM, DMARC — are never read, written or moved by
-anything here. Mail cannot break, because nothing about the parent changes except one
-added delegation.
+There is no DNS stack, and no Route53 hosted zone. The site lives on a subdomain of a
+zone we do not host, at a registrar (Hover) whose DNS editor **has no `NS` record type** —
+so there is nothing to delegate to. Two `CNAME` records do the whole job, which is all a
+subdomain on CloudFront ever needs:
+
+| Hostname (relative to the parent) | Points at | Purpose |
+|---|---|---|
+| `_<token>.solar` | `_<token>.acm-validations.aws` | ACM validation. **Must stay** — ACM re-checks it on every renewal. |
+| `solar` | `d<id>.cloudfront.net` | the site |
+
+The parent zone's own records — apex `A`, `MX`, SPF, DKIM, DMARC, `TXT` — are never read,
+written or moved by anything here. Nothing about mail or the parent's website is in the
+blast radius, which is the point: migrating a zone that fronts a live site *and* Google
+Workspace mail, in order to publish one subdomain, is a bad trade.
+
+Capture the parent's records before touching anything, so there is a before/after to diff:
 
 ```sh
-npx cdk deploy SigenDns --profile <profile>          # 1. creates the zone
+for t in A AAAA MX TXT CAA NS; do echo "== $t"; dig +short $t <parent-domain>; done
 ```
 
-It prints four nameservers. Add them as `NS` records for the subdomain label in the
-**parent** zone, at whatever registrar holds it. Change nothing else there. Then:
+**The certificate is created out of band** and referenced by ARN in `cloud.json`:
 
 ```sh
-dig NS <domain>                                       # 2. wait for this to answer
-npx cdk deploy SigenDns -c cert=1 --profile <profile> # 3. certificate
+aws acm request-certificate --domain-name <domain> --validation-method DNS \
+    --key-algorithm RSA_2048 --profile <profile> --region us-east-1
+
+aws acm describe-certificate --certificate-arn <arn> --profile <profile> \
+    --region us-east-1 \
+    --query 'Certificate.DomainValidationOptions[0].ResourceRecord'
 ```
 
-> **Why `-c cert=1` is a separate step.** Requesting the certificate before the
-> delegation resolves does not fail — it **hangs** in `CREATE_IN_PROGRESS` until ACM
-> gives up, which looks like a broken deploy rather than a wait. So the first deploy
-> does not ask for it.
+Add that record at the registrar, then wait for `ISSUED`:
 
-The hosted zone is `RemovalPolicy.RETAIN`. Deleting and recreating it issues a *new* set
-of nameservers, which means editing the parent zone again — a manual step at a
-registrar, triggered by a `cdk destroy` that looked routine.
+```sh
+aws acm wait certificate-validated --certificate-arn <arn> --profile <profile> \
+    --region us-east-1
+```
 
-### 4–6. The rest
+> **Why the certificate is not a CloudFormation resource.** `AWS::CertificateManager::Certificate`
+> with DNS validation blocks in `CREATE_IN_PROGRESS` until the record appears. With no
+> hosted zone, CDK cannot create that record, so the deploy would sit there waiting on
+> someone to open a browser — and if they took too long, roll back. An ARN in config is
+> the better operational story for the one resource that genuinely has a human in the
+> middle of its creation. It auto-renews for as long as the validation CNAME stays put.
+
+### The stacks
 
 ```sh
 npx cdk deploy SigenData --profile <profile>   # bucket, ingest Lambda, S3 events
 npx cdk deploy SigenAuth --profile <profile>   # Cognito + Google + the edge function
-npx cdk deploy SigenSite --profile <profile>   # CloudFront, behaviours, alias record
+npx cdk deploy SigenSite --profile <profile>   # CloudFront + behaviours
 ```
+
+`SigenSite` prints the distribution domain. That is the target for the second `CNAME`
+above, and it is the last manual step — after it propagates, the site is live.
 
 `SigenAuth` refuses to synth with an empty `google_client_id` or an empty
 `allowed_emails`. The second is the one worth stating: Cognito will authenticate *any*
@@ -103,9 +126,12 @@ refused.
 
 ## Cost
 
-About **$1/month**, dominated by the Route53 hosted zone at $0.50. Storage is ~1 GB of
-compressed raw per year plus its tiles; the ingest Lambda runs 24 times a day and sits
-well inside the free tier; CloudFront traffic for a handful of viewers does not register.
+Well under **$1/month**. There is no Route53 hosted zone — DNS lives at the registrar
+already paying for the parent domain — which removes what would otherwise have been the
+single largest line item at $0.50. What is left: ~1 GB of compressed raw per year plus
+its tiles (a few cents), an ingest Lambda that runs 24 times a day and sits well inside
+the free tier, and CloudFront traffic for a handful of viewers, which does not register.
+Cognito is free under 50 monthly active users; ACM certificates are free.
 
 ## What is deliberately not here
 

@@ -20,6 +20,7 @@ export interface CloudConfig {
 	profile: string;
 	domain: string;
 	bucket: string;
+	certificateArn: string;
 	captureTz: string;
 	googleClientId: string;
 	authDomainPrefix: string;
@@ -56,8 +57,8 @@ export function load(): CloudConfig {
 	// Same convention as config.example.json: _-prefixed keys are comments, since JSON
 	// has none, and a copied-and-edited file must not then fail to load.
 	const known = new Set([
-		'account_id', 'region', 'profile', 'domain', 'bucket', 'capture_tz',
-		'google_client_id', 'auth_domain_prefix', 'allowed_emails',
+		'account_id', 'region', 'profile', 'domain', 'bucket', 'certificate_arn',
+		'capture_tz', 'google_client_id', 'auth_domain_prefix', 'allowed_emails',
 	]);
 	const unknown = Object.keys(raw).filter((k) => !k.startsWith('_') && !known.has(k));
 	if (unknown.length) {
@@ -74,14 +75,15 @@ export function load(): CloudConfig {
 	if (!/^\d{12}$/.test(accountId)) fail('account_id must be 12 digits');
 
 	const domain = str('domain');
-	// A subdomain, not an apex: the whole DNS plan is to delegate a child zone so the
-	// parent's MX and TXT records are never touched. An apex here would mean migrating
-	// the parent zone, which is a different and much riskier job.
+	// A subdomain, not an apex. The site is reached by a plain CNAME at whatever
+	// registrar holds the parent zone, so the parent's own records -- apex A, MX, TXT --
+	// are never touched. A CNAME is illegal at a zone apex (RFC 1034), so an apex here
+	// would not merely be riskier, it would not work.
 	if (domain.split('.').length < 3) {
 		fail(
-			`domain ${domain} looks like an apex domain. This deploys into a DELEGATED ` +
-				`subdomain (e.g. solar.${domain}) precisely so the parent zone's mail records ` +
-				`are never touched.`,
+			`domain ${domain} looks like an apex domain. The site is pointed at CloudFront ` +
+				`with a CNAME, which is illegal at a zone apex -- and using a subdomain ` +
+				`(e.g. solar.${domain}) is what keeps the parent's mail records untouched.`,
 		);
 	}
 
@@ -104,12 +106,25 @@ export function load(): CloudConfig {
 		fail('allowed_emails must be an array of strings');
 	}
 
+	const certificateArn = str('certificate_arn');
+	// The certificate is created out of band and referenced by ARN -- see cloud/README.md
+	// for why. It must be us-east-1: CloudFront can attach a certificate from nowhere
+	// else, and the failure if it is elsewhere is an unhelpful CloudFront error late in
+	// the site deploy rather than anything that names the region.
+	if (!/^arn:aws:acm:us-east-1:\d{12}:certificate\/[0-9a-f-]+$/.test(certificateArn)) {
+		fail(
+			`certificate_arn ${certificateArn} is not a us-east-1 ACM certificate ARN. ` +
+				`CloudFront can only attach a certificate from us-east-1.`,
+		);
+	}
+
 	return {
 		accountId,
 		region: str('region'),
 		profile: str('profile'),
 		domain,
 		bucket,
+		certificateArn,
 		captureTz,
 		// Empty until the GCP client exists; auth-stack.ts is what insists on it, so the
 		// data and DNS stacks can deploy first.

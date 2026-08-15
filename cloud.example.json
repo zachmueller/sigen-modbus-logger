@@ -6,9 +6,12 @@
  "region": "us-east-1",
  "profile": "sigen",
 
- "__site": "The public face. domain must be a subdomain you can delegate: the deploy creates a Route53 hosted zone for it and prints the nameservers to add at your registrar, so the parent zone's own records -- MX especially -- are never touched.",
+ "__site": "The public face. domain must be a SUBDOMAIN, not an apex: it is pointed at CloudFront with a CNAME, which is illegal at a zone apex, and using a subdomain is what keeps the parent zone's own records -- MX especially -- untouched. You add that CNAME by hand at whatever registrar holds the parent.",
  "domain": "solar.example.com",
  "bucket": "sigen-telemetry-example",
+
+ "__cert": "The ACM certificate, created OUT OF BAND and referenced by ARN -- see cloud/README.md for why a CloudFormation resource that blocks on someone editing DNS in a browser is the worse option. Must be us-east-1: CloudFront can attach a certificate from nowhere else.",
+ "certificate_arn": "arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000",
 
  "__capture": "The capture host's timezone, as an IANA name. The archive's filenames, heartbeats and axis labels are all in the capture host's local clock, and series.tz_runs() reads time.localtime() -- so the ingest Lambda runs with TZ set to this, or it would label the data in UTC. Tiles themselves are partitioned on UTC boundaries regardless; only the labels are local.",
  "capture_tz": "Pacific/Auckland",

@@ -4,38 +4,32 @@
  * there and CloudFront can only attach a certificate from there -- so using one region
  * throughout means no stack ever references another across a region boundary.
  *
- * Deploy order matters, and it is not just dependency order: DnsStack has a human in
- * the middle of it. See cloud/README.md.
+ * There is no DNS stack. The site lives on a subdomain of a zone we do not host: the
+ * parent is at a registrar whose editor has no NS record type, so there is nothing to
+ * delegate to. Instead the subdomain is pointed at CloudFront with a plain CNAME, and
+ * the certificate is validated by a second CNAME, both added by hand once. See
+ * cloud/README.md -- that is also why certificate_arn is config rather than a resource.
  *
- *   1. cdk deploy SigenDns                     creates the zone, prints nameservers
- *   2. (you add those NS records at the registrar)
- *   3. cdk deploy SigenDns -c cert=1           requests + validates the certificate
- *   4. cdk deploy SigenData                    bucket, ingest, tiles
- *   5. cdk deploy SigenAuth                    Cognito + Google + the edge function
- *   6. cdk deploy SigenSite                    CloudFront, behaviours, alias record
+ * Deploy order:
  *
- * `-c cert=1` exists because requesting the certificate before the delegation resolves
- * does not fail -- it HANGS in CREATE_IN_PROGRESS until ACM gives up, which reads like
- * a broken deploy rather than a wait. Better to not ask for it yet.
+ *   1. cdk deploy SigenData     bucket, ingest Lambda, S3 events
+ *   2. cdk deploy SigenAuth     Cognito + Google + the viewer-request edge function
+ *   3. cdk deploy SigenSite     CloudFront, behaviours; prints the CNAME target
  */
 import * as cdk from 'aws-cdk-lib';
 import { load } from '../lib/config';
-import { DnsStack } from '../lib/dns-stack';
 
 const cfg = load();
 const app = new cdk.App();
 
-const env = { account: cfg.accountId, region: cfg.region };
-
 // Tagged so every resource in the account says what put it there and that the
 // definition is in git -- an account with one project in it today may not stay that way.
-const tags = { Project: 'sigen-telemetry', ManagedBy: 'cdk' };
+const commonProps: cdk.StackProps = {
+	env: { account: cfg.accountId, region: cfg.region },
+	tags: { Project: 'sigen-telemetry', ManagedBy: 'cdk' },
+};
 
-new DnsStack(app, 'SigenDns', {
-	env,
-	tags,
-	cfg,
-	// Truthy only when explicitly asked for: see the header.
-	withCertificate: !!app.node.tryGetContext('cert'),
-	description: `Delegated Route53 zone and ACM certificate for ${cfg.domain}`,
-});
+// Stacks land here as each phase is built. Referenced so the file is not "unused
+// imports and a config read" while that is in progress.
+void commonProps;
+void app;
