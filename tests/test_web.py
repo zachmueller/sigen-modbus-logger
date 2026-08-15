@@ -33,7 +33,6 @@ import threading
 import time
 import unittest
 from http.client import HTTPConnection
-from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -43,7 +42,6 @@ import lib             # noqa: E402
 import log             # noqa: E402
 import series          # noqa: E402
 import serve           # noqa: E402
-import snapshot        # noqa: E402
 from test_offline import ArchiveFixture, base_cfg   # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -132,6 +130,10 @@ class TestViewerIsReadOnly(unittest.TestCase):
     guarantee ("lib.Modbus is never constructed") cannot satisfy or break it.
     """
 
+    # Every module on the read side. One list, so a new one is covered by all three
+    # assertions below rather than by whichever the author remembered.
+    MODULES = ("series.py", "serve.py")
+
     def used_names(self, name):
         with open(os.path.join(HERE, name)) as fh:
             tree = ast.parse(fh.read(), filename=name)
@@ -144,7 +146,7 @@ class TestViewerIsReadOnly(unittest.TestCase):
         return out
 
     def test_viewer_never_constructs_a_modbus_client(self):
-        for name in ("series.py", "serve.py", "snapshot.py"):
+        for name in self.MODULES:
             used = self.used_names(name)
             self.assertNotIn("Modbus", used,
                              f"{name} would become a second client of the inverter")
@@ -154,13 +156,13 @@ class TestViewerIsReadOnly(unittest.TestCase):
     def test_viewer_modules_do_not_import_the_transport(self):
         # lib is imported for decode primitives; importing socket in serve.py is
         # only gethostname. What must never appear is a read of the device.
-        for name in ("series.py", "serve.py", "snapshot.py"):
+        for name in self.MODULES:
             used = self.used_names(name)
             self.assertNotIn("sweep", used)        # dump.sweep polls every register
             self.assertNotIn("identity_block", used)
 
     def test_no_write_function_codes(self):
-        for name in ("series.py", "serve.py", "snapshot.py"):
+        for name in self.MODULES:
             with open(os.path.join(HERE, name)) as fh:
                 src = fh.read()
             for fc in ("5", "6", "15", "16"):
@@ -775,159 +777,77 @@ class TestHTTP(HTTPFixture):
         self.assertIn("plottable", out)
 
 
-class TestSnapshot(HTTPFixture):
-    """One view, written out as one file that opens anywhere.
+class TestPageServerContract(HTTPFixture):
+    """What the page asks for, and whether this server answers it.
 
-    Every way this can be wrong is quiet, and every one of them is discovered by the
-    person the file was sent to rather than by whoever sent it: a stylesheet still
-    pointing at a server they cannot reach, a note that ends the script element and
-    leaves the payload on screen as text, a serial number nobody meant to send, or an
-    hour-old reading presented as the latest one.
+    web/app.js reaches the outside world through exactly one seam -- getJSON() -- so
+    the set of routes it names IS the contract, and a hosted deployment has to compose
+    the same answers out of static tiles. Both halves of that are quiet when wrong: a
+    renamed route gives a page that boots and then shows nothing, and a route this
+    server drops is only noticed by whoever opens it next.
+
+    Derived from the files rather than restated, so adding a fetch to app.js without a
+    route in serve.py fails here rather than in a browser.
     """
 
-    VIEW = "?hours=1&panels=soc,energy"
-
-    def export(self, query=None):
-        status, headers, body = self.fetch("/api/snapshot" + (query or self.VIEW))
-        self.assertEqual(status, 200, body[:400])
-        return headers, body.decode()
-
-    def payload(self, html):
-        m = re.search(r"window\.SIGEN_SNAPSHOT = (\{.*?\});</script>", html, re.S)
-        self.assertIsNotNone(m, "no payload in the exported file")
-        return json.loads(m.group(1))
-
-    def test_the_export_is_one_file_that_fetches_nothing(self):
-        self.seed()
-        self.start()
-        headers, html = self.export()
-        self.assertIn("text/html", headers["Content-Type"])
-        self.assertIn("attachment", headers["Content-Disposition"])
-        self.assertRegex(headers["Content-Disposition"],
-                         r'filename="sigen-snapshot-\d{8}T\d{4}-\d{8}T\d{4}\.html"')
-        for ref in ('src="/', 'href="/', "url(/"):
-            self.assertNotIn(ref, html,
-                             f"{ref} needs the server the reader cannot reach")
-        # www.w3.org is the SVG namespace, which is a name and never fetched.
-        outside = [u for u in re.findall(r'https?://[^\s"\')]+', html)
-                   if not u.startswith("http://www.w3.org")]
-        self.assertEqual(outside, [], "an exported file must reference nothing outside")
-        self.assertIn("<style>", html)
-
-    def test_the_export_and_the_page_share_one_renderer(self):
-        # The whole design rests on this: a snapshot looks like the screen because it
-        # IS the screen, fed a payload instead of fetch(). A forked copy of app.js
-        # would drift, and only the person who was sent the file would ever see it.
-        self.seed()
-        self.start()
-        _, html = self.export()
-        for name in ("app.js", "charts.js", "style.css"):
-            with open(os.path.join(HERE, "web", name)) as fh:
-                self.assertIn(fh.read(), html, f"{name} is not inlined verbatim")
-
-    def test_the_payload_is_what_the_three_endpoints_answer(self):
-        self.seed()
-        self.start()
-        _, html = self.export()
-        p = self.payload(html)
-        self.assertEqual(p["version"], snapshot.PAYLOAD_VERSION)
-        self.assertGreater(p["exported_at"], 0)
-        self.assertTrue(p["api"]["meta"]["ok"])
-        self.assertTrue(p["api"]["latest"]["ok"])
-        self.assertEqual(p["view"]["expanded"], ["soc"])
-        w = p["api"]["window"]
-        self.assertIn("plant_ess_soc", w["series"])
-        self.assertEqual(len(w["t"]), len(w["series"]["plant_ess_soc"]["mean"]))
-        self.assertEqual(len(w["t"]), len(w["health"]["records"]))
-        self.assertIn("plant_accumulated_grid_import_energy", w["energy"])
-
-    def test_the_export_is_trimmed_to_the_view(self):
-        self.seed()
-        self.start()
-        _, html = self.export()
-        p = self.payload(html)
-        meta = p["api"]["meta"]
-        self.assertEqual([x["id"] for x in meta["panels"]], ["soc"])
-        self.assertNotIn("inverter_pv1_current", html,
-                         "a panel that was collapsed must not travel")
-        drawn = set(p["api"]["window"]["series"])
-        self.assertTrue({c["key"] for c in meta["catalog"]} <= drawn)
-        self.assertGreater(len(self.json("/api/meta")["catalog"]), 200)
-        self.assertLess(len(meta["catalog"]), 20, "the catalogue is not trimmed")
-        for key in ("live_fields", "bucket_ladder", "samples_per_bucket", "plans",
-                    "started_at"):
-            self.assertNotIn(key, meta, "a snapshot carries only what the page draws")
-
-    def test_the_export_withholds_identity_unless_asked_for(self):
-        # Same rule as /api/meta, and it matters more here: this file leaves the LAN.
-        self.seed()
-        self.start()
-        _, html = self.export()
-        self.assertNotIn("TESTSERIAL", html)
-        self.assertIn("withheld", html)
-        self.stop()
-        self.start(web_show_identity=True)
-        _, html = self.export()
-        self.assertIn("TESTSERIAL", html)
-
-    def test_the_export_does_not_carry_the_archive_path(self):
-        # The footer prints the data directory, which on the capture host is an
-        # absolute path under someone's home. A login name is not part of a chart.
-        self.seed()
-        self.start()
-        _, html = self.export()
-        self.assertNotIn(self.tmp, html)
-        self.assertEqual(self.payload(html)["api"]["meta"]["data_dir"],
-                         os.path.basename(self.tmp))
-
-    def test_a_note_travels_with_the_view_and_cannot_end_the_script(self):
-        self.seed()
-        self.start()
-        evil = "</script><script>alert(1)</script>"
-        _, html = self.export(self.VIEW + "&note=" + quote(evil))
-        self.assertNotIn("<script>alert(1)", html)
-        self.assertEqual(self.payload(html)["note"], evil,
-                         "the note must survive escaping unchanged")
-        self.assertEqual(html.count("<script>"), 3,
-                         "the payload, charts.js and app.js -- and nothing else")
-
-    def test_an_oversized_export_is_refused_with_a_reason(self):
-        self.seed()
-        self.start()
-        real = serve.MAX_SNAPSHOT_BYTES
-        serve.MAX_SNAPSHOT_BYTES = 1000
-        self.addCleanup(lambda: setattr(serve, "MAX_SNAPSHOT_BYTES", real))
-        status, _, body = self.get("/api/snapshot" + self.VIEW)
-        self.assertEqual(status, 400)
-        self.assertIn("Narrow the window", json.loads(body)["error"])
-
-    def test_an_export_without_the_health_panel_drops_the_latency_arrays(self):
-        # Three 900-long arrays only one panel can draw. What must NOT be dropped is
-        # the per-bucket record and empty counts: every tooltip quotes them, and the
-        # outage hatching is derived from them.
-        self.seed()
-        self.start()
-        health = self.payload(self.export()[1])["api"]["window"]["health"]
-        for key in ("latency_median", "latency_p95", "latency_max", "note"):
-            self.assertNotIn(key, health)
-        for key in ("records", "empty", "no_data", "no_records", "covered"):
-            self.assertIn(key, health)
-        with_health = self.payload(
-            self.export("?hours=1&panels=soc,health,energy")[1])["api"]["window"]
-        self.assertIn("latency_median", with_health["health"])
-        self.assertIn("note", with_health["health"])
-
-    def test_app_js_and_the_payload_agree_on_the_routes(self):
-        # The contract between snapshot.py and web/app.js. Renaming one side without
-        # the other has to fail here rather than in a file already sent to someone.
-        self.seed()
-        self.start()
-        _, html = self.export()
+    def page_routes(self):
         with open(os.path.join(HERE, "web", "app.js")) as fh:
             js = fh.read()
-        self.assertIn("window." + snapshot.GLOBAL, js)
-        mapped = set(re.findall(r"'/api/\w+': '(\w+)'", js))
-        self.assertEqual(mapped, set(self.payload(html)["api"]))
+        return set(re.findall(r"'(/api/\w+)'", js))
+
+    def test_every_route_the_page_names_is_one_this_server_answers(self):
+        self.seed()
+        self.start()
+        for route in sorted(self.page_routes()):
+            status, _, body = self.get(route)
+            self.assertNotEqual(status, 404,
+                                f"web/app.js fetches {route}, which serve.py does not "
+                                f"route -- the page would boot and then show nothing")
+            self.assertEqual(status, 200, f"{route}: {body[:200]}")
+
+    def test_the_three_composable_answers_are_the_ones_a_tile_source_must_supply(self):
+        # A hosted deployment has no server: web/tiles.js builds these three out of
+        # precomputed objects. Pinning the set here means adding a fourth to app.js
+        # fails until the tile source can answer it too.
+        self.assertEqual(self.page_routes() & {"/api/meta", "/api/window", "/api/latest"},
+                         {"/api/meta", "/api/window", "/api/latest"})
+
+    def test_the_page_fetches_only_through_the_one_seam(self):
+        # Two renderers is the failure this whole arrangement exists to avoid, and a
+        # stray fetch() is how it would start: it would work on this server and quietly
+        # 404 against tiles. Comments are stripped first, since the prose above getJSON()
+        # names fetch() to say that nothing else may call it.
+        with open(os.path.join(HERE, "web", "app.js")) as fh:
+            code = "\n".join(re.sub(r"//.*$", "", line)
+                             for line in fh.read().split("\n"))
+        sites = [m.start() for m in re.finditer(r"\bfetch\(", code)]
+        self.assertEqual(len(sites), 2,
+                         "fetch() belongs in getJSON() and the tunnel probe only; "
+                         "everything else goes through getJSON()")
+        # And in those two functions, not two others: the count alone would be satisfied
+        # by moving a call rather than removing it.
+        enclosing = [re.findall(r"function (\w+)\s*\(", code[:at])[-1] for at in sites]
+        self.assertEqual(enclosing, ["getJSON", "verifyClosed"])
+
+    def test_every_asset_the_page_links_is_servable(self):
+        with open(os.path.join(HERE, "web", "index.html")) as fh:
+            html = fh.read()
+        for ref in sorted(set(re.findall(r'(?:src|href)="(/[^"]*)"', html))):
+            self.assertIn(ref, serve.STATIC,
+                          f"index.html links {ref}, which is not in serve.STATIC")
+
+    def test_the_retired_export_leaves_nothing_behind(self):
+        # Deleted deliberately, not left as a dead button: a control that 404s reads as
+        # a broken viewer rather than as a feature that moved.
+        self.seed()
+        self.start()
+        status, _, _ = self.get("/api/snapshot?hours=1")
+        self.assertEqual(status, 404)
+        with open(os.path.join(HERE, "web", "index.html")) as fh:
+            html = fh.read()
+        for gone in ('id="share"', 'id="snapshot-note"', 'id="snapshot-dl"',
+                     "Save snapshot"):
+            self.assertNotIn(gone, html)
 
 
 class TestWireFormat(unittest.TestCase):
@@ -945,36 +865,6 @@ class TestWireFormat(unittest.TestCase):
         self.assertEqual(serve.decimals_for(1000), 3)
         self.assertEqual(serve.decimals_for(1), 0)
         self.assertEqual(serve.round_list([3.14159], 2), [3.14])
-
-
-class TestSnapshotPackaging(unittest.TestCase):
-    """The string work, without an archive or a server behind it."""
-
-    def test_a_payload_cannot_end_the_script_element(self):
-        for evil in ("</script>", "<!--", "a\u2028b", "x & y"):
-            text = snapshot.json_literal({"x": evil})
-            for ch in ("<", ">", "&", "\u2028"):
-                self.assertNotIn(ch, text)
-            self.assertEqual(json.loads(text)["x"], evil,
-                             "escaped JSON must parse back to exactly the same text")
-
-    def test_an_index_html_that_cannot_be_inlined_is_an_error(self):
-        # Rather than a file that renders unstyled on someone else's machine.
-        payload = {"exported_at": time.time(), "note": "",
-                   "api": {"meta": {"plan_hash": "abc", "manifest": "m.json",
-                                    "device": {}},
-                           "window": {"start": 1786600000.0, "end": 1786603600.0}}}
-        real = snapshot._read
-        snapshot._read = (lambda name: "<html>no tags here</html>"
-                          if name == "index.html" else real(name))
-        self.addCleanup(lambda: setattr(snapshot, "_read", real))
-        with self.assertRaises(ValueError) as caught:
-            snapshot.render(payload)
-        self.assertIn("snapshot.py", str(caught.exception))
-
-    def test_the_filename_says_which_window_it_holds(self):
-        name = snapshot.filename(1786600000.0, 1786603600.0)
-        self.assertRegex(name, r"^sigen-snapshot-\d{8}T\d{4}-\d{8}T\d{4}\.html$")
 
 
 class TestIncrementalOpenFile(ViewerFixture):

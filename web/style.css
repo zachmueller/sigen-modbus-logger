@@ -101,7 +101,7 @@
 
 /* The hidden attribute has to win. A rule like `.group { display: flex }` beats the
    user agent's `[hidden] { display: none }` on specificity, so a control hidden from
-   JavaScript would stay on screen -- which for a snapshot means a button that cannot
+   JavaScript would stay on screen -- which in a shared view means a button that cannot
    work. One declaration rather than a display rule per hideable element. */
 [hidden] { display: none !important; }
 

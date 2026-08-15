@@ -1,11 +1,16 @@
 <!DOCTYPE html>
 <!--
-  The local viewer's one page. Served by serve.py from this directory; nothing is
-  fetched from anywhere else, so it works on a host with no internet at all.
+  The viewer's one page. Served by serve.py from this directory; nothing is fetched
+  from anywhere else, so it works on a host with no internet at all.
 
   No framework and no chart library on purpose: the rest of this repository is
   stdlib-only Python with nothing to install, and a viewer that needed a CDN
   would be the one part of it that stops working offline.
+
+  This same file is what a hosted deployment serves. It differs there by one inline
+  <script> setting window.SIGEN_SOURCE before app.js loads, which points the page at
+  precomputed tiles instead of at this server. There is deliberately no second copy
+  of the page or the renderer to drift out of step with this one.
 -->
 <html lang="en" data-theme="auto">
 <head>
@@ -28,11 +33,11 @@
 
 <!-- Filters: one row, above everything they scope.
 
-     data-live-only marks a control that needs the server to answer it. An exported
-     snapshot has no server, so applySnapshotMode() hides everything carrying the
-     attribute rather than leaving dead buttons on the page. The chips beside them
-     have no attribute and stay: bucket width and stride are how the numbers in the
-     file were made, and they are as true in an export as they are here. -->
+     data-live-only marks a control that asks for a window other than the one on
+     screen. A shared view is one fixed window, so applyFrozenMode() hides everything
+     carrying the attribute rather than leaving dead buttons on the page. The chips
+     beside them have no attribute and stay: bucket width and stride are how the
+     numbers were made, and they are as true in a shared view as they are here. -->
 <div class="filters" id="filters">
   <div class="group" role="group" aria-label="Window length" data-live-only>
     <span class="glabel">Window</span>
@@ -56,7 +61,6 @@
     <span class="chip" id="chip-stride" hidden></span>
     <span class="chip warn" id="chip-warming" hidden></span>
     <a class="chip link" id="csv" download data-live-only>Download CSV</a>
-    <a class="chip link" href="#share" data-live-only>Save snapshot</a>
     <!-- Only shown when the page is reached through an SSH tunnel, i.e. on
          localhost. It hands off to the Stop app via a URL scheme, because the
          tunnel lives on THIS machine and the server does not. -->
@@ -67,10 +71,10 @@
 
 <p class="notice" id="disconnected" hidden></p>
 
-<!-- Only an exported snapshot fills this in: on the live page there is nothing to
-     say, and in a file that someone else opens a day later there is a great deal —
-     starting with the fact that none of it is current. -->
-<p class="notice" id="snapshot-banner" hidden></p>
+<!-- Only a shared view fills this in: on the live page there is nothing to say, and
+     in a view someone else opens a day later there is a great deal — starting with
+     the fact that none of it is current. -->
+<p class="notice" id="frozen-banner" hidden></p>
 
 <p class="hint" id="hint">
   Arrow keys move through history; <kbd>+</kbd>/<kbd>−</kbd> zoom; <kbd>n</kbd> jumps to now.
@@ -113,30 +117,6 @@
     <div class="chosen" id="field-chosen" data-live-only></div>
   </section>
 
-  <!-- Writing the view out. There are no filters here on purpose: the window and
-       the panels already on screen ARE the export, so what you send is what you
-       checked. An exported file hides this card — it cannot re-export itself. -->
-  <section class="card" id="share" data-live-only>
-    <div class="card-head">
-      <h2>Save this view</h2>
-      <p class="note">One HTML file with these charts and their numbers inside it —
-        it opens with no server, no network and no Python, so it can be emailed to
-        someone who cannot reach this viewer. Narrow the window to the interesting
-        minutes first; the export is exactly what is on screen.</p>
-    </div>
-    <!-- maxlength matches serve.py's MAX_NOTE_CHARS: the note travels in the query
-         string, and the server truncates rather than refuse, so the limit is stated
-         here where it can still be seen. -->
-    <label class="stack"><span class="tiny">Note for whoever opens it (optional)</span>
-      <textarea id="snapshot-note" rows="2" maxlength="2000"
-                placeholder="pv3 falls to zero most afternoons around 15:40 while the other three strings hold — see the PV string current panel."></textarea></label>
-    <div class="card-foot">
-      <span id="snapshot-summary"></span>
-      <div class="spacer"></div>
-      <a class="btn" id="snapshot-dl" download>Save snapshot</a>
-    </div>
-    <p class="note" id="snapshot-privacy"></p>
-  </section>
 </main>
 
 <footer id="footer"></footer>
