@@ -21,6 +21,7 @@ bytes on disk, and every way it can be wrong is quiet:
 So each of those has a test rather than a comment.
 """
 import ast
+import calendar
 import gzip
 import io
 import json
@@ -41,6 +42,7 @@ import decode          # noqa: E402
 import lib             # noqa: E402
 import log             # noqa: E402
 import series          # noqa: E402
+import ingest          # noqa: E402
 import serve           # noqa: E402
 import tiles           # noqa: E402
 from test_offline import ArchiveFixture, base_cfg   # noqa: E402
@@ -689,6 +691,236 @@ class TestTiles(ViewerFixture):
             self.assertEqual(86400 % b, 0, f"{b}s does not divide a UTC day")
             if tiles.granularity_for(b) == tiles.HOUR:
                 self.assertEqual(3600 % b, 0, f"{b}s does not divide a UTC hour")
+
+
+# --------------------------------------------------------------------- ingest
+
+class TestIngest(ViewerFixture):
+    """Turning an archive into the objects the hosted viewer reads.
+
+    No S3 here: ingest.py reads a directory and writes a directory, which is the whole
+    reason it is testable at all. The Lambda is the thin part that syncs one to the other.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 09:00 UTC on a UTC day boundary + 9 h, so hour, day and month spans are all
+        # exercised and none of them coincides with the local date -- the capture host is
+        # UTC+12, and a tile named by the local date would be the bug.
+        self.base = 1786600800.0        # 2026-08-14 21:20 NZST = 09:20 UTC
+        self.base = float(int(self.base) // 3600 * 3600)
+
+    def seed(self, hours=2, step=2):
+        recs = []
+        n = int(hours * 3600 / step)
+        for i in range(n):
+            self.set_scaled("plant_ess_soc", 20.0 + (i % 500) * 0.1)
+            self.set_scaled("plant_accumulated_grid_import_energy", 100.0 + i * 0.001)
+            recs.append((self.base + i * step, self.full_mask(), 100, self.block_payload()))
+        self.write_records("20260814T090000", recs)
+        return series.newest_series(self.tmp)
+
+    def out(self):
+        d = os.path.join(self.tmp, "agg")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    # -- UTC partitioning --------------------------------------------------
+
+    def test_spans_are_utc_never_the_capture_hosts_local_date(self):
+        # A tile named by the local date would straddle a bucket boundary twice a year at
+        # a DST transition, leaving a one-hour seam. The page still LABELS local, from
+        # meta's tz change points -- partitioning and labelling are separate concerns.
+        #
+        # Pick an instant whose UTC and local dates DIFFER, or the test proves nothing.
+        # Anywhere east of UTC, a local morning is the previous UTC day.
+        ts = calendar.timegm((2026, 8, 13, 21, 0, 0, 0, 0, 0))   # 09:00 next day at +12
+        utc_date = time.strftime("%Y/%m/%d", time.gmtime(ts))
+        local_date = time.strftime("%Y/%m/%d", time.localtime(ts))
+        if utc_date == local_date:
+            self.skipTest("this machine's zone makes the UTC and local dates equal here")
+        self.assertEqual(ingest.hour_span(ts)[0] % 3600, 0)
+        self.assertEqual(ingest.day_span(ts)[0] % 86400, 0)
+        rel = ingest.path_for("abc12345", 300, ingest.day_span(ts)[0], tiles.DAY)
+        self.assertIn(utc_date, rel, "a tile is named by its UTC span")
+        self.assertNotIn(local_date, rel, "never by the capture host's local date")
+        self.assertTrue(rel.endswith(".json.gz"))
+
+    def test_month_spans_follow_the_calendar_not_a_fixed_width(self):
+        feb = calendar.timegm((2028, 2, 10, 0, 0, 0, 0, 0, 0))   # a leap February
+        lo, hi = ingest.month_span(feb)
+        self.assertEqual((hi - lo) // 86400, 29)
+        dec = calendar.timegm((2026, 12, 31, 23, 0, 0, 0, 0, 0))
+        lo, hi = ingest.month_span(dec)
+        self.assertEqual(time.gmtime(hi).tm_year, 2027, "December must roll the year")
+
+    # -- what gets written -------------------------------------------------
+
+    def test_widths_below_the_cadence_are_never_generated(self):
+        # choose_bucket() floors at the cadence, so at a 2 s tick nothing resolves to a
+        # 1 s bucket. Generating them cost 28% of the whole aggregate for tiles no reader
+        # could ask for.
+        self.assertIn(1, series.BUCKET_LADDER)
+        self.assertNotIn(1, ingest.widths_for(tiles.HOUR, floor_s=2))
+        self.assertIn(2, ingest.widths_for(tiles.HOUR, floor_s=2))
+        self.assertIn(1, ingest.widths_for(tiles.HOUR, floor_s=1))
+
+    def test_tiles_are_gzipped_and_parse_back(self):
+        # Without gzip the derived data is 20x the raw archive it came from. With it, less
+        # than 1x. Served as Content-Encoding: gzip so no page code has to inflate it.
+        s = self.seed()
+        out = self.out()
+        written = ingest.run(self.tmp, out, now=self.base + 4 * 3600)
+        tile_rels = [r for r, _ in written if r.endswith(".json.gz")]
+        self.assertTrue(tile_rels)
+        with gzip.open(os.path.join(out, sorted(tile_rels)[0]), "rb") as fh:
+            tile = json.load(fh)
+        self.assertEqual(tile["v"], tiles.TILE_VERSION)
+        self.assertEqual(tile["plan"], s.plan_hash)
+        self.assertEqual(len(tile["series"]["plant_ess_soc"]["mean"]), tile["n"])
+
+    def test_gzip_bytes_are_a_function_of_the_contents_only(self):
+        # A gzip header carrying the build time would make every re-run of an unchanged
+        # tile a new object, defeating S3's ETag and any CDN validator.
+        self.seed(hours=1)
+        a, b = self.out(), os.path.join(self.tmp, "agg2")
+        os.makedirs(b, exist_ok=True)
+        ingest.run(self.tmp, a, now=self.base + 4 * 3600)
+        time.sleep(1.1)
+        ingest.run(self.tmp, b, now=self.base + 4 * 3600)
+        checked = 0
+        for root, _, files in os.walk(a):
+            for f in files:
+                if not f.endswith(".json.gz"):
+                    continue
+                rel = os.path.relpath(os.path.join(root, f), a)
+                with open(os.path.join(a, rel), "rb") as fa, \
+                        open(os.path.join(b, rel), "rb") as fb:
+                    self.assertEqual(fa.read(), fb.read(), rel)
+                checked += 1
+        self.assertGreater(checked, 0, "nothing was compared")
+
+    def test_a_finished_span_is_immutable_and_a_running_one_is_not(self):
+        s = self.seed()
+        out = self.out()
+        # "now" inside the same UTC day: the hours are done, the day is not.
+        written = dict(ingest.run(self.tmp, out, now=self.base + 4 * 3600))
+        hours = [r for r in written if "/hour/" in r]
+        days = [r for r in written if "/day/" in r]
+        self.assertTrue(hours and days)
+        for r in hours:
+            self.assertEqual(written[r], ingest.IMMUTABLE, r)
+        for r in days:
+            self.assertEqual(written[r], ingest.FRESH, r)
+        # And once the day has closed, its tile is immutable too.
+        later = dict(ingest.run(self.tmp, out, now=self.base + 3 * 86400))
+        for r in [x for x in later if "/day/" in x]:
+            self.assertEqual(later[r], ingest.IMMUTABLE, r)
+
+    def test_an_incomplete_month_gets_no_tile(self):
+        # By design: complete months are written once and never re-read, which is what
+        # keeps ingest from re-decoding a month of raw every hour. The reader falls back
+        # to that month's day tiles.
+        self.seed()
+        out = self.out()
+        written = [r for r, _ in ingest.run(self.tmp, out, now=self.base + 4 * 3600)]
+        self.assertEqual([r for r in written if "/month/" in r], [])
+        # Two months later the month has closed, so now it exists.
+        written = [r for r, _ in ingest.run(self.tmp, out, now=self.base + 70 * 86400)]
+        self.assertTrue([r for r in written if "/month/" in r])
+
+    def test_a_span_with_no_records_writes_nothing(self):
+        # An absent tile means "no data here", which is the truth. An empty one would cost
+        # a request to say the same thing.
+        self.seed(hours=1)
+        out = self.out()
+        before = ingest.write_span(series.newest_series(self.tmp), out, tiles.HOUR,
+                                   self.base + 50 * 3600, now=self.base + 100 * 3600)
+        self.assertEqual(before, [])
+
+    # -- incremental -------------------------------------------------------
+
+    def test_the_incremental_run_touches_only_what_can_have_changed(self):
+        # run() re-reads the whole archive, which is right for a backfill and wrong once
+        # an hour -- it would grow to re-decoding a year on every rotation.
+        s = self.seed()
+        out = self.out()
+        full = {r for r, _ in ingest.run(self.tmp, out, now=self.base + 4 * 3600)}
+        inc = {r for r, _ in ingest.run_for(self.tmp, out, touched=[self.base],
+                                           now=self.base + 4 * 3600)}
+        self.assertTrue(inc < full, "the incremental run must be a strict subset")
+        hours = {r for r in inc if "/hour/" in r}
+        self.assertTrue(hours)
+        for r in hours:
+            self.assertIn(time.strftime("%Y/%m/%d/%H", time.gmtime(self.base)), r)
+        # The documents always move: extent and latest change every rotation.
+        self.assertIn(f"plan={s.plan_hash}/{ingest.META}", inc)
+        self.assertIn(ingest.INDEX, inc)
+
+    def test_a_rotation_straddling_a_utc_hour_rebuilds_both(self):
+        self.seed()
+        out = self.out()
+        inc = {r for r, _ in ingest.run_for(
+            self.tmp, out, touched=[self.base, self.base + 3600],
+            now=self.base + 4 * 3600)}
+        for ts in (self.base, self.base + 3600):
+            stem = time.strftime("%Y/%m/%d/%H", time.gmtime(ts))
+            self.assertTrue([r for r in inc if stem in r], stem)
+
+    # -- the documents -----------------------------------------------------
+
+    def test_meta_withholds_identity(self):
+        # This file is served over the internet. The serial and the inverter's LAN
+        # address are not part of reading a chart.
+        s = self.seed(hours=1)
+        m = ingest.build_meta(s)
+        blob = json.dumps(m)
+        self.assertNotIn("TESTSERIAL", blob)
+        self.assertNotIn(str(self.manifest.get("host")), blob)
+        self.assertIn("withheld", m["device"])
+        self.assertEqual(m["device"]["model"], s.manifest["device"]["model"])
+
+    def test_meta_states_the_field_picker_limit_rather_than_implying_none(self):
+        # Only day tiles carry the whole catalogue, and choose_bucket() reaches 120 s at
+        # a 15-hour span -- so the 6 h default cannot chart an arbitrary register. The
+        # page has to say so rather than offer a field that comes back absent.
+        s = self.seed(hours=1)
+        m = ingest.build_meta(s)
+        self.assertEqual(m["picker_min_bucket_s"],
+                         min(ingest.widths_for(tiles.DAY, s.fast_period_s)))
+        self.assertLess(len(m["fine_fields"]), len(m["coarse_fields"]))
+        self.assertGreater(series.choose_bucket(15 * 3600, s.fast_period_s),
+                           series.choose_bucket(6 * 3600, s.fast_period_s))
+
+    def test_latest_leaves_the_stall_verdict_to_the_reader(self):
+        # series.latest() decides it against a few cadences, which in a document written
+        # once an hour is always true -- the page would show a permanent red "the logger
+        # may have stopped". An age is only meaningful relative to when it is read.
+        s = self.seed(hours=1)
+        lt = ingest.latest(s)
+        for gone in ("logger_stalled", "record_age_s", "data_age_s", "now"):
+            self.assertNotIn(gone, lt)
+        self.assertEqual(lt["stall_after_s"], ingest.STALL_AFTER_S)
+        self.assertIn("record_ts", lt)
+        self.assertIn("data_ts", lt)
+
+    def test_index_names_every_plan_and_which_one_is_current(self):
+        # A superseded plan stays listed rather than silently dropped; `current` is the
+        # one holding the newest record, the same rule series.newest_series() applies.
+        t0 = self.base
+        self.write_records("20260814T090000", self.data_records(t0, 10), plan_hash="aaaaaaaa")
+        self.write_records("20260814T110000", self.data_records(t0 + 7200, 10),
+                           plan_hash="bbbbbbbb")
+        idx = ingest.index(series.discover(self.tmp))
+        self.assertEqual({p["hash"] for p in idx["plans"]}, {"aaaaaaaa", "bbbbbbbb"})
+        self.assertEqual(idx["current"], "bbbbbbbb")
+
+    def test_the_panels_come_from_serve_not_a_second_copy(self):
+        # A restated PANELS list is exactly the drift this arrangement exists to avoid: it
+        # would show up as a hosted page quietly missing a panel the local one has.
+        s = self.seed(hours=1)
+        self.assertIs(ingest.build_meta(s)["panels"], serve.PANELS)
+        self.assertIs(ingest.build_meta(s)["energy_tiles"], serve.ENERGY_TILES)
 
 
 # --------------------------------------------------------------------- latest
