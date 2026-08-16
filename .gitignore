@@ -32,3 +32,10 @@ __pycache__/
 
 # The Google OAuth client secret, for `cdk deploy --parameters`. Never committed.
 cloud/.google-secret
+
+# Session handoff notes. They name the AWS account, the domain, the Cognito ids and the
+# people the viewer is shared with -- everything cloud.json is gitignored for. A handoff is
+# written to be read by whoever picks the work up next, which makes it exactly the file
+# someone commits without thinking.
+HANDOFF.md
+HANDOFF-*.md

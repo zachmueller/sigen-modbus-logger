@@ -78,13 +78,17 @@ const state = {
 
 async function boot() {
   state.group = new C.CrosshairGroup($('tooltip'));
-  readHash();
   try {
     state.meta = await getJSON('/api/meta');
   } catch (e) {
     return fatal('Cannot reach the viewer API: ' + e.message);
   }
   if (!state.meta.ok) return fatal(state.meta.reason);
+  // AFTER meta, not before: a frozen share reads its window out of meta.view, so there is
+  // nothing to read until meta is in hand. /api/meta takes no window parameters, so nothing
+  // is lost by asking for it first. Everything below still runs after readHash(), which is
+  // what fills state.expanded and decides whether default_hours applies.
+  readHash();
   if (!state.expanded.size) {
     for (const p of state.meta.panels) if (!p.collapsed) state.expanded.add(p.id);
   }
@@ -103,7 +107,11 @@ function readHash() {
     // A frozen view is the one it was shared with, whatever the URL says: there is
     // nothing to ask for another, and a panel that was open when it was shared has to
     // be open when it is read -- including one PANELS marks collapsed.
-    const v = SRC.view || {};
+    //
+    // From meta, not from SIGEN_SOURCE: the share's meta.json already has to be fetched, so
+    // putting the frozen window there keeps the share page's inline script to one line and
+    // leaves one place where the answer lives.
+    const v = state.meta.view || {};
     state.hours = v.hours || null;
     state.end = v.end || null;
     state.expanded = new Set(v.expanded || []);
@@ -196,6 +204,10 @@ function wireControls() {
   }
   // Everything below asks for a window other than the one on screen.
   if (FROZEN) return applyFrozenMode();
+  if (SRC.share) {
+    $('share').hidden = false;
+    $('share-go').onclick = () => createShare();
+  }
   $('back').onclick = () => pan(-0.5);
   $('fwd').onclick = () => pan(0.5);
   $('now').onclick = () => { state.end = null; setLive(true); refresh(); };
@@ -259,15 +271,105 @@ function renderFrozenBanner() {
   box.appendChild(document.createTextNode(
     C.fmtTime(win.start, win.tz, 'full') + ' → ' + C.fmtTime(win.end, win.tz, 'full')
     + ' ' + C.zoneName(win.tz) + ' on the capture host\'s clock'
-    + (SRC.shared_at ? ', shared ' + C.fmtTime(SRC.shared_at, win.tz, 'full') : '')
+    + (state.meta.shared_at
+        ? ', shared ' + C.fmtTime(state.meta.shared_at, win.tz, 'full') : '')
     + '. It holds this window and these panels only, and it cannot be panned, zoomed '
     + 'or refreshed. The headline numbers are the last good sample before it was '
     + 'shared, not now.'));
-  if (SRC.note) {
+  if (state.meta.note) {
     box.appendChild(C.el('p', { style: { margin: '0.35rem 0 0' } }, [
       C.el('strong', { text: 'From the sender: ' }),
-      document.createTextNode(SRC.note)]));
+      document.createTextNode(state.meta.note)]));
   }
+}
+
+// ------------------------------------------------------ writing a shared view
+
+// What the share will contain, said before it is made rather than after. The window and the
+// expanded panels ARE the share, so the summary is the confirmation -- there is nothing else
+// to review.
+function renderShareSummary() {
+  const box = $('share-summary');
+  if (!box || !SRC.share || !state.win) return;
+  const win = state.win;
+  const panels = state.expanded.size;
+  box.textContent = C.fmtTime(win.start, win.tz, 'short') + ' → '
+    + C.fmtTime(win.end, win.tz, 'short') + ' · ' + fmtDuration(win.bucket_s)
+    + ' buckets · ' + panels + (panels === 1 ? ' panel' : ' panels')
+    + (state.custom.length ? ' · ' + state.custom.length + ' extra field'
+        + (state.custom.length === 1 ? '' : 's') : '');
+}
+
+async function createShare() {
+  const btn = $('share-go');
+  const out = $('share-result');
+  btn.disabled = true;
+  C.clear(out);
+  out.textContent = 'Copying tiles…';
+  try {
+    // hours/end rather than start/end: this is exactly what windowURL() sends, and the
+    // Lambda rebuilds the window the same way, so the frozen copy cannot land on a
+    // different span than the one on screen. null hours means the "All" preset.
+    const r = await fetch(SRC.share, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        hours: state.hours,
+        end: state.end || (state.win && state.win.end) || null,
+        panels: [...state.expanded],
+        fields: state.custom,
+        note: $('share-note').value || '',
+      }),
+    });
+    const body = await r.json().catch(() => null);
+    if (!r.ok || !body || !body.ok) {
+      // 401 carries a `login`: the session lapsed while the page sat open, and the fix is
+      // to sign in again rather than to retry. 403 has no login -- signing in cannot help.
+      const msg = (body && body.error) || (r.status + ' ' + r.statusText);
+      C.clear(out);
+      out.appendChild(document.createTextNode('Could not create the link: ' + msg + '. '));
+      if (body && body.login) {
+        out.appendChild(C.el('a', { href: body.login, text: 'Sign in again' }));
+      }
+      return;
+    }
+    showShareLink(body);
+  } catch (e) {
+    out.textContent = 'Could not create the link: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function showShareLink(body) {
+  const out = $('share-result');
+  C.clear(out);
+  const link = C.el('a', { href: body.url, text: body.url });
+  link.target = '_blank';
+  link.rel = 'noopener';
+  const copy = C.el('button', {
+    text: 'Copy',
+    onclick: () => {
+      // clipboard.writeText needs a secure context and a user gesture; both hold here. The
+      // link is on screen and selectable either way, so a refusal is not a dead end.
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(body.url)
+          .then(() => { copy.textContent = 'Copied'; })
+          .catch(() => { copy.textContent = 'Copy failed — select it instead'; });
+      } else {
+        copy.textContent = 'Select it to copy';
+      }
+    },
+  });
+  out.appendChild(C.el('strong', { text: 'Anyone with this link can read it: ' }));
+  out.appendChild(link);
+  out.appendChild(document.createTextNode(' '));
+  out.appendChild(copy);
+  out.appendChild(C.el('p', { style: { margin: '0.35rem 0 0' }, text:
+    'It needs no sign-in, and it is a copy: ' + body.tiles
+    + (body.tiles === 1 ? ' tile was' : ' tiles were') + ' written at '
+    + fmtDuration(body.bucket_s) + ' buckets. Re-aggregating the archive later cannot '
+    + 'change what you just sent.' }));
 }
 
 // -- closing the tunnel from the page
@@ -460,6 +562,7 @@ function renderAll() {
   }
 
   if (FROZEN) renderFrozenBanner();
+  renderShareSummary();
   renderPickerAvailability();
   renderFreshness();
   renderLiveTiles();
@@ -1007,11 +1110,33 @@ function renderPickerAvailability() {
   }
   // Say what to do, and be specific about the number: the threshold is a real
   // consequence of the bucket ladder, not a round figure.
-  const needS = min * 900;
+  const needS = pickerNeedsSpanS();
   note.textContent = state.meta.catalog.length + ' fields captured — but only the '
     + (state.meta.fine_fields || []).length + ' the panels use are stored at '
-    + fmtDuration(state.win ? state.win.bucket_s : 0) + ' resolution. Widen the window to '
-    + fmtDuration(Math.ceil(needS / 3600) * 3600) + ' or more to chart any of the others.';
+    + fmtDuration(state.win ? state.win.bucket_s : 0) + ' resolution.'
+    + (needS ? ' Widen the window past ' + fmtDuration(needS)
+               + ' to chart any of the others.' : '');
+}
+
+// The span at which choose_bucket() first returns picker_min_bucket_s.
+//
+// NOT min * target_buckets, which is what this used to compute. choose_bucket rounds UP to
+// the next ladder width, so `min` is chosen as soon as span/target exceeds the width BELOW
+// it -- for a 120 s minimum on this ladder, once span passes 60 * 900 = 54,000 s = 15 h.
+// The old formula gave 120 * 900 = 108,000 s = 30 h, which is where the ladder has already
+// moved on to the next width up, so the page demanded twice the window it needed.
+//
+// Both inputs come from meta rather than being restated here, so retuning the ladder or
+// TARGET_BUCKETS moves this number with no change to this file.
+function pickerNeedsSpanS() {
+  const min = state.meta.picker_min_bucket_s;
+  const ladder = state.meta.bucket_ladder || [];
+  const target = state.meta.target_buckets;
+  const i = ladder.indexOf(min);
+  // i === 0 would mean the picker works at the finest width there is, so this branch is
+  // unreachable; 0 says "no threshold to quote" rather than inventing one.
+  if (!min || !target || i <= 0) return 0;
+  return ladder[i - 1] * target;
 }
 
 function renderResults(term) {
@@ -1157,7 +1282,7 @@ function renderFooter() {
     (m.device && m.device.withheld ? ' Identity withheld: ' + m.device.withheld + '.' : '') }));
   if (FROZEN) {
     host.appendChild(C.el('p', { text:
-      'Shared ' + C.fmtTime(SRC.shared_at, win.tz, 'full') + ' ' +
+      'Shared ' + C.fmtTime(state.meta.shared_at, win.tz, 'full') + ' ' +
       C.zoneName(win.tz) + ', holding the ' + m.panels.length +
       (m.panels.length === 1 ? ' panel' : ' panels') + ' and ' +
       Object.keys(win.series).length + ' fields that were on screen. The archive it ' +

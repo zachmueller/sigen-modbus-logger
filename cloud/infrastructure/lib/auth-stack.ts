@@ -2,7 +2,10 @@ import * as cdk from 'aws-cdk-lib';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Construct } from 'constructs';
-import { CloudConfig, requireAuth, requirePool } from './config';
+import {
+	CloudConfig, requireAuth, requirePool,
+	hostedUiDomain, googleRedirectUri, cognitoCallbackUrl,
+} from './config';
 
 const LAMBDA_DIR = path.resolve(__dirname, '../../lambda');
 
@@ -80,7 +83,7 @@ export class AuthPoolStack extends cdk.Stack {
 			cognitoDomain: { domainPrefix: cfg.authDomainPrefix },
 		});
 
-		const callbackUrl = `https://${cfg.domain}/auth/callback`;
+		const callbackUrl = cognitoCallbackUrl(cfg);
 		const client = pool.addClient('Client', {
 			generateSecret: true,
 			supportedIdentityProviders: [
@@ -97,7 +100,7 @@ export class AuthPoolStack extends cdk.Stack {
 		});
 		client.node.addDependency(google);
 
-		const hostedUi = hostedUiDomainFor(cfg, this.region);
+		const hostedUi = hostedUiDomain(cfg);
 
 		const callbackFn = new cdk.aws_lambda.Function(this, 'AuthCallbackFn', {
 			runtime: cdk.aws_lambda.Runtime.NODEJS_22_X,
@@ -159,9 +162,19 @@ export class AuthPoolStack extends cdk.Stack {
 		});
 		new cdk.CfnOutput(this, 'CallbackApiDomain', { value: this.callbackApiDomain });
 		new cdk.CfnOutput(this, 'HostedUiDomain', { value: hostedUi });
-		new cdk.CfnOutput(this, 'GoogleRedirectUri', {
+		// The two redirect URIs, named apart, because conflating them is a whole evening.
+		// This one is a manual step and the only one Google ever needs.
+		new cdk.CfnOutput(this, 'GoogleAuthorizedRedirectUri', {
+			value: googleRedirectUri(cfg),
+			description: 'MANUAL: register this, and only this, on the Google OAuth client. '
+				+ 'It is Cognito\'s Hosted UI, not this site -- Google redirects to Cognito, '
+				+ 'which redirects here. Registering the site callback gives '
+				+ 'redirect_uri_mismatch.',
+		});
+		// This one needs no action; it is printed so it is never mistaken for the above.
+		new cdk.CfnOutput(this, 'CognitoCallbackUrl', {
 			value: callbackUrl,
-			description: 'Must be registered verbatim on the Google OAuth client',
+			description: 'Set by this stack on the app client. NOT a Google setting.',
 		});
 	}
 }
@@ -176,8 +189,11 @@ export class AuthEdgeStack extends cdk.Stack {
 		requireAuth(cfg);
 		requirePool(cfg);
 
-		const region = props.env?.region || 'us-east-1';
-		const issuer = `https://cognito-idp.${region}.amazonaws.com/${cfg.cognitoUserPoolId}`;
+		// cfg.region, not props.env.region: bin/app.ts sets the latter FROM the former, so
+		// they are the same string, and deriving the gate's issuer from the same field the
+		// Hosted UI domain comes from means there is one place a region can be wrong.
+		const issuer =
+			`https://cognito-idp.${cfg.region}.amazonaws.com/${cfg.cognitoUserPoolId}`;
 		// Every value here is a literal from cloud.json, which is the whole point of the
 		// two-stack split: nothing below is a CloudFormation token, so it survives being
 		// written to a file at synth time.
@@ -185,7 +201,7 @@ export class AuthEdgeStack extends cdk.Stack {
 			clientId: cfg.cognitoClientId,
 			issuer: issuer,
 			jwksUri: issuer + '/.well-known/jwks.json',
-			hostedUiDomain: hostedUiDomainFor(cfg, region),
+			hostedUiDomain: hostedUiDomain(cfg),
 			allowedEmails: cfg.allowedEmails,
 		};
 
@@ -231,8 +247,4 @@ export class AuthEdgeStack extends cdk.Stack {
 			description: 'How many addresses the gate will admit',
 		});
 	}
-}
-
-function hostedUiDomainFor(cfg: CloudConfig, region: string): string {
-	return `https://${cfg.authDomainPrefix}.auth.${region}.amazoncognito.com`;
 }

@@ -117,6 +117,31 @@
     <div class="chosen" id="field-chosen" data-live-only></div>
   </section>
 
+  <!-- Freezing the view into a public link. Hidden unless SIGEN_SOURCE sets `share`, which
+       only the hosted viewer does: serve.py has no share endpoint, and a frozen share
+       cannot re-share itself. There are no filters here on purpose -- the window and the
+       panels already on screen ARE the share, so what you send is what you checked. -->
+  <section class="card" id="share" data-live-only hidden>
+    <div class="card-head">
+      <h2>Share this view</h2>
+      <p class="note">Copies these charts to a public link that needs no sign-in, so it can
+        be sent to someone who has no account here. The copy is frozen: it keeps showing
+        this window with these numbers however the archive grows afterwards. Narrow the
+        window to the interesting minutes first.</p>
+    </div>
+    <!-- maxlength matches MAX_NOTE_CHARS in cloud/lambda/share/handler.py, which truncates
+         rather than refusing -- so the limit is stated here where it can still be seen. -->
+    <label class="stack"><span class="tiny">Note for whoever opens it (optional)</span>
+      <textarea id="share-note" rows="2" maxlength="2000"
+                placeholder="pv3 falls to zero most afternoons around 15:40 while the other three strings hold — see the PV string current panel."></textarea></label>
+    <div class="card-foot">
+      <span class="tiny" id="share-summary"></span>
+      <div class="spacer"></div>
+      <button id="share-go">Create link</button>
+    </div>
+    <p class="note" id="share-result"></p>
+  </section>
+
 </main>
 
 <footer id="footer"></footer>

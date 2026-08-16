@@ -25,20 +25,28 @@ Which tiles exist, and why the spans are what they are:
     is the current day, which is rebuilt each hour while it fills and carries a short TTL
     until it closes.
   - **Fine widths carry the panel fields; coarse widths carry everything.** An hour tile
-    holds the ~38 fields the panels, energy tiles and live strip need. From 120 s up a
-    tile spans a day and carries the whole ~259-field catalogue, because by then the
-    per-field cost has collapsed. Materialising all of them at 30 s would make a tile
-    larger than the raw .bin.gz it came from, which would defeat the point.
+    holds the 32 fields the panels, energy tiles and live strip need. From 120 s up a
+    tile spans a day and carries 240 -- the whole catalogue of 259 less the 6 counters,
+    which travel as endpoints, and the duplicate registers, which would draw one line
+    twice. By then the per-field cost has collapsed. Materialising all of them at 30 s
+    would make a tile larger than the raw .bin.gz it came from, which would defeat the
+    point. All three numbers are computed, not asserted: meta carries fine_fields,
+    coarse_fields and catalog, and a test reads them back.
 
     What that costs, stated plainly because it is a real limit and easy to get wrong:
-    the field picker works only where the day tiles do. series.choose_bucket() reaches
-    120 s at a span of 15 HOURS, not the ~4 the design notes claimed -- with
-    TARGET_BUCKETS at 900 a bucket of 120 s needs 108,000 s of span. So the 24 h, 3 d,
-    7 d and longer views can chart any captured register; 15 m, 1 h and the default 6 h
-    cannot, and meta's `picker_min_bucket_s` is what tells the page to say so rather
-    than offer a field that would come back absent. The local viewer still has the whole
-    catalogue at the full 2 s cadence; that is the tool for a narrow look at an odd
-    register.
+    the field picker works only where the day tiles do, and the span where that begins
+    is NOT the one the arithmetic first suggests. series.choose_bucket() rounds UP to
+    the next ladder width, so a 120 s bucket is chosen as soon as span/TARGET_BUCKETS
+    exceeds the width BELOW it -- 60 s. With TARGET_BUCKETS at 900 that is 54,000 s, so
+    the picker opens just past 15 HOURS. (108,000 s, the span at which the quotient
+    reaches 120 s itself, is 30 h -- where the ladder has already moved on to 300 s. An
+    earlier version of this comment quoted it, and web/app.js computed the same way and
+    told people to widen to 30 h when 15 would do.) So the 24 h, 3 d, 7 d and longer
+    views can chart any captured register; 15 m, 1 h and the default 6 h cannot, and
+    meta's `picker_min_bucket_s` and `target_buckets` are what let the page state the
+    real limit instead of offering a field that would come back absent. The local viewer
+    still has the whole catalogue at the full 2 s cadence; that is the tool for a narrow
+    look at an odd register.
   - **An incomplete month has no month tile.** It is served from that month's day tiles
     instead. Complete months are therefore immutable-on-first-write, and no ingest run
     ever re-reads a month of raw. The alternative -- rebuilding month tiles hourly --
@@ -310,6 +318,10 @@ def build_meta(s, capture_tz_now=None):
         "tz": series.tz_runs(_tz_probe(first, last, capture_tz_now)),
         "stall_after_s": STALL_AFTER_S,
         "bucket_ladder": list(series.BUCKET_LADDER),
+        # Shipped so the page can reproduce choose_bucket()'s arithmetic instead of
+        # hardcoding a copy of it. web/app.js needs it to say which span opens the field
+        # picker, and it got that wrong for want of this number.
+        "target_buckets": series.TARGET_BUCKETS,
         "samples_per_bucket": series.SAMPLES_PER_BUCKET,
         "granularity": {k: widths_for(k, s.fast_period_s)
                         for k in (tiles.HOUR, tiles.DAY, tiles.MONTH)},

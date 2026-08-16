@@ -62,6 +62,24 @@ const Tiles = (() => {
     return body;
   }
 
+  /** What "now" means for this source.
+   *
+   * The live hosted page: the clock, obviously. A FROZEN share: the moment it was shared.
+   *
+   * That distinction is not cosmetic. latest.json is copied into a share as it stood at
+   * share time and then never touched, so measuring its ages against the clock makes them
+   * grow forever -- and `stall_after_s` is 7200, so any share opened more than two hours
+   * later rendered a red "no record for 3.4 d -- the logger may have stopped" over data that
+   * was perfectly current when it was sent. The share was fine; only the clock had moved.
+   *
+   * Reading `shared_at` from meta rather than from SIGEN_SOURCE keeps the share page's inline
+   * script to one line and gives the frozen view a single source of truth.
+   */
+  function nowFor(src, st) {
+    if (src.frozen && st && st.meta && st.meta.shared_at) return st.meta.shared_at;
+    return Date.now() / 1000;
+  }
+
   async function ensureMeta(src) {
     const base = src.base.endsWith('/') ? src.base : src.base + '/';
     if (state && state.base === base && (!src.plan || state.plan === src.plan)) {
@@ -164,7 +182,7 @@ const Tiles = (() => {
     // state.meta.extent, and mutating the cached object would poison the next read.
     const out = Object.assign({}, st.meta);
     out.ok = true;
-    out.now = Date.now() / 1000;
+    out.now = nowFor(src, st);
     out.plans = (st.index.plans || []).map((p) => p.hash);
     out.extent = Object.assign({}, st.meta.extent);
     // The footer prints this. On the capture host it is an absolute path under someone's
@@ -183,7 +201,10 @@ const Tiles = (() => {
     // stored age would be wrong the moment after it was written, and a stored
     // logger_stalled would be permanently true -- a red "the logger may have stopped" on
     // a page whose data is merely an hour old, which is normal.
-    const now = Date.now() / 1000;
+    //
+    // For a frozen share `now` is share time, not the clock -- see nowFor(). Otherwise the
+    // same reasoning inverts and every old share claims the logger died.
+    const now = nowFor(src, st);
     lt.now = now;
     if (lt.record_ts) lt.record_age_s = now - lt.record_ts;
     if (lt.data_ts) lt.data_age_s = now - lt.data_ts;
@@ -235,7 +256,7 @@ const Tiles = (() => {
     const st = await ensureMeta(src);
     const t0 = performance.now();
     const ext = st.meta.extent || {};
-    const now = Date.now() / 1000;
+    const now = nowFor(src, st);
 
     let end = num(q, 'end', null);
     const hours = num(q, 'hours', st.meta.default_hours || 6);

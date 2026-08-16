@@ -932,16 +932,23 @@ class TestSync(ViewerFixture):
 # ------------------------------------------------------- the Lambda package
 
 class TestIngestPackage(unittest.TestCase):
-    """What ships to the ingest Lambda, derived rather than trusted.
+    """What ships to the Python Lambdas, derived rather than trusted.
 
     This exists because the hand-written list was wrong: it omitted config.py, which
     serve.py imports, and the only symptom was `No module named 'config'` in a CloudWatch
     log after a successful deploy. A packaging mistake should fail here, in a second,
     rather than in a cloud log minutes later.
+
+    TWO handlers ship this list now -- ingest and share -- because both import the tile
+    geometry rather than restating it, so the closure is computed over both.
     """
 
     PACKAGE = os.path.join(HERE, "cloud", "lambda", "ingest", "PACKAGE.txt")
     HANDLER = os.path.join(HERE, "cloud", "lambda", "ingest", "handler.py")
+    SHARE_HANDLER = os.path.join(HERE, "cloud", "lambda", "share", "handler.py")
+
+    def handlers(self):
+        return [self.HANDLER, self.SHARE_HANDLER]
 
     def listed(self):
         with open(self.PACKAGE) as fh:
@@ -962,9 +969,9 @@ class TestIngestPackage(unittest.TestCase):
                 out.add(n.module.split(".")[0])
         return out & local
 
-    def closure(self):
-        """Every repository module handler.py reaches, transitively."""
-        seen, stack = set(), [self.HANDLER]
+    def closure(self, roots=None):
+        """Every repository module the given handlers reach, transitively."""
+        seen, stack = set(), list(roots or self.handlers())
         while stack:
             for dep in self.imports_of(stack.pop()):
                 if dep not in seen:
@@ -975,7 +982,28 @@ class TestIngestPackage(unittest.TestCase):
     def test_the_package_list_is_exactly_the_import_closure(self):
         listed = {x for x in self.listed() if x.endswith(".py")}
         self.assertEqual(listed, {m + ".py" for m in self.closure()},
-                         "PACKAGE.txt has drifted from what handler.py actually imports")
+                         "PACKAGE.txt has drifted from what the Lambda handlers import")
+
+    def test_the_share_handler_needs_nothing_the_list_does_not_carry(self):
+        # The two Lambdas share one PACKAGE.txt, which is only safe while the share
+        # handler's closure is a SUBSET of what the list already carries. If it ever grows
+        # an import the ingest handler does not reach, the union above keeps the list
+        # correct -- but this states the assumption so a surprise is visible.
+        share_only = self.closure([self.SHARE_HANDLER]) - self.closure([self.HANDLER])
+        self.assertEqual(share_only, set(),
+                         f"the share handler reaches {sorted(share_only)}, which the ingest "
+                         f"handler does not -- one list still covers both, but say so here")
+
+    def test_the_share_handler_imports_the_tile_geometry_rather_than_restating_it(self):
+        # A share that computed its own bucket width or key layout could write tiles under
+        # keys web/tiles.js never asks for, and the symptom would be a share page that
+        # renders as a flat line -- indistinguishable from an outage. So it must reach these
+        # three, and the assertion is on the IMPORT, not on a substring of the arithmetic.
+        reached = self.imports_of(self.SHARE_HANDLER)
+        for module in ("series", "tiles", "ingest"):
+            self.assertIn(module, reached,
+                          f"cloud/lambda/share/handler.py must import {module} rather than "
+                          f"restating tile geometry")
 
     def test_the_register_map_travels_with_the_modules(self):
         # dump.load_regmap() locates it relative to __file__, so a package without it
@@ -1184,16 +1212,51 @@ class TestIngest(ViewerFixture):
         self.assertEqual(m["device"]["model"], s.manifest["device"]["model"])
 
     def test_meta_states_the_field_picker_limit_rather_than_implying_none(self):
-        # Only day tiles carry the whole catalogue, and choose_bucket() reaches 120 s at
-        # a 15-hour span -- so the 6 h default cannot chart an arbitrary register. The
-        # page has to say so rather than offer a field that comes back absent.
+        # Only day tiles carry the whole catalogue, so the 6 h default cannot chart an
+        # arbitrary register. The page has to say so rather than offer a field that comes
+        # back absent.
         s = self.seed(hours=1)
         m = ingest.build_meta(s)
         self.assertEqual(m["picker_min_bucket_s"],
                          min(ingest.widths_for(tiles.DAY, s.fast_period_s)))
         self.assertLess(len(m["fine_fields"]), len(m["coarse_fields"]))
-        self.assertGreater(series.choose_bucket(15 * 3600, s.fast_period_s),
-                           series.choose_bucket(6 * 3600, s.fast_period_s))
+        # The page needs both of these to reproduce choose_bucket()'s arithmetic; without
+        # target_buckets it hardcoded 900 and, worse, the wrong formula.
+        self.assertEqual(m["target_buckets"], series.TARGET_BUCKETS)
+        self.assertIn(m["picker_min_bucket_s"], m["bucket_ladder"])
+
+    def test_the_picker_threshold_is_the_width_below_it_not_the_width_itself(self):
+        # choose_bucket() rounds UP to the next ladder width, so picker_min_bucket_s is
+        # reached once span/TARGET_BUCKETS passes the width BELOW it -- 60 * 900 = 54,000 s
+        # = 15 h on this ladder, not 120 * 900 = 108,000 s = 30 h.
+        #
+        # web/app.js computed it the second way and told people to widen to 30 h when 15
+        # would do; 30 h is in fact where the ladder has already moved on to 300 s. This
+        # asserts the boundary from both sides so the arithmetic cannot drift back.
+        s = self.seed(hours=1)
+        m = ingest.build_meta(s)
+        minimum = m["picker_min_bucket_s"]
+        ladder = m["bucket_ladder"]
+        below = ladder[ladder.index(minimum) - 1]
+        threshold = below * m["target_buckets"]
+
+        self.assertLess(series.choose_bucket(threshold, s.fast_period_s), minimum,
+                        "at exactly the threshold the picker is still shut")
+        self.assertGreaterEqual(
+            series.choose_bucket(threshold + below, s.fast_period_s), minimum,
+            "one bucket past it, the picker opens")
+        # And this is precisely what the old formula got wrong. min * target_buckets is the
+        # LAST span that still resolves to `min`, not the first: the band is
+        # (below * target, min * target]. Quoting its far end as the entry point overstated
+        # the requirement by exactly the ladder's step, which here is 2x.
+        wrong = minimum * m["target_buckets"]
+        self.assertEqual(series.choose_bucket(wrong, s.fast_period_s), minimum,
+                         "min * target_buckets is the top of the band, still `min`")
+        self.assertGreater(series.choose_bucket(wrong + 1, s.fast_period_s), minimum,
+                           "one second past it, the ladder has moved on")
+        self.assertEqual(wrong, 2 * threshold,
+                         "on this ladder 60 -> 120 is a doubling, so the old message asked "
+                         "for twice the window the picker actually needs")
 
     def test_latest_leaves_the_stall_verdict_to_the_reader(self):
         # series.latest() decides it against a few cadences, which in a document written
@@ -1599,13 +1662,20 @@ class TestPageServerContract(HTTPFixture):
             code = "\n".join(re.sub(r"//.*$", "", line)
                              for line in fh.read().split("\n"))
         sites = [m.start() for m in re.finditer(r"\bfetch\(", code)]
-        self.assertEqual(len(sites), 2,
-                         "fetch() belongs in getJSON() and the tunnel probe only; "
-                         "everything else goes through getJSON()")
-        # And in those two functions, not two others: the count alone would be satisfied
-        # by moving a call rather than removing it.
+        # And in these functions, not others of the same count: the number alone would be
+        # satisfied by moving a call rather than removing it.
+        #
+        # createShare() is the one WRITE the page makes, and it is deliberately not routed
+        # through getJSON(). That seam exists so one renderer can read from serve.py or from
+        # static tiles, and it is shaped for that: it returns parsed JSON and throws on any
+        # failure. A share POST has a body, and it has to tell 401 (sign in again) from 403
+        # (signing in cannot help) from 400 (the window has no data), which a thrown Error
+        # flattens. A tile source cannot answer it at all -- there is no server -- which is
+        # why the card only appears when SIGEN_SOURCE sets `share`.
         enclosing = [re.findall(r"function (\w+)\s*\(", code[:at])[-1] for at in sites]
-        self.assertEqual(enclosing, ["getJSON", "verifyClosed"])
+        self.assertEqual(enclosing, ["getJSON", "createShare", "verifyClosed"],
+                         "fetch() belongs in getJSON(), createShare() and the tunnel probe "
+                         "only; every READ goes through getJSON()")
 
     def test_every_asset_the_page_links_is_servable(self):
         with open(os.path.join(HERE, "web", "index.html")) as fh:
@@ -1617,15 +1687,62 @@ class TestPageServerContract(HTTPFixture):
     def test_the_retired_export_leaves_nothing_behind(self):
         # Deleted deliberately, not left as a dead button: a control that 404s reads as
         # a broken viewer rather than as a feature that moved.
+        #
+        # `id="share"` came BACK, for the hosted share link -- but the self-contained HTML
+        # export it used to drive is still gone, so the snapshot ids and its wording must
+        # stay absent. The distinction is the point: one writes a file, the other writes an
+        # S3 prefix, and reviving the markup without reviving the export is correct.
         self.seed()
         self.start()
         status, _, _ = self.get("/api/snapshot?hours=1")
         self.assertEqual(status, 404)
         with open(os.path.join(HERE, "web", "index.html")) as fh:
             html = fh.read()
-        for gone in ('id="share"', 'id="snapshot-note"', 'id="snapshot-dl"',
-                     "Save snapshot"):
+        for gone in ('id="snapshot-note"', 'id="snapshot-dl"', 'id="snapshot-summary"',
+                     'id="snapshot-banner"', "Save snapshot", "Save this view"):
             self.assertNotIn(gone, html)
+
+    def test_the_page_derives_the_picker_threshold_from_the_width_below_the_minimum(self):
+        # The bug this pins was USER-VISIBLE: app.js computed `min * target_buckets`, so with
+        # a 120 s minimum it told people to widen the window to 30 h when 15 h is enough --
+        # 30 h is the top of the b120 band, not its start. See ingest.py's header.
+        #
+        # A source-level assertion because there is no JS harness: the arithmetic lives in
+        # JavaScript, and the Python test above pins choose_bucket()'s behaviour without
+        # touching the page's copy of the reasoning. Mutating the formula back left that test
+        # passing, which is how this gap was found.
+        with open(os.path.join(HERE, "web", "app.js")) as fh:
+            code = "\n".join(re.sub(r"//.*$", "", line) for line in fh.read().split("\n"))
+        fn = re.search(r"function pickerNeedsSpanS\(\)\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(fn, "web/app.js should derive the threshold in one function")
+        body = re.sub(r"\s+", " ", fn.group(1))
+        self.assertIn("ladder[i - 1] * target", body,
+                      "the threshold is the ladder width BELOW picker_min_bucket_s times "
+                      "target_buckets, because choose_bucket() rounds up")
+        self.assertNotRegex(body, r"\bmin\s*\*\s*target\b",
+                            "min * target_buckets is the TOP of the band -- that was the bug")
+        self.assertNotRegex(body, r"\*\s*900\b",
+                            "target_buckets comes from meta, not a hardcoded 900")
+
+    def test_the_share_card_is_hidden_until_a_source_offers_a_share_endpoint(self):
+        # serve.py serves this page with no SIGEN_SOURCE, so SRC.share is undefined and the
+        # card must stay hidden -- there is no local share endpoint, and a button that
+        # cannot work is worse than no button. Only site-stack.ts's /view entry point sets
+        # it. The `hidden` attribute is what makes the default safe: app.js reveals the card,
+        # it never has to remember to hide it.
+        with open(os.path.join(HERE, "web", "index.html")) as fh:
+            html = fh.read()
+        card = re.search(r'<section[^>]*id="share"[^>]*>', html)
+        self.assertIsNotNone(card, "the share card should exist in the one page")
+        self.assertIn("hidden", card.group(0),
+                      "the share card must default to hidden: serve.py has no share endpoint")
+        self.assertIn("data-live-only", card.group(0),
+                      "a frozen share cannot re-share itself, so applyFrozenMode() must "
+                      "hide this card too")
+        with open(os.path.join(HERE, "web", "app.js")) as fh:
+            app = fh.read()
+        self.assertIn("SRC.share", app,
+                      "app.js must gate the card on the source offering an endpoint")
 
 
 class TestWireFormat(unittest.TestCase):

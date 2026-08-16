@@ -13,6 +13,9 @@
     "@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy": true,
     "@aws-cdk/aws-cloudfront:useOriginAccessControl": true,
     "@aws-cdk/core:enablePartitionLiterals": true,
-    "@aws-cdk/core:target-partitions": ["aws"]
+    "@aws-cdk/core:target-partitions": ["aws"],
+
+    "//": "WEAK cross-stack references, and this one is not a tidy-up -- without it the read gate's code cannot be changed at all. SiteStack takes the Lambda@Edge VERSION arn from SigenAuthEdge, and CDK turns that into a CloudFormation Export whose NAME embeds the version's logical id, which embeds the code's asset hash. So editing one line of auth-edge/index.js renames the export, and CloudFormation refuses: 'Cannot delete export ... as it is in use by SigenSite'. A CFN export's value cannot be changed while another stack imports it, and the old value's resource is gone, so there is nothing to keep alive. Weak references replace Fn::ImportValue with Fn::GetStackOutput, which the CDK CLI resolves at deploy time and inlines as a literal -- no export, so the deadlock cannot recur. Deploy the producer before the consumer, which the artifact dependency already enforces.",
+    "@aws-cdk/core:defaultCrossStackReferences": "weak"
   }
 }

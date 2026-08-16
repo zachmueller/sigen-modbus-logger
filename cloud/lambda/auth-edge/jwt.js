@@ -52,31 +52,37 @@ function b64urlJson(seg) {
 	return JSON.parse(Buffer.from(seg, 'base64url').toString('utf8'));
 }
 
-/** The token's claims, or null. Null for every failure -- a caller must not be able to
- *  tell "expired" from "forged" and act differently on it. */
+/** `{claims, reason}`. `claims` is null for every failure and the CALLER MUST TREAT THEM
+ *  ALL ALIKE -- a visitor must not be able to tell "expired" from "forged" and act on the
+ *  difference. `reason` exists only to be logged: it names which check failed, so a
+ *  sign-in problem is a CloudWatch read rather than an experiment in a browser. It is a
+ *  fixed vocabulary and never carries any of the token, which is a bearer credential. */
 async function verifyIdToken(token, cfg) {
+	const no = (reason) => ({ claims: null, reason: reason });
 	try {
 		const parts = token.split('.');
-		if (parts.length !== 3) return null;
+		if (parts.length !== 3) return no('not-a-jwt');
 		const header = b64urlJson(parts[0]);
-		if (header.alg !== 'RS256') return null;
+		if (header.alg !== 'RS256') return no('alg-not-rs256');
 		const key = await keyForKid(cfg.jwksUri, header.kid);
-		if (!key) return null;
+		if (!key) return no('unknown-kid');
 		const ok = crypto.verify(
 			'RSA-SHA256',
 			Buffer.from(parts[0] + '.' + parts[1]),
 			key,
 			Buffer.from(parts[2], 'base64url'),
 		);
-		if (!ok) return null;
+		if (!ok) return no('bad-signature');
 		const claims = b64urlJson(parts[1]);
-		if (claims.iss !== cfg.issuer) return null;
-		if (claims.aud !== cfg.clientId) return null;
-		if (claims.token_use !== 'id') return null;
-		if (!claims.exp || claims.exp * 1000 <= Date.now()) return null;
-		return claims;
+		if (claims.iss !== cfg.issuer) return no('wrong-issuer');
+		if (claims.aud !== cfg.clientId) return no('wrong-audience');
+		if (claims.token_use !== 'id') return no('not-an-id-token');
+		if (!claims.exp || claims.exp * 1000 <= Date.now()) return no('expired');
+		return { claims: claims, reason: null };
 	} catch (e) {
-		return null;
+		// Includes a JWKS fetch that failed, which is indistinguishable here from a
+		// malformed token -- and was indistinguishable in the logs too, until `reason`.
+		return no('threw: ' + e.message);
 	}
 }
 

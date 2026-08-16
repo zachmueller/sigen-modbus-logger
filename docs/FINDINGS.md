@@ -448,6 +448,200 @@ thing exists before you conclude anything from it surviving once.
 
 ---
 
+## Hosting the archive: what measuring found that reading did not
+
+The hosted viewer (`cloud/`, `ingest.py`, `tiles.py`, `web/tiles.js`) publishes the archive
+to S3 and serves precomputed tiles through CloudFront. Almost every bug below survived code
+review and died the moment something was run.
+
+### 15. No gzip made the derived data twenty times the raw
+
+The first tile run produced **141 MB from 6.9 MB of raw**. Gzip takes it to 9.3 MB — 15x,
+26x on the widest tiles — because a tile is long arrays of similar numbers. Final ratio:
+agg 6.74 MB against raw 6.9 MB, i.e. **0.97x**, about $0.05/month per year of data. The
+plan had estimated `agg/` at ~2 GB/year; it is ~1.17 GB, marginally *smaller* than the raw.
+
+gzip `mtime` is pinned to 0 so the bytes are a pure function of the contents. Otherwise
+every re-run of an unchanged tile is a new object, which defeats S3's ETag and every CDN
+validator.
+
+### 16. Widths below the capture cadence were 28% of the aggregate and unreachable
+
+`choose_bucket` floors at the plan's cadence, so a 2 s tick can never resolve to a 1 s
+bucket. Generating those tiles anyway cost more than a quarter of the whole aggregate for
+objects no reader could ever request — and below the cadence most buckets hold one sample,
+so min == mean == max and half are empty.
+
+**The rule: generate only what the reader's own width selection can ask for.**
+
+### 17. `series.extent()` under-reports on purpose, and tiling believed it
+
+It returns the newest *file's first* record, and its docstring says so — the true end needs
+a scan. Fine for the local viewer, which polls `/api/latest` separately. For tiling it
+dropped every hour after the open file started: **37 minutes of the real archive**, which is
+exactly the data anyone opens the page to see. An archive still on its first file would have
+produced one hour of tiles however long it ran. `ingest.extent()` calls `series.latest()` to
+do the scan.
+
+### 18. Two off-by-one errors in counters, both plausible-looking
+
+`_grid()` is end-inclusive, so adjacent tiles shared a bucket: a duplicated point at every
+seam, and a counter's `last_value` read from the *next* tile. Truncating afterwards cannot
+fix it, because `first_value`/`last_value`/`reset` are derived inside `series.window` — the
+fix is `end_exclusive=True`.
+
+Then: counters measured from the tile edge, not the window edge. A tile spans an hour; "the
+last six hours" starts at :05. Grid import read **5.35 kWh against a true 5.23** — 2%,
+always in the same direction, on the number the README calls the independent cross-check
+that agrees to a watt-hour. Fixed by carrying per-bucket `first`/`last` arrays.
+
+**Caught only by diffing the browser's composed answer against `serve.py`'s, field by
+field.** A 2% error on a plausible number is invisible to inspection.
+
+### 19. Four ways a deploy can ship or serve the wrong thing
+
+1. **`TZ` is a Lambda reserved variable** — CloudFormation refuses to set it. The zone
+   arrives as `CAPTURE_TZ` and the handler calls `time.tzset()` before anything computes a
+   local time. Without it every axis label is twelve hours out.
+2. **CDK's asset hash did not cover the code.** It fingerprints the asset *source* —
+   `handler.py` plus `PACKAGE.txt` — so editing `series.py` gave "no changes" and left old
+   code running. `assetHashType: OUTPUT` hashes what actually ships. Silently deploying
+   stale code is the worst failure a deploy tool has.
+3. **The package list was incomplete**, missing `config.py`, which `serve.py` imports.
+   Symptom: `No module named 'config'` in CloudWatch after a clean deploy. Now `PACKAGE.txt`
+   with a test that recomputes the transitive import closure of every handler. Usefully,
+   `log.py` is *excluded* — the only module that constructs `lib.Modbus` — so the ingest and
+   share paths are read-only **because that code does not ship**, a stronger claim than "it
+   is never called".
+4. **`RemovalPolicy.RETAIN` orphans a bucket when the FIRST deploy fails.** Rollback skips
+   deleting it and the next deploy fails with "already exists". Delete the empty bucket by
+   hand. RETAIN is still right — it protects telemetry that exists nowhere else.
+
+### 20. `index.json` named only one plan, because an invocation can only see one
+
+Built from `series.discover()` over `/tmp`, and an invocation downloads one plan — so the
+recovered 1 Hz series vanished from the index the moment the main plan rebuilt. Now assembled
+from every plan's published `meta.json`, which is the only view that knows about all of them.
+
+Related: **`plan_of()` treated a date as a hash.** `sigen-20260814.manifest.json` yielded
+`"20260814"`, because a date is eight valid hex characters, and would have filed legacy files
+under `plan=20260814/` where nothing could decode them. Now it requires `log.py`'s three
+dash-separated components. Found by a test written expecting it to pass.
+
+### 21. Under OAC without `s3:ListBucket`, S3 returns 403 for a missing key
+
+It will not confirm absence to a caller that cannot list. But **an absent tile is how
+`web/tiles.js` learns the logger was off** — `ingest.py` writes nothing for a span with no
+records. `tiles.js` deliberately does *not* treat 403 as absent, because on a gated path a
+403 is a refusal and must never read as "no data". So the fix is `ListBucket` scoped to the
+published prefixes.
+
+This bit **twice**. The share Lambda's first version probed with `head_object` and caught
+only 404, so every share failed with `An error occurred (403) when calling HeadObject` while
+checking whether a brand-new share id was free. Catching 403 as absent would have fixed the
+symptom and reintroduced exactly the confusion above — a broken policy would produce a share
+full of gaps instead of an error. It now *lists* instead of probing: absence is unambiguous,
+and `list_objects_v2` sends a prefix, which is what lets the IAM grant stay scoped.
+
+**The rule: never let "forbidden" and "absent" collapse into one branch, in either
+direction.**
+
+### 22. A pre-existing, user-visible bug the tiling work surfaced
+
+The logger reads model and serial *once* at startup, so a restart during a brief outage
+writes a manifest whose device block is just an error. `discover()` keeps the newest
+manifest, so `[Errno 64] Host is down` became the answer to "what hardware is this?" — a
+claim about *now*, from a file written days ago. The real archive has exactly this: day one
+has the model, days two and three have the error. `Series.device()` now prefers whichever
+manifest resolved a model. **This fixed the local viewer too.**
+
+### 23. A 200 is not "it renders", and curl hides the difference
+
+`buildSite()` writes the hosted entry points with **no file extension**, because `/view` and
+`/p/<uid>` are the contract. `BucketDeployment` derives `Content-Type` from the extension, so
+both deployed as `binary/octet-stream` and **the browser downloaded a file called `view`
+instead of rendering the viewer**. The address bar never moved, which read exactly like being
+bounced back to sign in — and the sign-in it appeared to be failing had in fact succeeded
+minutes earlier.
+
+Every check said fine. `curl` returned `200`. The handoff listed `/` and `/p/<id>` as
+"verified working" on that basis. Nothing exercised whether a browser would *render* the
+body. This is finding 12 — *"it is listening" is not "it is reachable", and curl hides the
+difference* — recurring one layer up, at content type instead of at reachability.
+
+The fix is a second `BucketDeployment` that declares `text/html`, plus a synth-time check
+that every extensionless file it writes is one the stack knows to declare a type for.
+
+**The rule: for anything a browser renders, assert the Content-Type, not the status.**
+
+### 24. A frozen share aged, and started accusing the logger of dying
+
+`tiles.js` computes `record_age_s` and `logger_stalled` from the clock on every read,
+deliberately: a stored age would be wrong the moment after it was written, and a stored
+`logger_stalled` would be permanently true on a page whose data is merely an hour old.
+
+Correct for the live page, and exactly wrong for a frozen share. `latest.json` is copied at
+share time and never touched, so measuring against the clock makes its ages grow forever —
+and with `stall_after_s` at 7200, **any share opened more than two hours after it was made
+rendered a red "the logger may have stopped"** over data that was current when it was sent.
+The share was fine; only the clock had moved.
+
+So "now" is a property of the source, not of the process: `nowFor()` returns `meta.shared_at`
+for a frozen source and the clock otherwise. Verified by doctoring a share's `shared_at` to
+60 s after its newest record — the page reports "data 60 s old when shared" and no stall,
+where the clock would have said 4.6 h.
+
+### 25. The read gate could not be changed, and said nothing while failing
+
+Two independent problems, and the second hid the first.
+
+**It was undeployable.** `SiteStack` takes the Lambda@Edge *version* ARN from
+`SigenAuthEdge`, and CDK turns that into a CloudFormation export whose name embeds the
+version's logical id, which embeds the code's asset hash. So editing one line of the gate
+renames the export, and CloudFormation refuses: `Cannot delete export … as it is in use by
+SigenSite`. An export's value cannot be changed while it is imported, and the old value's
+resource is gone, so there is nothing to keep alive. Un-gating the site to break the cycle
+would open a window where the telemetry is public, which is the one thing this must not do.
+The fix is `@aws-cdk/core:defaultCrossStackReferences: weak`, which replaces
+`Fn::ImportValue` with `Fn::GetStackOutput` — resolved by the CLI at deploy time and inlined,
+so there is no export to deadlock on.
+
+**It was silent.** Across 18 invocations the gate emitted zero log lines — no allow, no deny,
+no reason. So "the cookie was rejected", "there was no cookie" and "it worked and something
+downstream broke" were indistinguishable, and diagnosing a sign-in problem meant inspecting a
+browser's cookie jar instead of reading a log. It now logs one line per decision, with the
+reason a verification failed, while returning a byte-identical response — the visitor still
+cannot tell "expired" from "forged", which was the original and correct instinct that had
+been over-applied to the logs as well.
+
+**The rule: a security decision that emits nothing cannot be operated. Log the decision, not
+the credential.**
+
+### 26. Wrong arithmetic, right answer, and the wrong one shipped to the UI
+
+The field picker needs a window wide enough to reach the day tiles. The threshold is 15
+hours, and both the design notes and `ingest.py` said so — with the derivation "a 120 s
+bucket needs 108,000 s of span". 108,000 s is **30** hours.
+
+The real reason 15 h is correct: `choose_bucket` rounds *up* to the next ladder width, so a
+120 s bucket is chosen as soon as `span / TARGET_BUCKETS` passes the width *below* it —
+`60 * 900 = 54,000 s`. 108,000 s is the *top* of the `b120` band, not its start.
+
+The prose reached the right number by the wrong route, so it read as verified. Then
+`web/app.js` computed `picker_min_bucket_s * 900` from the same reasoning and told users
+**"widen the window to 30 h"** when 15.1 h suffices — a user-visible factor of two, live for
+the life of the feature.
+
+Worse: the first test written for this passed against the buggy JavaScript, because it
+asserted `choose_bucket`'s behaviour in Python and never touched the page's copy of the
+reasoning. **Mutating the fix back is what exposed the gap.**
+
+**The rule: a plausible derivation attached to a correct number is not a checked derivation —
+and a test for shared arithmetic has to exercise every implementation of it, not the
+convenient one.**
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is

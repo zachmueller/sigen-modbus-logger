@@ -3,9 +3,24 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Construct } from 'constructs';
 import { CloudConfig } from './config';
+import { archiveLambdaCode } from './archive-bundle';
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
 const WEB = path.join(REPO_ROOT, 'web');
+
+/**
+ * The HTML entry points buildSite() writes with NO file extension, because they answer at
+ * /view and /p/<uid> and the URL is the contract.
+ *
+ * Named once and shared, because the deployment has to know which objects need their
+ * Content-Type declared -- see the two BucketDeployments below. A file added to buildSite()
+ * without being added here would be uploaded as binary/octet-stream and would download
+ * instead of rendering, which is a symptom nothing about it suggests.
+ */
+const HTML_ENTRY_POINTS = ['view', 'share-view'] as const;
+
+/** Copied verbatim; their extensions tell S3 what they are. */
+const WEB_ASSETS = ['app.js', 'tiles.js', 'charts.js', 'style.css', 'favicon.svg'] as const;
 
 /**
  * CloudFront, and the decision about what is gated.
@@ -31,7 +46,6 @@ export interface SiteStackProps extends cdk.StackProps {
 	cfg: CloudConfig;
 	edgeVersionArn: string;
 	callbackApiDomain: string;
-	shareApiDomain?: string;
 }
 
 export class SiteStack extends cdk.Stack {
@@ -58,6 +72,67 @@ export class SiteStack extends cdk.Stack {
 			props.callbackApiDomain, {
 				protocolPolicy: cdk.aws_cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
 			});
+
+		// ---- POST /api/share -------------------------------------------------
+		// It lives in THIS stack, not the data stack, for two reasons. It needs no
+		// cross-stack reference for its origin, which is the coupling that made the read
+		// gate's code undeployable (see cdk.json). And the data stack must synth before
+		// Cognito exists, while this stack already only synths once the pool ids are in
+		// cloud.json.
+		const shareFn = new cdk.aws_lambda.Function(this, 'ShareFn', {
+			runtime: cdk.aws_lambda.Runtime.PYTHON_3_12,
+			handler: 'handler.lambda_handler',
+			code: archiveLambdaCode(path.join(REPO_ROOT, 'cloud/lambda/share')),
+			// Copying a handful of tiles server-side. The work is S3 round trips, not CPU.
+			timeout: cdk.Duration.seconds(60),
+			memorySize: 512,
+			environment: {
+				BUCKET: cfg.bucket,
+				AGG_PREFIX: 'agg/',
+				SHARE_PREFIX: 'share/',
+				SITE_DOMAIN: cfg.domain,
+				// Reserved as TZ; see the handler.
+				CAPTURE_TZ: cfg.captureTz,
+			},
+			logGroup: new cdk.aws_logs.LogGroup(this, 'ShareLogs', {
+				retention: cdk.aws_logs.RetentionDays.ONE_MONTH,
+				removalPolicy: cdk.RemovalPolicy.DESTROY,
+			}),
+			description: 'Freeze one view into share/<uid>/. See cloud/lambda/share.',
+		});
+		// Read the aggregates, write the shares, and nothing else. Notably NOT raw/: a share
+		// is made from tiles, so the archive of record is not in this function's reach.
+		shareFn.addToRolePolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['s3:GetObject'],
+			resources: [`arn:aws:s3:::${cfg.bucket}/agg/*`],
+		}));
+		shareFn.addToRolePolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['s3:PutObject', 's3:GetObject'],
+			resources: [`arn:aws:s3:::${cfg.bucket}/share/*`],
+		}));
+		// ListBucket, for the same reason CloudFront needs it a few lines below: without it
+		// S3 answers 403 for a key that does NOT exist, because it will not confirm absence
+		// to a caller that cannot list. The share function has to know which tiles are
+		// absent -- that is how a gap in the data is represented -- and catching 403 as
+		// "absent" would make a broken policy look like an outage. Scoped by prefix, so raw/
+		// cannot even be enumerated; list_objects_v2 sends a prefix, which is what makes the
+		// condition work here.
+		shareFn.addToRolePolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['s3:ListBucket'],
+			resources: [`arn:aws:s3:::${cfg.bucket}`],
+			conditions: { StringLike: { 's3:prefix': ['agg/*', 'share/*'] } },
+		}));
+
+		// AWS_IAM, not NONE. The read gate is a Lambda@Edge on a CloudFront behaviour, so
+		// anything reachable BESIDE CloudFront is ungated -- and this endpoint mints public
+		// copies of private telemetry, so an open function URL would let anyone with the URL
+		// publish someone else's data. OAC signs CloudFront's requests with SigV4 and IAM
+		// refuses everyone else, which makes the URL itself uninteresting.
+		const shareUrl = shareFn.addFunctionUrl({
+			authType: cdk.aws_lambda.FunctionUrlAuthType.AWS_IAM,
+		});
+		const shareOrigin = cdk.aws_cloudfront_origins.FunctionUrlOrigin
+			.withOriginAccessControl(shareUrl);
 
 		// /p/<uid> -> one page for every share id. A CloudFront Function, not a
 		// Lambda@Edge: it is three lines of string work on a path, it runs before the
@@ -128,6 +203,22 @@ function handler(event) {
 					cachePolicy: respectOrigin,
 					edgeLambdas: gate,
 					compress: true,
+				},
+				'/api/share': {
+					origin: shareOrigin,
+					viewerProtocolPolicy:
+						cdk.aws_cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+					// ALLOW_ALL because it is a POST, and CloudFront refuses methods a
+					// behaviour does not list -- before the gate ever runs, so the symptom
+					// would be a 403 with nothing in any log.
+					allowedMethods: cdk.aws_cloudfront.AllowedMethods.ALLOW_ALL,
+					cachePolicy: cdk.aws_cloudfront.CachePolicy.CACHING_DISABLED,
+					// The gate has to see the cookie, and the function has to see the body.
+					// EXCEPT_HOST_HEADER matters for a function URL: SigV4 is computed over
+					// the origin's host, so forwarding the viewer's would break the signature.
+					originRequestPolicy: cdk.aws_cloudfront.OriginRequestPolicy
+						.ALL_VIEWER_EXCEPT_HOST_HEADER,
+					edgeLambdas: gate,
 				},
 				// -- public -------------------------------------------------
 				'/auth/*': {
@@ -223,21 +314,61 @@ function handler(event) {
 		});
 
 		// ---- the page -----------------------------------------------------
+		// TWO deployments over one prefix, and the reason is content type.
+		//
+		// /view and /p/<uid> must be reachable at those exact URLs, so the objects behind
+		// them have NO file extension -- and BucketDeployment derives Content-Type from the
+		// extension (it is `aws s3 sync` underneath, which falls back to
+		// binary/octet-stream for anything it cannot recognise). The result was a browser
+		// DOWNLOADING a file called `view` instead of rendering the viewer, while curl
+		// reported a cheerful 200. The gate, the tiles and the page were all fine.
+		//
+		// contentType is per-deployment, not per-file, so the extensionless entry points
+		// get their own deployment that declares it. Splitting on that boundary rather
+		// than renaming to view.html is deliberate: /view already carries the Lambda@Edge
+		// gate on viewer-request, and CloudFront forbids a CloudFront Function on the same
+		// event type for the same behaviour, so there is nowhere to put a rewrite.
+		const webSource = cdk.aws_s3_deployment.Source.asset(WEB, {
+			assetHashType: cdk.AssetHashType.OUTPUT,
+			bundling: {
+				image: cdk.DockerImage.fromRegistry('scratch'),
+				local: { tryBundle: (out: string) => buildSite(out, cfg) },
+			},
+		});
+		const siteBucket = cdk.aws_s3.Bucket.fromBucketName(this, 'SiteBucket', cfg.bucket);
+
+		// Everything whose extension already tells S3 what it is.
 		new cdk.aws_s3_deployment.BucketDeployment(this, 'Site', {
-			destinationBucket: cdk.aws_s3.Bucket.fromBucketName(this, 'SiteBucket', cfg.bucket),
+			destinationBucket: siteBucket,
 			destinationKeyPrefix: 'site',
-			sources: [cdk.aws_s3_deployment.Source.asset(WEB, {
-				assetHashType: cdk.AssetHashType.OUTPUT,
-				bundling: {
-					image: cdk.DockerImage.fromRegistry('scratch'),
-					local: { tryBundle: (out: string) => buildSite(out, cfg) },
-				},
-			})],
+			sources: [webSource],
+			// This deployment owns pruning, so `exclude` here is load-bearing twice over:
+			// it keeps the entry points out of THIS upload, and it withholds them from
+			// `--delete`. Without it, whichever deployment ran last would delete the
+			// other's objects.
+			exclude: [...HTML_ENTRY_POINTS],
 			// Only this prefix, so a deployment cannot reach raw/ or agg/.
 			prune: true,
 			distribution: dist,
-			distributionPaths: ['/view', '/share-view', '/index.html', '/app.js',
-				'/tiles.js', '/charts.js', '/style.css'],
+			distributionPaths: ['/index.html', '/app.js', '/tiles.js', '/charts.js',
+				'/style.css', '/favicon.svg'],
+		});
+
+		// The extensionless HTML entry points, told what they are.
+		new cdk.aws_s3_deployment.BucketDeployment(this, 'SiteEntryPoints', {
+			destinationBucket: siteBucket,
+			destinationKeyPrefix: 'site',
+			sources: [webSource],
+			exclude: ['*'],
+			include: [...HTML_ENTRY_POINTS],
+			contentType: 'text/html; charset=utf-8',
+			// The Site deployment above prunes; two deployments both passing --delete over
+			// one prefix would race to remove each other's work.
+			prune: false,
+			distribution: dist,
+			// /p/<uid> is rewritten to /share-view on viewer-request, BEFORE the cache
+			// lookup, so /share-view is the cache key to invalidate.
+			distributionPaths: ['/view', '/share-view'],
 		});
 
 		new cdk.CfnOutput(this, 'DistributionDomain', {
@@ -268,13 +399,15 @@ function buildSite(out: string, cfg: CloudConfig): boolean {
 	const withSource = (js: string) =>
 		page.replace(ANCHOR, ANCHOR + '\n<script>' + js + '</script>');
 
-	for (const f of ['app.js', 'tiles.js', 'charts.js', 'style.css', 'favicon.svg']) {
+	for (const f of WEB_ASSETS) {
 		fs.copyFileSync(path.join(WEB, f), path.join(out, f));
 	}
 
-	// The gated viewer. Its data comes from /agg/, which the gate also covers.
+	// The gated viewer. Its data comes from /agg/, which the gate also covers, and `share`
+	// is what turns on the "Save this view" card -- only here. serve.py's local page has no
+	// share endpoint, and a frozen share cannot re-share itself.
 	fs.writeFileSync(path.join(out, 'view'),
-		withSource(`window.SIGEN_SOURCE={kind:"tiles",base:"/agg/"};`));
+		withSource(`window.SIGEN_SOURCE={kind:"tiles",base:"/agg/",share:"/api/share"};`));
 
 	// A frozen share. The id comes out of the path, so one object answers for all of them,
 	// and its data comes from /share/<id>/ -- public, and a copy, so re-aggregating history
@@ -285,6 +418,23 @@ function buildSite(out: string, cfg: CloudConfig): boolean {
 		+ `window.SIGEN_SOURCE={kind:"tiles",base:"/share/"+m[1]+"/",frozen:true};})();`));
 
 	fs.writeFileSync(path.join(out, 'index.html'), landingPage(cfg));
+
+	// Every extensionless entry point must be one this stack knows to declare a Content-Type
+	// for, or it deploys as binary/octet-stream and downloads instead of rendering. Checked
+	// at synth, because the alternative is finding out in a browser.
+	for (const f of HTML_ENTRY_POINTS) {
+		if (!fs.existsSync(path.join(out, f))) {
+			throw new Error(`buildSite() did not write the entry point "${f}" that `
+				+ `HTML_ENTRY_POINTS promises. The two lists have drifted.`);
+		}
+	}
+	for (const f of fs.readdirSync(out)) {
+		if (!path.extname(f) && !(HTML_ENTRY_POINTS as readonly string[]).includes(f)) {
+			throw new Error(`buildSite() wrote "${f}", which has no file extension and is `
+				+ `not in HTML_ENTRY_POINTS. It would deploy as binary/octet-stream and a `
+				+ `browser would download it instead of rendering it. Add it to that list.`);
+		}
+	}
 	return true;
 }
 

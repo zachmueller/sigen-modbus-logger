@@ -146,6 +146,39 @@ function opt(raw: Record<string, unknown>, key: string): string {
 	return typeof v === 'string' ? v.trim() : '';
 }
 
+/**
+ * The Cognito Hosted UI origin. Derived, never configured: Cognito builds it from the
+ * domain prefix and the region, so a second copy in cloud.json could only ever be wrong.
+ */
+export function hostedUiDomain(cfg: CloudConfig): string {
+	return `https://${cfg.authDomainPrefix}.auth.${cfg.region}.amazoncognito.com`;
+}
+
+/**
+ * What must be registered on the GOOGLE OAuth client -- and it is emphatically NOT the
+ * site's own `/auth/callback`, which is what this repository used to tell people to
+ * register and which cost a session's debugging.
+ *
+ * The browser never goes from Google to this site. It goes Google -> the Cognito Hosted UI
+ * -> here. Google validates `redirect_uri` against its own registered list, and the only
+ * URI it is ever asked to redirect to is Cognito's `/oauth2/idpresponse`. Registering the
+ * site's callback instead produces `Error 400: redirect_uri_mismatch`, in which Google
+ * helpfully echoes the idpresponse URI that is missing -- a URI that appeared nowhere in
+ * this repository.
+ */
+export function googleRedirectUri(cfg: CloudConfig): string {
+	return hostedUiDomain(cfg) + '/oauth2/idpresponse';
+}
+
+/**
+ * What must be registered on the COGNITO app client. Nobody has to do this by hand -- the
+ * CDK sets it -- and it is named here only so it can never again be mistaken for the one
+ * above.
+ */
+export function cognitoCallbackUrl(cfg: CloudConfig): string {
+	return `https://${cfg.domain}/auth/callback`;
+}
+
 /** Called by the stack that bakes the pool's ids into code. */
 export function requirePool(cfg: CloudConfig): void {
 	if (!cfg.cognitoUserPoolId || !cfg.cognitoClientId) {
@@ -169,7 +202,13 @@ export function requireAuth(cfg: CloudConfig): void {
 		fail(
 			'google_client_id is empty, so the site would have no way to sign anyone in.\n' +
 				'  Create the OAuth client in the Google Cloud Console first (External consent\n' +
-				'  screen; authorized redirect URI https://' + cfg.domain + '/auth/callback).',
+				'  screen), and register this as its ONE authorized redirect URI:\n\n' +
+				'    ' + googleRedirectUri(cfg) + '\n\n' +
+				'  That is Cognito\'s Hosted UI, NOT this site. Google redirects to Cognito,\n' +
+				'  which then redirects here -- so registering ' + cognitoCallbackUrl(cfg) + '\n' +
+				'  instead yields "Error 400: redirect_uri_mismatch" on every sign-in.\n' +
+				'  Also check the consent screen\'s Publishing status: while it is "Testing",\n' +
+				'  only accounts on its Test users list can sign in, whatever allowed_emails says.',
 		);
 	}
 	if (!cfg.allowedEmails.length) {

@@ -36,6 +36,45 @@ function isPublic(uri) {
 	return uri.indexOf('/auth/') === 0;
 }
 
+// An API call cannot follow a redirect usefully. fetch() would chase the 302 to Google, get
+// a sign-in page back, and hand app.js an HTML body where it expected JSON -- so the page
+// would report a parse error for what is really an expired session. A status it can branch on
+// instead, with `login` naming where to send the person.
+function unauthorizedJson(request, reason) {
+	const host = request.headers.host[0].value;
+	return {
+		status: '401',
+		statusDescription: 'Unauthorized',
+		headers: {
+			'content-type': [{ key: 'Content-Type', value: 'application/json' }],
+			'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+		},
+		body: JSON.stringify({
+			ok: false,
+			error: reason,
+			login: 'https://' + host + '/view',
+		}),
+	};
+}
+
+/** Refused for good: no `login`, because signing in again cannot change the answer. */
+function forbiddenJson(reason) {
+	return {
+		status: '403',
+		statusDescription: 'Forbidden',
+		headers: {
+			'content-type': [{ key: 'Content-Type', value: 'application/json' }],
+			'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+		},
+		body: JSON.stringify({ ok: false, error: reason }),
+	};
+}
+
+/** Paths whose caller is a script, not a browser navigating. */
+function isApi(uri) {
+	return uri.indexOf('/api/') === 0;
+}
+
 function loginRedirect(request) {
 	const host = request.headers.host[0].value;
 	// Where to come back to, carried through Google and the callback. Host-relative, and
@@ -80,6 +119,35 @@ function forbidden(email) {
 	};
 }
 
+// One line per decision, because this function used to emit NOTHING -- and a sign-in that
+// silently bounced could not be told from one that silently worked, so diagnosing it meant
+// reading a browser's cookie jar instead of a log.
+//
+// Two things are deliberately absent. The token: it is a bearer credential, and a log is a
+// place it would sit for a month. The full address: it is someone's identity, and the
+// domain is enough to tell which of a handful of allowlisted people hit a gate.
+//
+// Allows are logged only for page requests, not for every /agg/* tile the page then
+// fetches -- same reasoning as serve.py's `noisy` filter. "Did this person get in?" is
+// answered by one line; a line per tile would bury it.
+function log(decision, request, detail) {
+	console.log(JSON.stringify({
+		gate: decision,
+		uri: request.uri,
+		detail: detail || undefined,
+	}));
+}
+
+function isTelemetryFetch(uri) {
+	return uri.indexOf('/agg/') === 0 || uri.indexOf('/share/') === 0;
+}
+
+/** The domain only. Enough to diagnose, not a record of who was here. */
+function domainOf(email) {
+	const at = String(email || '').indexOf('@');
+	return at < 0 ? 'no-domain' : String(email).slice(at).toLowerCase();
+}
+
 exports.handler = async (event) => {
 	const request = event.Records[0].cf.request;
 	if (isPublic(request.uri)) return request;
@@ -88,17 +156,40 @@ exports.handler = async (event) => {
 		? request.headers.cookie.map((h) => h.value).join('; ')
 		: '';
 	const token = readCookie(cookieHeader, COOKIE);
-	if (!token) return loginRedirect(request);
+	if (!token) {
+		log('no-cookie', request);
+		return isApi(request.uri)
+			? unauthorizedJson(request, 'not signed in')
+			: loginRedirect(request);
+	}
 
-	const claims = await verifyIdToken(token, cfg);
-	// An invalid or expired token is indistinguishable from no token, on purpose: send
-	// them to sign in rather than telling them which it was.
-	if (!claims) return loginRedirect(request);
+	const { claims, reason } = await verifyIdToken(token, cfg);
+	// An invalid or expired token is indistinguishable from no token TO THE VISITOR, on
+	// purpose: send them to sign in rather than telling them which it was. `reason` is for
+	// the log only, and does not change the response.
+	if (!claims) {
+		log('verify-failed', request, reason);
+		return isApi(request.uri)
+			? unauthorizedJson(request, 'your session has expired')
+			: loginRedirect(request);
+	}
 
 	const email = String(claims.email || '').toLowerCase();
 	// email_verified matters: without it, a Google account could in principle assert an
 	// address it does not control, and the allowlist is keyed on the address.
-	if (!email || claims.email_verified === false) return forbidden(claims.email);
-	if (!cfg.allowedEmails.includes(email)) return forbidden(claims.email);
+	if (!email || claims.email_verified === false) {
+		log('email-unverified', request, domainOf(claims.email));
+		return isApi(request.uri)
+			? forbiddenJson('your Google account has no verified email address')
+			: forbidden(claims.email);
+	}
+	if (!cfg.allowedEmails.includes(email)) {
+		log('not-allowlisted', request, domainOf(email));
+		// 403, not 401: signing in again cannot help, so the page must not offer to.
+		return isApi(request.uri)
+			? forbiddenJson('this account is not on the viewer\'s list')
+			: forbidden(claims.email);
+	}
+	if (!isTelemetryFetch(request.uri)) log('allow', request);
 	return request;
 };

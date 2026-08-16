@@ -2,17 +2,9 @@ import * as cdk from 'aws-cdk-lib';
 import * as path from 'path';
 import { Construct } from 'constructs';
 import { CloudConfig } from './config';
+import { archiveLambdaCode } from './archive-bundle';
 
 const REPO_ROOT = path.resolve(__dirname, '../../..');
-
-/** One path per line, ignoring blanks and #-comments. See cloud/lambda/ingest/PACKAGE.txt. */
-function readPackageList(file: string): string[] {
-	const fs = require('fs');
-	const lines: string[] = fs.readFileSync(file, 'utf-8').split('\n');
-	const out = lines.map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
-	if (!out.length) throw new Error(`${file} lists no files to package`);
-	return out;
-}
 
 /**
  * The one bucket, and the Lambda that turns raw into tiles.
@@ -94,34 +86,10 @@ export class DataStack extends cdk.Stack {
 		// serve.py imports, and the only symptom was "No module named 'config'" in a
 		// CloudWatch log after deploy. tests/test_web.py recomputes the import closure and
 		// asserts that file is exactly right, so the failure now happens in the suite.
-		const HANDLER_DIR = path.join(REPO_ROOT, 'cloud/lambda/ingest');
-		const files = readPackageList(path.join(HANDLER_DIR, 'PACKAGE.txt'));
-
-		const ingestCode = cdk.aws_lambda.Code.fromAsset(HANDLER_DIR, {
-			// Hash the BUNDLE, not this directory. By default CDK fingerprints the asset
-			// source, which here is just handler.py and PACKAGE.txt -- so editing
-			// series.py or ingest.py produced "SigenData (no changes)" and left the old
-			// code running in the Lambda. Silently deploying stale code is the worst
-			// failure available in a deploy tool, so the hash has to cover what actually
-			// ships.
-			assetHashType: cdk.AssetHashType.OUTPUT,
-			// A local bundling step rather than a Docker image: the "build" is a handful
-			// of file copies, so synth stays fast and needs no container runtime.
-			bundling: {
-				image: cdk.DockerImage.fromRegistry('scratch'),
-				local: {
-					tryBundle(outputDir: string): boolean {
-						const fs = require('fs');
-						for (const f of files) {
-							fs.copyFileSync(path.join(REPO_ROOT, f), path.join(outputDir, f));
-						}
-						fs.copyFileSync(path.join(HANDLER_DIR, 'handler.py'),
-							path.join(outputDir, 'handler.py'));
-						return true;
-					},
-				},
-			},
-		});
+		// The bundling, the PACKAGE.txt list and the OUTPUT asset hash all live in
+		// archive-bundle.ts, because the share Lambda in site-stack.ts needs exactly the
+		// same closure -- it imports the same tile geometry rather than restating it.
+		const ingestCode = archiveLambdaCode(path.join(REPO_ROOT, 'cloud/lambda/ingest'));
 
 		const ingest = new cdk.aws_lambda.Function(this, 'IngestFn', {
 			runtime: cdk.aws_lambda.Runtime.PYTHON_3_12,

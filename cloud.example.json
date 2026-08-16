@@ -22,5 +22,11 @@
  "allowed_emails": [
   "you@example.com",
   "someone@example.com"
- ]
+ ],
+
+ "__google_redirect": "Register ONE authorized redirect URI on the Google OAuth client, and it is NOT this site -- it is the Cognito Hosted UI: https://<auth_domain_prefix>.auth.<region>.amazoncognito.com/oauth2/idpresponse . Google redirects to Cognito, which then redirects to https://<domain>/auth/callback; that second URL is set by the CDK on the app client and is not a Google setting. Registering it with Google instead gives 'Error 400: redirect_uri_mismatch' on every sign-in, and Google's error details name the idpresponse URI it expected. `cdk deploy SigenAuthPool` prints both as GoogleAuthorizedRedirectUri and CognitoCallbackUrl. Also check the consent screen's Publishing status: while it is 'Testing' only accounts on its Test users list can sign in, whatever allowed_emails says.",
+
+ "__pool": "Filled in AFTER `cdk deploy SigenAuthPool`, from its UserPoolId and ClientId outputs. Leave them empty on a first deploy: SigenAuthEdge and SigenSite do not even appear in `cdk ls` until both are set, which is deliberate -- a Lambda@Edge cannot be given them as environment variables, so they are baked into its code at synth, and synthesizing before the pool exists would bake a CloudFormation token and reject every valid login.",
+ "cognito_user_pool_id": "",
+ "cognito_client_id": ""
 }
