@@ -199,23 +199,56 @@ def _write(out_dir, rel, obj):
     return path
 
 
-def complete(kind, start, now):
-    """Has this span finished? A finished tile is written once and cached forever."""
-    return SPAN_OF[kind](start)[1] <= now
+def complete(kind, start, now, data_end=None):
+    """Has this span finished, AND does the archive actually reach past it?
+
+    Both halves matter, and the second was missing. A finished tile is written once and
+    cached forever -- `Cache-Control: immutable`, max-age a year -- so "finished" has to
+    mean the tile can never need rewriting. The clock alone does not establish that,
+    because raw can arrive LATE.
+
+    It did. The capture host's uploader was installed eleven hours after the archive it
+    copies, and a rebuild run in between built the UTC hour whose raw stopped 54 minutes
+    short of its end. By the clock that hour was long over, so the tile was written
+    immutable -- and its `covered` range claimed the whole hour anyway, because
+    series.window() extends the newest file to the end of the window it was asked for
+    (series.py, "a pending file's buckets hold no records"). So the tile asserted, for a
+    year, that the inverter recorded nothing between 11:06 and 12:00. That is
+    indistinguishable from a real outage, which is how it was reported: "no records".
+    Uploading the rest of that hour rewrote the object in S3 and could not dislodge the
+    copy in the CDN; it took a manual invalidation. FINDINGS 30.
+
+    `data_end` is the archive's true newest record -- ingest.extent(), which scans rather
+    than trusting series.extent()'s indexed end. A span ending at or before it is
+    genuinely finished: whatever gaps lie inside it are real gaps, because the archive
+    demonstrably continued past them. Omitted, this degrades to the old clock-only answer,
+    so no caller can be silently wrong by forgetting it -- write_span() computes it.
+    """
+    end = SPAN_OF[kind](start)[1]
+    if end > now:
+        return False
+    return data_end is None or end <= data_end
 
 
-def write_span(s, out_dir, kind, ts, cache=None, now=None):
+def write_span(s, out_dir, kind, ts, cache=None, now=None, data_end=None):
     """Every tile for the span containing `ts`. Returns [(relpath, cache_control)].
 
     A span with no records in it writes nothing rather than a tile full of nulls: the
     reader treats an absent tile as "no data here", which is the truth, and an empty
     tile would cost a request to say the same thing.
+
+    `data_end` decides immutable-versus-fresh with complete(); it is computed here when
+    the caller does not pass it, so the safe answer is the default. The callers that
+    write many spans pass it, because extent() scans and doing that per span would read
+    the newest file once for every hour in the archive.
     """
     now = time.time() if now is None else now
+    if data_end is None:
+        data_end = extent(s)[1]
     start, end = SPAN_OF[kind](ts)
     keys = fine_keys(s) if kind == tiles.HOUR else coarse_keys(s)
     counters = counter_keys()
-    header = IMMUTABLE if complete(kind, start, now) else FRESH
+    header = IMMUTABLE if complete(kind, start, now, data_end) else FRESH
     written = []
     for bucket_s in widths_for(kind, s.fast_period_s):
         tile = tiles.build_from_series(s, {c["key"]: c for c in series.catalog(s)},
@@ -270,12 +303,16 @@ def build_all(s, out_dir, cache=None, now=None, kinds=None):
     ever re-reads a month of raw.
     """
     now = time.time() if now is None else now
+    # Once, not per span: extent() scans the newest file, and every span in the archive
+    # shares the same answer.
+    data_end = extent(s)[1]
     written = []
     for kind in (kinds or (tiles.HOUR, tiles.DAY, tiles.MONTH)):
         for ts in spans_touching(s, kind):
-            if kind == tiles.MONTH and not complete(kind, ts, now):
+            if kind == tiles.MONTH and not complete(kind, ts, now, data_end):
                 continue
-            written.extend(write_span(s, out_dir, kind, ts, cache=cache, now=now))
+            written.extend(write_span(s, out_dir, kind, ts, cache=cache, now=now,
+                                      data_end=data_end))
     return written
 
 
@@ -472,20 +509,42 @@ def run_for(data_dir, out_dir, touched, now=None, cache=None, plan_hash=None):
     for ph, s in found.items():
         if plan_hash and ph != plan_hash:
             continue
+        data_end = extent(s)[1]
         spans = {(tiles.HOUR, hour_span(t)[0]) for t in touched}
         spans |= {(tiles.DAY, day_span(t)[0]) for t in touched}
+        # And the span BEFORE the earliest touched one. complete() only calls a span
+        # finished once the archive reaches PAST its end, so the hour a rotation closes is
+        # written FRESH -- correct, but nothing would ever come back to upgrade it, and
+        # every finished hour would sit at max-age=60 revalidating forever. The next
+        # rotation is the thing that proves the previous span finished, so that is when it
+        # is rewritten: identical bytes, changed header. The month block below rests on the
+        # same reasoning.
+        #
+        # Done explicitly rather than relying on a rotation straddling the boundary. It
+        # usually does -- rotate_minutes rarely divides the hour -- but a run that happened
+        # to align would leave every hour tile fresh forever, and that is too quiet a
+        # failure to depend on a coincidence of phase. The cost is bounded and constant:
+        # one extra hour and one extra day per rotation, never a growing window.
+        earliest = min(touched)
+        spans.add((tiles.HOUR, hour_span(hour_span(earliest)[0] - 1)[0]))
+        spans.add((tiles.DAY, day_span(day_span(earliest)[0] - 1)[0]))
         # A month gets its tile the first time it is seen complete. Cheap to re-check:
         # if it is already there this rewrites identical bytes, and if the ingest that
         # should have written it was lost, this is what repairs it.
+        #
+        # complete(), not `m_end <= now`: a month whose raw is still arriving must get NO
+        # tile rather than a fresh one, because the reader falls back to that month's day
+        # tiles and a month tile short of its last days would silently answer for them.
         for t in touched:
-            m_start, m_end = month_span(t)
-            if m_end <= now:
+            m_start, _ = month_span(t)
+            if complete(tiles.MONTH, m_start, now, data_end):
                 spans.add((tiles.MONTH, m_start))
-            prev = month_span(m_start - 1)
-            if prev[1] <= now:
-                spans.add((tiles.MONTH, prev[0]))
+            prev = month_span(m_start - 1)[0]
+            if complete(tiles.MONTH, prev, now, data_end):
+                spans.add((tiles.MONTH, prev))
         for kind, start in sorted(spans, key=lambda kv: (kv[0], kv[1])):
-            written.extend(write_span(s, out_dir, kind, start, cache=cache, now=now))
+            written.extend(write_span(s, out_dir, kind, start, cache=cache, now=now,
+                                      data_end=data_end))
         written.extend(write_documents(s, out_dir))
     written.extend(write_index(found, out_dir))
     return written

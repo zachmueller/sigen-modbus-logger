@@ -1400,19 +1400,57 @@ class TestIngest(ViewerFixture):
     def test_a_finished_span_is_immutable_and_a_running_one_is_not(self):
         s = self.seed()
         out = self.out()
-        # "now" inside the same UTC day: the hours are done, the day is not.
+        # "now" inside the same UTC day: the hours are done, the day is not. seed() writes
+        # two hours, so the FIRST hour is finished on both counts -- the clock is past it
+        # and the archive continues into the second -- while the second hour holds the last
+        # record and so is still open. That is the distinction, and it is not the clock's.
         written = dict(ingest.run(self.tmp, out, now=self.base + 4 * 3600))
-        hours = [r for r in written if "/hour/" in r]
+        hours = sorted(r for r in written if "/hour/" in r)
         days = [r for r in written if "/day/" in r]
         self.assertTrue(hours and days)
+        # The hour holding the last record, at EVERY bucket width -- so match on the
+        # date-and-hour suffix, not on a path that pins one width.
+        last_hour = ingest.hour_span(ingest.extent(s)[1])[0]
+        tail = time.strftime("/%Y/%m/%d/%H.json.gz", time.gmtime(last_hour))
         for r in hours:
-            self.assertEqual(written[r], ingest.IMMUTABLE, r)
+            want = ingest.FRESH if r.endswith(tail) else ingest.IMMUTABLE
+            self.assertEqual(written[r], want, r)
+        self.assertTrue(any(r.endswith(tail) for r in hours),
+                        "the open hour should still be written, just not immutable")
+        self.assertTrue(any(not r.endswith(tail) for r in hours),
+                        "and a finished hour must exist, or this proves only one half")
         for r in days:
             self.assertEqual(written[r], ingest.FRESH, r)
-        # And once the day has closed, its tile is immutable too.
+        # Advancing only the CLOCK must not make the day immutable: the archive still stops
+        # inside it, so more raw for that day can still arrive and rewrite the tile. This is
+        # the assertion that used to read the other way, and FINDINGS 30 is what it cost.
         later = dict(ingest.run(self.tmp, out, now=self.base + 3 * 86400))
         for r in [x for x in later if "/day/" in x]:
-            self.assertEqual(later[r], ingest.IMMUTABLE, r)
+            self.assertEqual(later[r], ingest.FRESH, r)
+
+    def test_a_span_is_immutable_only_once_the_archive_passes_it(self):
+        # The bug, reduced. A UTC hour whose raw stops 54 minutes short was written with
+        # max-age=31536000 because the clock was eleven hours past it -- and its `covered`
+        # range claimed the whole hour anyway, since series.window() extends the newest file
+        # to the end of the window it was asked for. So it asserted for a year that the
+        # inverter recorded nothing in those 54 minutes, which reads exactly like an outage.
+        # The rest of the hour arrived when the uploader was finally installed; S3 took the
+        # rewrite and the CDN kept serving the old copy.
+        s = self.seed(hours=1)
+        out = self.out()
+        far = self.base + 30 * 86400          # a month past the data, by the clock
+        hour = ingest.hour_span(self.base)[0]
+        self.assertGreater(ingest.hour_span(hour)[1], ingest.extent(s)[1],
+                           "the fixture must stop short of the hour's end")
+        self.assertFalse(ingest.complete(tiles.HOUR, hour, far, ingest.extent(s)[1]),
+                         "the archive stops inside this hour, so its tile can still change")
+        written = dict(ingest.write_span(s, out, tiles.HOUR, self.base, now=far))
+        self.assertTrue(written)
+        for r in written:
+            self.assertEqual(written[r], ingest.FRESH, r)
+        # The clock alone still answers when there is no archive to consult, so callers
+        # without a series are not silently changed.
+        self.assertTrue(ingest.complete(tiles.HOUR, hour, far))
 
     def test_an_incomplete_month_gets_no_tile(self):
         # By design: complete months are written once and never re-read, which is what
@@ -1422,7 +1460,18 @@ class TestIngest(ViewerFixture):
         out = self.out()
         written = [r for r, _ in ingest.run(self.tmp, out, now=self.base + 4 * 3600)]
         self.assertEqual([r for r in written if "/month/" in r], [])
-        # Two months later the month has closed, so now it exists.
+        # Two months on the CLOCK is not enough, and that is the point. The archive still
+        # ends inside this month, so raw for its remaining days can still arrive -- and a
+        # month tile short of its last days would answer for them, because the reader stops
+        # falling back to day tiles as soon as a month tile exists.
+        written = [r for r, _ in ingest.run(self.tmp, out, now=self.base + 70 * 86400)]
+        self.assertEqual([r for r in written if "/month/" in r], [])
+        # It appears once the ARCHIVE passes the month's end, which is what makes writing
+        # it once and never again a promise ingest can actually keep.
+        nxt = ingest.month_span(self.base)[1]
+        self.set_scaled("plant_ess_soc", 42.0)
+        self.write_records("20260901T000000",
+                           [(nxt + 60, self.full_mask(), 100, self.block_payload())])
         written = [r for r, _ in ingest.run(self.tmp, out, now=self.base + 70 * 86400)]
         self.assertTrue([r for r in written if "/month/" in r])
 
@@ -1463,6 +1512,37 @@ class TestIngest(ViewerFixture):
         for ts in (self.base, self.base + 3600):
             stem = time.strftime("%Y/%m/%d/%H", time.gmtime(ts))
             self.assertTrue([r for r in inc if stem in r], stem)
+
+    def test_a_finished_hour_is_upgraded_to_immutable_by_the_next_rotation(self):
+        # complete() will not call a span finished until the archive reaches PAST its end,
+        # so the hour a rotation closes is written FRESH. Something has to come back and
+        # upgrade it, or every hour tile sits at max-age=60 revalidating forever, which
+        # would quietly undo the point of precomputing them. run_for() therefore also
+        # rebuilds the span before the earliest it was handed.
+        #
+        # Rotation is aligned to the hour here ON PURPOSE. An off-phase rotation straddles
+        # the boundary and rebuilds the previous hour as a side effect, so this would pass
+        # without the explicit span and prove nothing about it.
+        self.seed(hours=1)                       # 06:00:00 .. 06:59:58, one UTC hour
+        out = self.out()
+        now = self.base + 4 * 3600
+        tail = time.strftime("/%Y/%m/%d/%H.json.gz", time.gmtime(self.base))
+        first = dict(ingest.run_for(self.tmp, out, touched=[self.base], now=now))
+        opened = [r for r in first if r.endswith(tail)]
+        self.assertTrue(opened, "the hour holding the last record should still be written")
+        for r in opened:
+            self.assertEqual(first[r], ingest.FRESH, r)
+        # The next hour arrives. Stamp sorts after seed()'s, because the name is what orders
+        # files and the header is what dates the records.
+        self.set_scaled("plant_ess_soc", 30.0)
+        self.write_records("20260814T100000",
+                           [(self.base + 3600 + i * 2, self.full_mask(), 100,
+                             self.block_payload()) for i in range(30)])
+        second = dict(ingest.run_for(self.tmp, out, touched=[self.base + 3600], now=now))
+        again = [r for r in second if r.endswith(tail)]
+        self.assertTrue(again, "the previous hour must be revisited, not left at max-age=60")
+        for r in again:
+            self.assertEqual(second[r], ingest.IMMUTABLE, r)
 
     # -- the documents -----------------------------------------------------
 
