@@ -748,6 +748,116 @@ covers only the half that principal shares with you.**
 
 ---
 
+## Installing the uploader: what the archive's own lifecycle turned out to hide
+
+### 28. `.bin.gz` is what travels, so a `.bin` that never rotated never leaves
+
+`sync.py` uploads rotated records and manifests and skips the open `.bin`, correctly: it grows
+every couple of seconds, so uploading it means re-uploading a partial file forever. What that
+also means is that a `.bin` which *never* rotates is never uploaded, and nothing said so.
+
+`log.py` gzips the open file when it rotates. A logger killed mid-hour leaves the `.bin`
+behind, and no later run gzips it — so that hour reaches S3 only if somebody notices. There
+are four such files in this archive, from commissioning-day restarts on 2026-08-14. They are
+offsite only because `cloud/backfill.py` swept the directory once and did not care about
+extensions.
+
+`sync.py --status` now names them. The test that separates a stranded file from the open one is
+not its name or its age but **the existence of a newer `.bin.gz`** — that is the proof rotation
+has happened since, so this file is finished and was simply never compressed. Age would be
+wrong: the open file is the newest thing there and is not stranded. Without that test the
+current hour is reported every five minutes, for the whole hour, every hour, and a warning
+that is always on is a warning nobody reads.
+
+It deliberately does **not** affect the exit status. A file already carried offsite by another
+route is stranded here forever, so failing on it would pin `--status` to 1 for good — and a
+permanently-red signal says less than silence.
+
+**The same lifecycle produced a second, quieter problem.** That one-off backfill uploaded the
+then-open `.bin`, and rotation later produced the `.bin.gz` for the same stem. Both sat in
+`raw/plan=08c047b8/`, and `series.discover()` admits `.bin` *and* `.bin.gz` into one Series
+group — so that hour decoded twice. `sort_chronologically` breaks the identical-stamp tie on
+basename, so the `.bin` sorts first and `spans()` gives it `last_ts == first_ts`; but
+`FileSpan.overlaps()` returns true for a degenerate span inside the queried range, so it is
+still read. Mean, min and max absorb duplicated identical samples, which is why nothing looked
+wrong. Confirmed harmless to delete by decompressing both and checking the partial was a
+byte-exact prefix of the rotated file — 721,228 of 1,175,904 bytes — which is a stronger claim
+than comparing record timestamps.
+
+**Two `.bin` extensions for one span is a collision the archive format permits and the reader
+does not detect. Check for it after any backfill that predates the uploader.**
+
+### 29. A red pill blamed the logger for the uploader's absence
+
+Two live shares rendered `no record for 4.5 h when shared — the logger may have stopped`, and
+`11.1 h` on the other. FINDINGS 24's fix was working exactly as intended: the age was measured
+from `shared_at`, not the clock, so it did not grow after sending.
+
+The sentence was still wrong. The logger had not missed a tick — `~/sigen/data` held a record
+from minutes earlier the whole time. What had stopped, or rather had never started, was the
+*uploader*: `sync.py` was not installed, so S3 was eleven hours behind a healthy capture.
+
+On a `tiles` source `record_ts` is the newest record that reached the bucket, and that only
+advances on rotation-plus-upload. A stopped logger and a stopped uploader are therefore the
+**same symptom**, and the page has nothing to tell them apart with. It now names both there,
+and still names the logger alone on `serve.py`, which reads the archive directly and where the
+inference is available.
+
+**This is FINDINGS 7's distinction one hop further out.** That one separated "the logger
+stopped" from "the device stopped answering" and kept them apart because conflating them
+misdirects the person reading. The hosted page added a third component — the uploader — and
+inherited a message written when only two existed.
+
+**A page can only name the failure its evidence distinguishes. Where two components produce an
+identical symptom, name both or name neither.**
+
+### 30. A tile was promised immutable for a year, from raw that had not arrived
+
+Reported from the live viewer: 11:06 to 12:00 NZST on 2026-08-16 read as **"no records"**
+while everything either side of it was fine. In UTC that is hour 23 of 2026-08-15.
+
+`complete()` asked one question — has the clock passed the end of this span? It had, by eleven
+hours. So a rebuild run at 15:50 NZST wrote that hour with `Cache-Control: public,
+max-age=31536000, immutable`, built from raw that stopped 54 minutes short of the hour's end
+because the uploader had not been installed yet.
+
+**Two things then made it invisible rather than obviously broken.** The tile's `covered` range
+claimed the whole hour anyway — `series.window()` extends the newest file to the end of the
+window it was asked for, since it has no way to know where an open file ends. So `web/tiles.js`
+read those buckets as *covered, with no records*, which is precisely how a real outage looks.
+And the promise was kept: uploading the rest of that hour rewrote the object in S3 and could
+not dislodge the copy in the CDN. It took a manual `/agg/*` invalidation, and then a hard
+reload, because the browser had cached the same year.
+
+The architecture notes state the invariant plainly: *a tile is written once from a complete
+span, then never rewritten — which is what makes `immutable` safe.* The clock does not
+establish that a span is complete, because **raw can arrive late**. Here it arrived eleven
+hours late, which is how long the uploader took to install; a backfill of any old date does the
+same thing.
+
+`complete()` now takes `data_end`, the archive's true newest record from `ingest.extent()` —
+which scans, rather than trusting `series.extent()`'s indexed end (FINDINGS 17) — and calls a
+span finished only once the archive reaches *past* it. Whatever gaps lie inside such a span are
+real gaps, because the archive demonstrably continued through them.
+
+**The fix on its own would have made things worse, quietly.** The hour a rotation closes now
+starts out fresh, and nothing revisited it — so every hour tile would have sat at `max-age=60`
+revalidating forever, undoing the reason the tiles are precomputed at all. `run_for()` also
+rebuilds the span *before* the earliest it is handed: identical bytes, changed header, the same
+reasoning the month block already used. Explicitly, not by relying on a rotation straddling the
+UTC boundary — it usually does, since `rotate_minutes` rarely divides the hour, but an aligned
+one would leave every hour fresh forever, and that is too quiet to rest on a coincidence of
+phase. The test for it rotates *on* the hour for exactly that reason.
+
+Months tightened rather than loosened: an incomplete-by-data month now gets no tile, where the
+clock alone used to be enough. The reader falls back to that month's day tiles, which is the
+designed path, and a month tile short of its last days would have answered for them instead.
+
+**`immutable` is a promise about the future made from the present. Only make it from evidence
+that the input is finished — the clock is evidence about the clock.**
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is
