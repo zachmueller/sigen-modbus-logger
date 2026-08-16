@@ -1103,6 +1103,29 @@ class TestSharePostIsSigned(unittest.TestCase):
         self.assertIn("edgeLambdas: gateSigningBody", share.group(1),
                       "the share behaviour must use the association that carries the body")
 
+    def test_cloudfront_is_granted_both_invoke_actions_not_just_the_url_one(self):
+        # A signed request still has to be AUTHORISED, and since October 2025 a function URL
+        # requires lambda:InvokeFunction as well as lambda:InvokeFunctionUrl. CDK's
+        # withOriginAccessControl() grants only the latter -- it grants both for authType
+        # NONE, so the omission is specific to the OAC path -- and the symptom of the gap is
+        # indistinguishable from the payload-hash bug above: 403, no invocation, no log, and
+        # a gate that has already said `allow`. This is the second cause of one symptom.
+        #
+        # Pinned on the stack rather than the deployed policy because a test cannot reach AWS.
+        # A future CDK that grants it too makes this redundant, not wrong: the statements are
+        # identical. Deleting it as "surely CDK does that" is the regression.
+        ts = self.read(self.STACK)
+        grant = re.search(r"shareFn\.addPermission\([^;]*;", ts, re.S)
+        self.assertIsNotNone(grant,
+                             "site-stack.ts must grant CloudFront lambda:InvokeFunction "
+                             "itself; withOriginAccessControl() stops at InvokeFunctionUrl")
+        self.assertIn("'lambda:InvokeFunction'", grant.group(0))
+        self.assertIn("cloudfront.amazonaws.com", grant.group(0))
+        self.assertIn("sourceArn", grant.group(0),
+                      "scope it to this distribution -- otherwise any CloudFront distribution "
+                      "in any account could invoke the endpoint that mints public shares")
+        self.assertIn("distribution/", grant.group(0))
+
     def test_the_page_names_a_refusal_that_carries_no_error(self):
         # The whole cost of this bug was diagnostic: three layers can refuse a share, and the
         # page could only read one of their shapes. `{"Message": "Forbidden"}` reduced to

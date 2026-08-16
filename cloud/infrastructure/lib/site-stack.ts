@@ -275,6 +275,28 @@ function handler(event) {
 			},
 		});
 
+		// ---- what CloudFront may INVOKE -----------------------------------
+		// `withOriginAccessControl()` above grants lambda:InvokeFunctionUrl and stops there.
+		// That was sufficient once. Since **October 2025** a function URL requires BOTH
+		// lambda:InvokeFunctionUrl and lambda:InvokeFunction, and this one was created after
+		// that -- so CloudFront authenticated successfully and was then refused, which is a
+		// 403 whose body is a link to urls-auth.html. Nothing invokes, so nothing logs: not in
+		// the share function, and the gate one hop earlier has already said `allow`. It cost
+		// two rounds of debugging. aws-cdk-lib 2.265.0 adds both actions for authType NONE
+		// (aws-lambda/lib/function-url.js) and only the one for OAC, so this fills that gap;
+		// a later CDK that grants it too is harmless, the statements are identical.
+		//
+		// SourceArn, not lambda:InvokedViaFunctionUrl, because SourceArn is what actually
+		// contains this: only CloudFront acting for THIS distribution can invoke. The OAC
+		// documentation's own command omits the condition key, and it is a security boundary
+		// worth stating in the terms the docs use rather than improving on untested.
+		shareFn.addPermission('CloudFrontInvokeFunction', {
+			principal: new cdk.aws_iam.ServicePrincipal('cloudfront.amazonaws.com'),
+			action: 'lambda:InvokeFunction',
+			sourceArn: `arn:aws:cloudfront::${this.account}:distribution/`
+				+ dist.distributionId,
+		});
+
 		// ---- what CloudFront may read -------------------------------------
 		// OAC generates a bucket policy automatically, but only for the prefixes it knows
 		// about, and `fromBucketName` gives an IBucket the stack cannot attach one to. So

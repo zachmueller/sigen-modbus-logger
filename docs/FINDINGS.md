@@ -703,6 +703,49 @@ note is 10.0 KB — but the ceiling above the cap is the next way this breaks.
 every log you own says "fine", suspect the hop between two of them — and make every layer
 that can refuse a request say so in the one shape the caller already reads.**
 
+#### 27b. …and behind it, a second cause wearing the same 403
+
+The payload hash was real, documented and necessary — and fixing it did not make the button
+work. The next click failed with a 403 again, except the page could now quote it:
+
+```
+403 Forbidden. For troubleshooting Function URL authorization issues,
+see: https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html
+```
+
+That is a *different* string, and the difference is the whole diagnosis. Signing the same POST
+four ways maps every 403 this endpoint can produce:
+
+| How the request is signed | Response |
+|---|---|
+| Not signed at all | `{"Message":"Forbidden"}` |
+| Signed over an empty payload, or with `UNSIGNED-PAYLOAD`, while sending a body | `{"message":"The request signature we calculated does not match…"}` |
+| Correct payload hash, **admin** credentials | **400** from the handler — it arrives |
+| Correct payload hash, **CloudFront** | `Forbidden. For troubleshooting Function URL authorization issues…` |
+
+The browser's 403 is not the signature string, so authentication was **succeeding**: the gate's
+hash was accepted, and *authorization* was refused. Which AWS documents plainly:
+
+> Starting in **October 2025**, new function URLs will require both `lambda:InvokeFunctionUrl`
+> and `lambda:InvokeFunction` permissions. […] If a function's resource-based policy doesn't
+> grant [both], users get a 403 Forbidden error code.
+
+`aws-cdk-lib` 2.265.0's `FunctionUrlOrigin.withOriginAccessControl()` grants exactly one of
+them. The same library adds *both* for `authType: NONE` a few files away, so it knows the
+requirement; the OAC path simply does not do it. The function URL here was created after the
+cutoff, so it needs the second grant, and `site-stack.ts` now adds it explicitly.
+
+**The part worth keeping is how the first fix was "verified".** A SigV4 probe against the
+function URL, signed correctly, returned the handler's 400 — an apparently perfect end-to-end
+proof. It was signed with `AdministratorAccess` credentials. When a caller in the same account
+has the actions in its *identity* policy, the resource policy is never consulted, so that probe
+could not have detected a missing resource-policy action however many times it was run. It
+proved authentication and was silent about authorization, while looking like proof of both.
+
+**The rule: a probe that authenticates differently from production proves nothing about
+production's authorization. Test as the principal that will actually call — or admit the test
+covers only the half that principal shares with you.**
+
 ---
 
 ## Known limits

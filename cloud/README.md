@@ -46,6 +46,14 @@ refuses the request **403 before invoking it**, leaving nothing in the handler's
 gate adds the header (`includeBody: true` on that behaviour only); nothing a client sends is
 required. See `signPayload()` in `cloud/lambda/auth-edge/index.js` and FINDINGS 27.
 
+**And CloudFront needs two invoke permissions, not one.** Since October 2025 a function URL
+requires `lambda:InvokeFunction` as well as `lambda:InvokeFunctionUrl`; CDK's
+`withOriginAccessControl()` grants only the second, so `site-stack.ts` adds the first itself,
+scoped to this distribution by `AWS:SourceArn`. Miss it and a correctly *signed* request is
+correctly *refused* — same 403, same empty log, and the only tell is that the body links to
+`urls-auth.html` instead of complaining about a signature. Both grants are on the *function*;
+neither is on the URL, which is why `aws lambda get-policy` is where to look.
+
 **`/view` and `/p/{uid}` are objects with no file extension**, because the URL is the
 contract. `BucketDeployment` derives `Content-Type` from the extension, so they are deployed
 by a *second* deployment that declares `text/html` explicitly — see `site-stack.ts`. Get
