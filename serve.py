@@ -262,7 +262,7 @@ class Viewer:
         first, last = s.extent()
         spans = s.spans()
         manifest = s.manifest
-        device = dict(manifest.get("device") or {})
+        device = dict(s.device())
         if not self.cfg["web_show_identity"]:
             # A manifest records model, serial and the address polled, which
             # identifies an installation. The page is on the LAN; the serial is not

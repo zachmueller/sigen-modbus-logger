@@ -283,7 +283,7 @@ def build_meta(s, capture_tz_now=None):
     """
     first, last = extent(s)
     manifest = s.manifest
-    device = dict(manifest.get("device") or {})
+    device = dict(s.device())
     kept = {"model": device.get("model") or "unknown"}
     if not device.get("model"):
         kept["why"] = ("this manifest was written while the device was not answering: "

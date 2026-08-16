@@ -18,6 +18,7 @@
  */
 import * as cdk from 'aws-cdk-lib';
 import { load } from '../lib/config';
+import { DataStack } from '../lib/data-stack';
 
 const cfg = load();
 const app = new cdk.App();
@@ -29,7 +30,8 @@ const commonProps: cdk.StackProps = {
 	tags: { Project: 'sigen-telemetry', ManagedBy: 'cdk' },
 };
 
-// Stacks land here as each phase is built. Referenced so the file is not "unused
-// imports and a config read" while that is in progress.
-void commonProps;
-void app;
+new DataStack(app, 'SigenData', {
+	...commonProps,
+	cfg,
+	description: 'Telemetry bucket, ingest Lambda and the capture host credential',
+});

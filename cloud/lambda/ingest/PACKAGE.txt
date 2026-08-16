@@ -1,0 +1,24 @@
+# What goes in the ingest Lambda package, one path per line, relative to the repository
+# root. Blank lines and #-comments ignored.
+#
+# This is the single source of truth: cloud/infrastructure/lib/data-stack.ts reads it to
+# bundle the asset, and tests/test_web.py recomputes the transitive local-import closure
+# of handler.py and asserts this list matches exactly. So adding an import to serve.py
+# that reaches a new module fails a test, rather than failing at runtime in the Lambda
+# with "No module named 'config'" -- which is how this file came to exist.
+#
+# log.py is deliberately ABSENT, and that is the interesting omission: it is the only
+# module that constructs lib.Modbus. The ingest path is read-only by construction because
+# the code that could write to an inverter is not in the package at all.
+
+config.py
+decode.py
+dump.py
+ingest.py
+lib.py
+series.py
+serve.py
+tiles.py
+
+# Located relative to __file__ by dump.load_regmap(), so it has to travel with them.
+regmap.json

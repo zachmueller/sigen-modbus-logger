@@ -153,10 +153,16 @@ class Series:
     directory are two Series and are never merged.
     """
 
-    def __init__(self, data_dir, plan_hash, manifest_path, paths):
+    def __init__(self, data_dir, plan_hash, manifest_path, paths, manifest_paths=None):
         self.data_dir = data_dir
         self.plan_hash = plan_hash
         self.manifest_path = manifest_path
+        # Every manifest written for this plan, oldest first. They all describe the same
+        # block plan -- that is what the hash covers -- so any of them decodes. They do
+        # NOT all carry the same identity: the logger reads model and serial once at
+        # startup, so a manifest written while the device happened not to answer records
+        # the error instead. See device().
+        self.manifest_paths = list(manifest_paths or [manifest_path])
         self.paths = paths
         self._manifest = None
         self._spans = None
@@ -180,6 +186,35 @@ class Series:
     @property
     def fast_period_s(self):
         return self.manifest.get("fast_period_s") or 1
+
+    def device(self):
+        """The best identity any manifest for this plan carries.
+
+        The logger reads model, serial and firmware ONCE, at startup. A restart while the
+        inverter is not answering therefore writes a manifest whose device block is just
+        an error -- and since the newest manifest is the one used for decoding, that error
+        became the answer to "what hardware is this?" even when an earlier manifest for the
+        same plan has the real thing.
+
+        The observed case: the archive's first day recorded "SigenStor EC 10.0 SP AU", the
+        two after it recorded "[Errno 64] Host is down". Reporting the latter reads as "the
+        device is down", which is a statement about NOW, from a file written days ago and
+        describing a moment that has passed.
+
+        So prefer any manifest that actually resolved a model, oldest first -- identity
+        does not change over a plan's life, and the first successful read is as true as the
+        last. Falls back to the newest manifest's block, error and all, when none did.
+        """
+        newest = self.manifest.get("device") or {}
+        for path in self.manifest_paths:
+            try:
+                with open(path) as fh:
+                    dev = (json.load(fh).get("device") or {})
+            except (OSError, ValueError):
+                continue
+            if dev.get("model"):
+                return dev
+        return newest
 
     def slow_block_indices(self):
         """Blocks that fire less often than the fast tier.
@@ -258,18 +293,21 @@ def discover(data_dir):
         full = os.path.join(data_dir, name)
         m = MANIFEST_RE.search(name)
         if m:
-            # Any manifest for a hash describes the same plan -- that is what the
-            # hash covers -- so the newest is as good as the first.
-            manifests[m.group(1)] = full
+            # For DECODING, any manifest for a hash is as good as any other -- that is
+            # what the hash covers -- so the newest is used. All of them are kept because
+            # identity is the exception: see Series.device().
+            manifests.setdefault(m.group(1), []).append(full)
             continue
         m = decode.HASH_RE.search(name)
         if m and (name.endswith(".bin") or name.endswith(".bin.gz")):
             paths.setdefault(m.group(1), []).append(full)
     out = {}
     for plan_hash, group in paths.items():
-        if plan_hash not in manifests:
+        found = manifests.get(plan_hash)
+        if not found:
             continue                   # no manifest, no format of record, no decode
-        out[plan_hash] = Series(data_dir, plan_hash, manifests[plan_hash], group)
+        out[plan_hash] = Series(data_dir, plan_hash, found[-1], group,
+                                manifest_paths=found)
     return out
 
 

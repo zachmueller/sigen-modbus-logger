@@ -207,6 +207,46 @@ class TestIndex(ViewerFixture):
         # newest_series picks the one holding the newest record, and only that one.
         self.assertEqual(self.series_of().plan_hash, "deadbeef")
 
+    def test_identity_survives_a_manifest_written_during_an_outage(self):
+        # The logger reads model and serial ONCE, at startup, so a restart while the
+        # inverter is not answering writes a manifest whose device block is just an error.
+        # The newest manifest is the one used for decoding, so that error became the
+        # answer to "what hardware is this?" -- reading as "the device is down", which is
+        # a claim about NOW made from a file written days ago.
+        #
+        # Observed in the real archive: day one recorded the model, the two days after it
+        # recorded "[Errno 64] Host is down".
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4),
+                           manifest_day="20260814")
+        good = os.path.join(self.tmp, "sigen-20260814-08c047b8.manifest.json")
+        with open(good) as fh:
+            man = json.load(fh)
+        self.assertTrue(man["device"].get("model"), "fixture manifest has no model")
+        blind = dict(man, device={"error": "[Errno 64] Host is down"})
+        for day in ("20260815", "20260816"):
+            with open(os.path.join(self.tmp,
+                                   f"sigen-{day}-08c047b8.manifest.json"), "w") as fh:
+                json.dump(blind, fh)
+
+        s = self.series_of()
+        self.assertEqual(s.manifest["device"], blind["device"],
+                         "decoding still uses the newest manifest")
+        self.assertEqual(s.device()["model"], man["device"]["model"],
+                         "identity must come from whichever manifest actually has it")
+
+    def test_identity_reports_the_failure_when_no_manifest_ever_read_it(self):
+        # Falling back is not the same as inventing: if the model was never read, the
+        # error is the honest answer.
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4))
+        path = os.path.join(self.tmp, "sigen-20260814-08c047b8.manifest.json")
+        with open(path) as fh:
+            man = json.load(fh)
+        with open(path, "w") as fh:
+            json.dump(dict(man, device={"error": "no identity"}), fh)
+        self.assertEqual(self.series_of().device(), {"error": "no identity"})
+
     def test_files_without_a_manifest_for_their_plan_are_not_offered(self):
         t0 = 1786600000.0
         self.write_records("20260814T090000", self.data_records(t0, 3))
@@ -691,6 +731,73 @@ class TestTiles(ViewerFixture):
             self.assertEqual(86400 % b, 0, f"{b}s does not divide a UTC day")
             if tiles.granularity_for(b) == tiles.HOUR:
                 self.assertEqual(3600 % b, 0, f"{b}s does not divide a UTC hour")
+
+
+# ------------------------------------------------------- the Lambda package
+
+class TestIngestPackage(unittest.TestCase):
+    """What ships to the ingest Lambda, derived rather than trusted.
+
+    This exists because the hand-written list was wrong: it omitted config.py, which
+    serve.py imports, and the only symptom was `No module named 'config'` in a CloudWatch
+    log after a successful deploy. A packaging mistake should fail here, in a second,
+    rather than in a cloud log minutes later.
+    """
+
+    PACKAGE = os.path.join(HERE, "cloud", "lambda", "ingest", "PACKAGE.txt")
+    HANDLER = os.path.join(HERE, "cloud", "lambda", "ingest", "handler.py")
+
+    def listed(self):
+        with open(self.PACKAGE) as fh:
+            lines = [x.strip() for x in fh]
+        return [x for x in lines if x and not x.startswith("#")]
+
+    def local_modules(self):
+        return {f[:-3] for f in os.listdir(HERE) if f.endswith(".py")}
+
+    def imports_of(self, path):
+        with open(path) as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        local, out = self.local_modules(), set()
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):
+                out |= {a.name.split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                out.add(n.module.split(".")[0])
+        return out & local
+
+    def closure(self):
+        """Every repository module handler.py reaches, transitively."""
+        seen, stack = set(), [self.HANDLER]
+        while stack:
+            for dep in self.imports_of(stack.pop()):
+                if dep not in seen:
+                    seen.add(dep)
+                    stack.append(os.path.join(HERE, dep + ".py"))
+        return seen
+
+    def test_the_package_list_is_exactly_the_import_closure(self):
+        listed = {x for x in self.listed() if x.endswith(".py")}
+        self.assertEqual(listed, {m + ".py" for m in self.closure()},
+                         "PACKAGE.txt has drifted from what handler.py actually imports")
+
+    def test_the_register_map_travels_with_the_modules(self):
+        # dump.load_regmap() locates it relative to __file__, so a package without it
+        # imports cleanly and then fails on the first decode.
+        self.assertIn("regmap.json", self.listed())
+
+    def test_the_module_that_can_talk_to_the_inverter_is_not_in_the_package(self):
+        # log.py is the only module that constructs lib.Modbus. The ingest path is
+        # read-only by construction because that code is not shipped at all -- a stronger
+        # statement than "it is never called".
+        self.assertNotIn("log.py", self.listed())
+        with open(os.path.join(HERE, "log.py")) as fh:
+            self.assertIn("Modbus(", fh.read(), "log.py no longer opens the connection; "
+                                                "this test is pinning the wrong module")
+
+    def test_every_packaged_file_exists(self):
+        for rel in self.listed():
+            self.assertTrue(os.path.exists(os.path.join(HERE, rel)), rel)
 
 
 # --------------------------------------------------------------------- ingest
