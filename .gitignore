@@ -29,3 +29,6 @@ cloud/**/*.template.json
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# The Google OAuth client secret, for `cdk deploy --parameters`. Never committed.
+cloud/.google-secret

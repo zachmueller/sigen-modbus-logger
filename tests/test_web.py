@@ -44,6 +44,7 @@ import log             # noqa: E402
 import series          # noqa: E402
 import ingest          # noqa: E402
 import serve           # noqa: E402
+import sync            # noqa: E402
 import tiles           # noqa: E402
 from test_offline import ArchiveFixture, base_cfg   # noqa: E402
 
@@ -172,6 +173,62 @@ class TestViewerIsReadOnly(unittest.TestCase):
                 src = fh.read()
             for fc in ("5", "6", "15", "16"):
                 self.assertNotIn(f"fc={fc}", src)
+
+
+class TestDependenciesStayContained(unittest.TestCase):
+    """boto3 is the one dependency, and it lives in exactly one module.
+
+    The repository's headline claim is stdlib-only with nothing to install. sync.py breaks
+    that deliberately -- signing S3 requests by hand is not a thing to hand-roll -- but the
+    breach has to stay contained, or the capture host stops being able to capture without a
+    pip install and the Pi Zero migration gets harder for no reason.
+    """
+
+    # Everything that must run on a bare Python: capture, decode, and the local viewer.
+    STDLIB_ONLY = ("config.py", "lib.py", "log.py", "decode.py", "dump.py", "series.py",
+                   "serve.py", "tiles.py", "ingest.py", "regmap_gen.py")
+
+    def tree_of(self, name):
+        with open(os.path.join(HERE, name)) as fh:
+            return ast.parse(fh.read(), filename=name)
+
+    def imported_by(self, name, top_level_only=False):
+        """Modules imported by `name`. `top_level_only` ignores imports inside functions,
+        which is the distinction between a hard dependency and a lazy one."""
+        tree = self.tree_of(name)
+        nodes = tree.body if top_level_only else list(ast.walk(tree))
+        out = set()
+        for n in nodes:
+            if isinstance(n, ast.Import):
+                out |= {a.name.split(".")[0] for a in n.names}
+            elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                out.add(n.module.split(".")[0])
+        return out
+
+    def test_only_sync_py_imports_boto3(self):
+        for name in self.STDLIB_ONLY:
+            self.assertNotIn("boto3", self.imported_by(name),
+                             f"{name} must run on a bare Python; boto3 belongs in sync.py")
+
+    def test_sync_imports_boto3_lazily(self):
+        # At module scope it would break `sync.py --status` and `--dry-run` on a machine
+        # that has never installed it, and would pull boto3 into any process that imports
+        # this module for its ledger logic.
+        self.assertIn("boto3", self.imported_by("sync.py"),
+                      "sync.py does need boto3 somewhere")
+        self.assertNotIn("boto3", self.imported_by("sync.py", top_level_only=True),
+                         "boto3 must be imported inside the function that needs it")
+
+    def test_sync_never_constructs_a_modbus_client(self):
+        # Parsed with ast, not grepped: sync.py's own docstring says it never constructs
+        # one, and a substring search cannot tell the promise from the breach. Same reason
+        # TestViewerIsReadOnly does it this way.
+        tree = self.tree_of("sync.py")
+        used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        used |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        self.assertNotIn("Modbus", used)
+        self.assertNotIn("lib", self.imported_by("sync.py"),
+                         "the uploader has no business with the transport")
 
 
 # ---------------------------------------------------------------------- index
@@ -731,6 +788,89 @@ class TestTiles(ViewerFixture):
             self.assertEqual(86400 % b, 0, f"{b}s does not divide a UTC day")
             if tiles.granularity_for(b) == tiles.HOUR:
                 self.assertEqual(3600 % b, 0, f"{b}s does not divide a UTC hour")
+
+
+# ----------------------------------------------------------------- uploading
+
+class TestSync(ViewerFixture):
+    """The offsite uploader's bookkeeping. No network: boto3 is never reached.
+
+    What can go wrong here is quiet in a specific way -- a file that is never uploaded, or
+    one uploaded to a key nothing can decode -- and the symptom appears weeks later as a
+    hole in the hosted archive.
+    """
+
+    def ledger(self):
+        return sync.Ledger(os.path.join(self.tmp, sync.LEDGER))
+
+    def test_the_open_bin_is_never_uploaded(self):
+        # It grows every couple of seconds. Uploading it would mean re-uploading a partial
+        # file forever; log.py gzips it on rotation and the .gz is what travels.
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4))            # .bin
+        self.write_records("20260814T100000", self.data_records(t0 + 3600, 4),
+                           gzip_it=True)                                          # .bin.gz
+        names = {n for n, _, _ in sync.pending(self.tmp, self.ledger())}
+        self.assertTrue(any(n.endswith(".bin.gz") for n in names))
+        self.assertFalse(any(n.endswith(".bin") and not n.endswith(".bin.gz")
+                             for n in names), "the open file must not be uploaded")
+        self.assertTrue(any(n.endswith(".manifest.json") for n in names),
+                        "without a manifest nothing downstream can decode the records")
+
+    def test_the_ledger_stops_a_file_being_uploaded_twice(self):
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4), gzip_it=True)
+        led = self.ledger()
+        todo = sync.pending(self.tmp, led)
+        self.assertTrue(todo)
+        for name, sz, mtime in todo:
+            led.record(name, sz, mtime)
+        led.save()
+        self.assertEqual(sync.pending(self.tmp, self.ledger()), [],
+                         "a recorded file must not come back as pending")
+
+    def test_a_rewritten_manifest_is_uploaded_again(self):
+        # log.py re-emits the manifest when the date rolls over. Keyed on size and mtime,
+        # so a rewrite is noticed without hashing the whole archive every run.
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4), gzip_it=True)
+        led = self.ledger()
+        for name, sz, mtime in sync.pending(self.tmp, led):
+            led.record(name, sz, mtime)
+        led.save()
+        man = os.path.join(self.tmp, "sigen-20260814-08c047b8.manifest.json")
+        with open(man) as fh:
+            d = json.load(fh)
+        time.sleep(1.1)                          # mtime resolution
+        with open(man, "w") as fh:
+            json.dump(dict(d, started_at="later"), fh)
+        names = {n for n, _, _ in sync.pending(self.tmp, self.ledger())}
+        self.assertIn(os.path.basename(man), names)
+
+    def test_a_corrupt_ledger_re_uploads_rather_than_crashing(self):
+        # Losing the ledger is harmless -- uploading is idempotent -- and crashing on it
+        # would stop the archive going offsite over a cache file.
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4), gzip_it=True)
+        with open(os.path.join(self.tmp, sync.LEDGER), "w") as fh:
+            fh.write("{not json")
+        self.assertTrue(sync.pending(self.tmp, self.ledger()))
+
+    def test_the_key_carries_the_plan_hash(self):
+        # The ingest Lambda finds the plan from the key, and decode.check_plan_hash treats
+        # a missing hash as a mismatch. A file without one is skipped and reported, never
+        # filed under a guess.
+        self.assertEqual(sync.plan_of("sigen-20260814T090000-08c047b8.bin.gz"), "08c047b8")
+        self.assertEqual(sync.plan_of("sigen-20260814-08c047b8.manifest.json"), "08c047b8")
+        self.assertIsNone(sync.plan_of("sigen-20260814T074107.bin"))
+        self.assertIsNone(sync.plan_of("sigen-20260814.manifest.json"))
+
+    def test_the_ledger_write_is_atomic(self):
+        # A kill mid-write must not leave a truncated ledger, which would re-upload the
+        # whole archive on the next run.
+        with open(os.path.join(HERE, "sync.py")) as fh:
+            src = fh.read()
+        self.assertIn("os.replace(tmp, self.path)", src)
 
 
 # ------------------------------------------------------- the Lambda package

@@ -1,8 +1,14 @@
 # Sigenergy SigenStor local telemetry
 
 Read-only Modbus TCP capture and decode for a Sigenergy SigenStor, over your own
-LAN. No cloud, no account, no vendor API. Stdlib-only Python 3.9+ — no
-dependencies, nothing to `pip install`.
+LAN. No vendor API, no vendor account. **Capture, decode and the local viewer are
+stdlib-only Python 3.9+ with nothing to `pip install`** — a test asserts it, so the
+part that has to keep running on a bare Python cannot quietly grow a dependency.
+
+Two optional additions do not hold to that, and are off by default: `sync.py`, which
+copies rotated archive files to your own S3 bucket and needs `boto3`; and `cloud/`,
+which deploys a hosted viewer and needs Node at deploy time only. Neither runs unless
+you configure it, and neither is needed to capture, decode or view locally.
 
 **Nothing here writes to the inverter.** Holding registers are read with function
 code 3 — which is a read — and no write function code is ever issued. Registers
@@ -145,6 +151,12 @@ then `~/.config/sigen/config.json`.
 | `web_launchd_label` | `local.sigen-viewer` | Viewer daemon label. Must differ from `launchd_label`. |
 | `web_default_hours` | `6` | Default lookback when the page opens. |
 | `web_show_identity` | `false` | Let the viewer's API report serial, firmware and the inverter's address. |
+| `s3_bucket` | — | Bucket for the offsite copy. Unset means no uploading. |
+| `s3_region` | `us-east-1` | Bucket region. |
+| `s3_prefix` | `raw/` | Key prefix. Must end with `/`. |
+| `aws_profile` | — | Named `~/.aws` profile. Credentials never live in `config.json`. |
+| `sync_enabled` | `false` | Master switch for `sync.py`. Off until you mean it. |
+| `sync_launchd_label` | `local.sigen-sync` | Uploader daemon label. Must differ from the other two. |
 
 `keep_days` is retention, and it is narrower than it looks: on **rotation** only,
 any `*.bin.gz` older than N days is deleted. It never touches the open `.bin`,
@@ -174,6 +186,10 @@ python3 config.py --render deploy/launchd.plist.template
 | `decode.py` | Offline decode of the raw archive into CSV/JSONL/derived series. |
 | `dump.py` | One-shot full-map decode: what every documented register returns on this unit. |
 | `serve.py` | The local web viewer: an HTTP server that plots the archive. Never opens a Modbus connection. |
+| `sync.py` | Copies rotated archive files to S3. The one module that needs `boto3`, imported lazily inside it. Off unless `sync_enabled`. |
+| `tiles.py` | The wire format both read paths produce, so the local viewer and the hosted one cannot disagree. Not a CLI. |
+| `ingest.py` | An archive directory to a directory of precomputed tiles. Knows nothing about S3, which is what makes it testable. Not a CLI. |
+| `cloud/` | The hosted viewer: CDK stacks, the ingest Lambda, and the backfill. Deploy-time only; see [cloud/README.md](cloud/README.md). |
 | `series.py` | Archive index, bucket aggregation and health scan behind the viewer. Not a CLI. |
 | `web/` | The viewer's page: one HTML file, one stylesheet, two scripts. No framework, no CDN. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
@@ -184,6 +200,8 @@ python3 config.py --render deploy/launchd.plist.template
 | `deploy/install-launcher.sh` | Run on a viewing **Mac**: generates a Spotlight-launchable `.app` that opens the tunnel and the page in one keystroke. |
 | `deploy/install-daemon.sh`, `uninstall-daemon.sh` | LaunchDaemon install/removal for the logger. Needs sudo. |
 | `deploy/install-viewer.sh`, `uninstall-viewer.sh` | The same for the viewer. Separate daemon, so restarting it cannot interrupt capture. |
+| `deploy/install-sync.sh`, `uninstall-sync.sh` | The same for the uploader. A third daemon, for the same reason. Checks boto3 and the credential *as the user the daemon will run as*. |
+| `deploy/sync.plist.template` | The uploader's LaunchDaemon. `StartInterval`, not `KeepAlive`: it is a job that finishes. |
 | `deploy/launchd.plist.template` | LaunchDaemon definition, rendered from config at install time. |
 | `deploy/viewer.plist.template` | The viewer's LaunchDaemon definition. `ProcessType: Background`, so the logger wins any contention. |
 | `deploy/launchagent.plist.template` | LaunchAgent alternative, for a host that *does* auto-login. |

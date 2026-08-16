@@ -34,5 +34,13 @@
  "gap_log_quiet_s": 60,
  "bucket_s": 300,
 
- "manifest_identity": true
+ "manifest_identity": true,
+
+ "__offsite": "sync.py, the offsite copy. The one part that needs a dependency (boto3) and a network credential, and it is OFF by default -- an archive is nobody's business until its owner says so. Credentials come from a named ~/.aws profile, NEVER from this file. The uploader sends rotated .bin.gz and manifests only, never the open .bin, so the current hour reaches S3 on the next rotation.",
+ "s3_bucket": null,
+ "s3_region": "us-east-1",
+ "s3_prefix": "raw/",
+ "aws_profile": null,
+ "sync_enabled": false,
+ "sync_launchd_label": "local.sigen-sync"
 }

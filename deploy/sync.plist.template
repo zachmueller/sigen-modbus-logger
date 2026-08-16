@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The offsite uploader, rendered by deploy/install-sync.sh via `config.py --render`.
+     Do not install this file directly: the placeholders are filled from config.json.
+
+     A third daemon, separate from both the logger and the viewer, for the same reason
+     they are separate from each other: restarting it must not be able to interrupt
+     capture. It reads rotated files and writes only its own ledger, so it is not a
+     second client of the inverter and cannot be.
+
+     StartInterval rather than KeepAlive: this is a job that finishes. It scans for
+     pending files, uploads them and exits, so launchd should run it periodically rather
+     than restart it forever. Five minutes is far more often than the hourly rotation it
+     is waiting for -- the point of the short interval is not freshness but recovery: an
+     upload that failed while the network was down is retried soon after it returns,
+     without waiting for the next rotation. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@SYNC_LABEL@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PYTHON@</string>
+		<!-- -u so a stall is visible in the log while it is happening -->
+		<string>-u</string>
+		<string>@INSTALL_DIR@/sync.py</string>
+		<string>--once</string>
+		<string>--data-dir</string>
+		<string>@DATA_DIR@</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>@INSTALL_DIR@</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<!-- Run as a normal user, not root. It needs a ~/.aws profile, which is the
+	     invoking user's, and it needs no privilege beyond reading the archive. -->
+	<key>UserName</key>
+	<string>@USER@</string>
+	<!-- Background, NOT Interactive: the logger is the latency-sensitive process on this
+	     host and must win any contention -- including for the network. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>@LOG_DIR@/sync.log</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG_DIR@/sync.err</string>
+</dict>
+</plist>

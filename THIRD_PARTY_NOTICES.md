@@ -1,6 +1,17 @@
 # Third-party notices
 
-This project has no runtime dependencies — it is Python standard library only.
+The capture, decode and local-viewer path has no runtime dependencies — it is Python
+standard library only, and `tests/` asserts that. Two optional parts do have them:
+
+  - `sync.py`, the offsite uploader, imports **boto3** (Apache 2.0). Imported lazily
+    inside the one function that needs it, so nothing else pulls it in, and off unless
+    `sync_enabled` is set.
+  - `cloud/infrastructure/`, the deploy toolchain, uses **aws-cdk-lib** (Apache 2.0)
+    and Node. Deploy-time only; it never runs on the capture host.
+
+Both are ordinary AWS SDKs under Apache 2.0, installed from their own registries rather
+than vendored here, so their notices travel with those installs.
+
 One *data* file is derived from third-party source, and its licence travels with it.
 
 ## `regmap.json`

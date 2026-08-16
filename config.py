@@ -74,8 +74,19 @@ DEFAULTS = {
     "web_port": 8787,
     "web_bind": "0.0.0.0",     # "127.0.0.1" to require an SSH tunnel
     "web_launchd_label": "local.sigen-viewer",
+    "sync_launchd_label": "local.sigen-sync",
     "web_default_hours": 6,
     "web_show_identity": False,
+
+    # --- offsite copy (sync.py) -------------------------------------------
+    # The one part of this toolchain that needs a dependency (boto3) and a network
+    # credential. Off by default: an archive is nobody's business until its owner
+    # says so. Credentials come from a named ~/.aws profile, never from here.
+    "s3_bucket": None,
+    "s3_region": "us-east-1",
+    "s3_prefix": "raw/",
+    "aws_profile": None,
+    "sync_enabled": False,
 
     # --- privacy ----------------------------------------------------------
     # Manifests carry model/serial/firmware so an archive can be traced to the
@@ -88,13 +99,14 @@ INT_KEYS = ("port", "plant_unit", "inverter_unit", "fast_period_s",
             "recycle_s", "max_lag_s", "gap_log_quiet_s", "bucket_s",
             "web_port", "web_default_hours")
 FLOAT_KEYS = ("timeout_s",)
-BOOL_KEYS = ("manifest_identity", "web_show_identity")
+BOOL_KEYS = ("manifest_identity", "web_show_identity", "sync_enabled")
 PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 
 # Keys exported to sh by --sh, as SIGEN_<UPPER>.
 SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
            "launchd_label", "run_as_user", "fast_period_s",
-           "web_port", "web_bind", "web_launchd_label")
+           "web_port", "web_bind", "web_launchd_label",
+           "sync_launchd_label", "s3_bucket", "s3_prefix", "aws_profile")
 
 
 class ConfigError(SystemExit):
@@ -202,6 +214,12 @@ def load(require_host=True, overrides=None):
                           "use something above 1024 so the viewer needs no root")
     if cfg["web_default_hours"] < 1:
         raise ConfigError("web_default_hours must be >= 1")
+    if cfg["s3_prefix"] and not cfg["s3_prefix"].endswith("/"):
+        # Otherwise every key would be "rawplan=..." -- a silently wrong prefix rather
+        # than an error, and the ingest Lambda would never see the files.
+        raise ConfigError(f"s3_prefix {cfg['s3_prefix']!r} must end with '/'")
+    if cfg["sync_enabled"] and not cfg["s3_bucket"]:
+        raise ConfigError("sync_enabled is true but no s3_bucket is set")
     return cfg
 
 
@@ -229,6 +247,7 @@ def render(cfg, template):
     subs = {
         "@LABEL@": cfg["launchd_label"],
         "@WEB_LABEL@": cfg["web_launchd_label"],
+        "@SYNC_LABEL@": cfg["sync_launchd_label"],
         "@PYTHON@": cfg["python"],
         "@INSTALL_DIR@": cfg["install_dir"],
         "@DATA_DIR@": cfg["data_dir"],
