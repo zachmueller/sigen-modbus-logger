@@ -106,7 +106,13 @@ PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
            "launchd_label", "run_as_user", "fast_period_s",
            "web_port", "web_bind", "web_launchd_label",
-           "sync_launchd_label", "s3_bucket", "s3_prefix", "aws_profile")
+           "sync_launchd_label", "s3_bucket", "s3_prefix", "aws_profile",
+           # Exported so deploy/install-sync.sh can refuse to install a daemon that will
+           # only ever decline to upload: sync.py exits on a false sync_enabled, so an
+           # installer blind to it succeeds and then fails every five minutes into a log
+           # nobody is watching yet. s3_region for symmetry -- a wrong region is a
+           # confusing failure at runtime and a cheap check here.
+           "s3_region", "sync_enabled")
 
 
 class ConfigError(SystemExit):

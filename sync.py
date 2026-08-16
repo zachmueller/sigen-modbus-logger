@@ -65,6 +65,38 @@ def wanted(name):
     return is_record(name) or is_manifest(name)
 
 
+def stranded(names):
+    """Un-rotated `.bin` files that rotation has already moved past, oldest first.
+
+    log.py gzips the open `.bin` when it rotates, and only the `.bin.gz` travels -- see
+    wanted() and the module docstring. Nothing gzips a file afterwards, so a logger killed
+    mid-hour leaves its `.bin` behind and **that hour never reaches S3 by this route**. It
+    is reported rather than uploaded because uploading a file that might still be growing
+    is precisely what this daemon must not do.
+
+    What separates a stranded file from the open one is not its name or its age but the
+    existence of a NEWER `.bin.gz`: that is the proof rotation has happened since, so this
+    file is finished and was simply never compressed. Without that test the current hour
+    would be reported as stranded every five minutes, for the whole hour, every hour.
+
+    Stems compare as strings because the stamp is fixed-width and directly follows
+    `sigen-`, so lexical order is chronological order. That keeps this function free of
+    decode's regexes, and sync.py free of the import -- tests/ asserts that confinement.
+    """
+    gz_stems = {n[:-len(".bin.gz")] for n in names if is_record(n)}
+    if not gz_stems:
+        return []                      # nothing has rotated yet; the only .bin is open
+    newest_gz = max(gz_stems)
+    out = []
+    for name in sorted(names):
+        if not name.endswith(".bin") or is_record(name):
+            continue
+        stem = name[:-len(".bin")]
+        if stem not in gz_stems and stem < newest_gz:
+            out.append(name)
+    return out
+
+
 def plan_of(name):
     """The plan hash in a filename, or None.
 
@@ -204,8 +236,16 @@ def run_once(cfg, data_dir, dry_run=False, verbose=False):
             ledger.save()
         return 0, 0
     total = sum(sz for _, sz, _ in todo)
+    # Mentioned only on a run that has something to do, so an idle daemon stays silent
+    # rather than repeating the same line every five minutes forever. `--status` lists them.
+    try:
+        n_stranded = len(stranded(os.listdir(data_dir)))
+    except OSError:
+        n_stranded = 0
     print(f"  [{time.strftime('%Y-%m-%d %H:%M:%S')}] {len(todo)} pending, "
-          f"{total/1e6:.1f} MB", flush=True)
+          f"{total/1e6:.1f} MB"
+          + (f" ({n_stranded} un-rotated .bin stranded; see --status)"
+             if n_stranded else ""), flush=True)
     if dry_run:
         for name, sz, _ in todo:
             plan = plan_of(name)
@@ -251,6 +291,25 @@ def status(cfg, data_dir):
         print(f"  pending  {sz/1024:9.1f} KB  {name}")
     if len(todo) > 8:
         print(f"  ... and {len(todo) - 8} more")
+
+    # Reported, never counted as pending, and deliberately NOT reflected in the exit
+    # status: a file already carried offsite by cloud/backfill.py is stranded here forever,
+    # so failing on it would pin --status to 1 for good, and a permanently-red signal says
+    # less than silence. What it needs is a human deciding whether the hour is anywhere
+    # else, which is what this text asks for.
+    try:
+        orphans = stranded(os.listdir(data_dir))
+    except OSError:
+        orphans = []
+    if orphans:
+        print(f"stranded   {len(orphans)} un-rotated .bin file(s) rotation has moved past; "
+              f"this daemon never uploads a .bin.")
+        print(f"           Check they reached S3 another way (cloud/backfill.py) -- "
+              f"otherwise those hours are on one disk.")
+        for name in orphans[:8]:
+            print(f"  stranded {name}")
+        if len(orphans) > 8:
+            print(f"  ... and {len(orphans) - 8} more")
     return 0 if not todo else 1
 
 

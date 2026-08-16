@@ -530,6 +530,25 @@ class TestConfig(unittest.TestCase):
         self.assertIn("SIGEN_HOST=h", out)
         self.assertIn("'/opt/sigen with space'", out)   # quoted, so eval is safe
 
+    def test_sh_exports_the_keys_install_sync_refuses_to_install_without(self):
+        # deploy/install-sync.sh can only refuse what --sh tells it, and it used to be
+        # blind to sync_enabled: the install then SUCCEEDED and the daemon declined to
+        # upload every five minutes into a log nobody was watching. sync_enabled reaches sh
+        # as the literal "True", because emit_sh prints booleans through str() -- so the
+        # export and the installer's comparison have to move together or the guard is
+        # silently unenforceable. Asserting both halves here is what keeps them together.
+        self.write({"host": "h", "s3_bucket": "b", "sync_enabled": True})
+        out = ArchiveFixture.capture_stdout(config.emit_sh, config.load())
+        self.assertIn("SIGEN_SYNC_ENABLED=True", out,
+                      "install-sync.sh cannot check a key --sh does not export")
+        self.assertIn("SIGEN_S3_REGION=", out,
+                      "a wrong region is a confusing runtime failure and a cheap check")
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "deploy", "install-sync.sh")) as fh:
+            sh = fh.read()
+        self.assertIn('"$SIGEN_SYNC_ENABLED" = "True"', sh,
+                      "the installer must compare against the literal emit_sh prints")
+
     def test_render_substitutes_every_token(self):
         self.write({"host": "h", "install_dir": "/opt/sigen",
                     "run_as_user": "someone"})

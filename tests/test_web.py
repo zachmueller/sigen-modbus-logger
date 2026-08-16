@@ -874,6 +874,44 @@ class TestSync(ViewerFixture):
         self.assertTrue(any(n.endswith(".manifest.json") for n in names),
                         "without a manifest nothing downstream can decode the records")
 
+    def test_an_un_rotated_bin_is_reported_rather_than_silently_dropped(self):
+        # A logger killed mid-hour leaves its .bin un-gzipped, and nothing gzips it later,
+        # so that hour never reaches S3 by this route. wanted() is right to skip it -- the
+        # open file is still growing -- but skipping it in silence is how an hour goes
+        # missing for weeks. What proves a .bin is finished is a NEWER .bin.gz beside it.
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4))            # died
+        self.write_records("20260814T100000", self.data_records(t0 + 3600, 4),
+                           gzip_it=True)                                          # rotated
+        self.write_records("20260814T110000", self.data_records(t0 + 7200, 4))     # open
+        self.assertEqual(sync.stranded(os.listdir(self.tmp)),
+                         ["sigen-20260814T090000-08c047b8.bin"],
+                         "only a .bin a later rotation has moved past is stranded")
+        # Reporting it must not turn into uploading it: it is skipped for a reason.
+        pend = {n for n, _, _ in sync.pending(self.tmp, self.ledger())}
+        self.assertNotIn("sigen-20260814T090000-08c047b8.bin", pend)
+
+    def test_the_open_bin_is_not_reported_as_stranded(self):
+        # Otherwise the current hour is reported every five minutes, for the whole hour,
+        # every hour -- and a warning that is always on is a warning nobody reads.
+        t0 = 1786600000.0
+        self.write_records("20260814T090000", self.data_records(t0, 4), gzip_it=True)
+        self.write_records("20260814T100000", self.data_records(t0 + 3600, 4))
+        self.assertEqual(sync.stranded(os.listdir(self.tmp)), [])
+        # Nor before anything has rotated at all, when the only .bin there is is the open one.
+        self.assertEqual(sync.stranded(["sigen-20260814T090000-08c047b8.bin"]), [])
+
+    def test_a_bin_beside_its_own_gz_is_not_stranded(self):
+        # The observed case: cloud/backfill.py uploaded the then-open .bin, and rotation
+        # later produced the .bin.gz for the same stem. The .gz supersedes it, so calling
+        # the .bin stranded would send somebody hunting for an hour that is already offsite.
+        t0 = 1786600000.0
+        recs = self.data_records(t0, 4)
+        self.write_records("20260814T090000", recs)
+        self.write_records("20260814T090000", recs, gzip_it=True)
+        self.write_records("20260814T100000", self.data_records(t0 + 3600, 4), gzip_it=True)
+        self.assertEqual(sync.stranded(os.listdir(self.tmp)), [])
+
     def test_the_ledger_stops_a_file_being_uploaded_twice(self):
         t0 = 1786600000.0
         self.write_records("20260814T090000", self.data_records(t0, 4), gzip_it=True)
@@ -1951,6 +1989,28 @@ class TestPageServerContract(HTTPFixture):
                             "min * target_buckets is the TOP of the band -- that was the bug")
         self.assertNotRegex(body, r"\*\s*900\b",
                             "target_buckets comes from meta, not a hardcoded 900")
+
+    def test_the_stall_warning_does_not_blame_the_logger_on_a_tiles_source(self):
+        # Observed live: a share rendered "no record for 4.5 h when shared -- the logger may
+        # have stopped" over an archive whose logger had not missed a tick. What had stopped
+        # was the uploader, which was never installed. On a tiles source `record_ts` is the
+        # newest record that reached the bucket, and sync.py only advances that on rotation,
+        # so the two failures are the SAME symptom and the page cannot tell them apart. It
+        # must therefore name both. serve.py reads the archive directly, so there it may
+        # still name the logger alone. See FINDINGS 29.
+        with open(os.path.join(HERE, "web", "app.js")) as fh:
+            code = "\n".join(re.sub(r"//.*$", "", line) for line in fh.read().split("\n"))
+        fn = re.search(r"function renderFreshness\(\)\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(fn, "web/app.js should render the freshness pill in one function")
+        body = re.sub(r"\s+", " ", fn.group(1))
+        stall = re.search(r"logger_stalled\)\s*\{(.*?)\}\s*else", body)
+        self.assertIsNotNone(stall, "the stalled branch should be findable")
+        self.assertIn("the logger or the uploader may have stopped", stall.group(1),
+                      "a tiles source cannot distinguish a stopped logger from a stopped "
+                      "uploader, so it must not pick one")
+        self.assertIn("SRC.kind === 'server'", stall.group(1),
+                      "the wording must branch on the source, not apply everywhere: "
+                      "serve.py reads the archive itself and there the logger IS the answer")
 
     def test_the_share_card_is_hidden_until_a_source_offers_a_share_endpoint(self):
         # serve.py serves this page with no SIGEN_SOURCE, so SRC.share is undefined and the

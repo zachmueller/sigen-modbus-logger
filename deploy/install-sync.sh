@@ -26,6 +26,12 @@ trap 'rm -f "$TMP"' EXIT
   echo "sync_launchd_label must differ from web_launchd_label ($LABEL)"; exit 1; }
 [ -n "$SIGEN_S3_BUCKET" ] || {
   echo "no s3_bucket in config.json; nothing to upload to"; exit 1; }
+# config.py's emit_sh prints booleans through str(), so true arrives as "True". Checked
+# here because sync.py exits on a false sync_enabled: without this the install succeeds,
+# and the daemon then declines to upload every five minutes into a log nobody is watching.
+[ "$SIGEN_SYNC_ENABLED" = "True" ] || {
+  echo "sync_enabled is not true in config.json; the daemon would install and then refuse"
+  echo "to upload every five minutes. Set it and re-run."; exit 1; }
 
 # Check boto3 and the credential AS THE USER THE DAEMON WILL RUN AS. Checking as root
 # would pass on root's environment and then fail every five minutes as someone else --

@@ -631,10 +631,17 @@ function renderFreshness() {
     cls = 'bad';
     text = 'no data in this archive';
   } else if (l.logger_stalled) {
-    // Only a genuinely absent record means the capture itself stopped.
+    // Only a genuinely absent record means the capture itself stopped -- and on a tiles
+    // source that inference is not available. There, `record_ts` is the newest record that
+    // reached the bucket, which sync.py only ever advances on rotation, so a stopped
+    // uploader and a stopped logger produce the identical symptom. This page said "the
+    // logger may have stopped" over an archive whose logger had never missed a tick and
+    // whose uploader was not installed. Name both, or name neither (FINDINGS 29).
     cls = 'bad';
     text = 'no record for ' + fmtAge(l.record_age_s) + when +
-           ' — the logger may have stopped';
+           (SRC.kind === 'server'
+             ? ' — the logger may have stopped'
+             : ' — the logger or the uploader may have stopped');
   } else if (!l.device_answering) {
     // The logger is fine; the device is not. Keeping these apart is the whole
     // point (FINDINGS 7).
