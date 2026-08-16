@@ -31,12 +31,20 @@ before the script loads. The page here is byte-for-byte the page `serve.py` serv
 |---|---|
 | `/view` | Google sign-in, email allowlist |
 | `/agg/*` (tiles) | same gate — a gate on the HTML alone would leave the data open |
+| `POST /api/share` | same gate, **plus** the payload hash below — it mints public copies |
 | `/p/{uid}`, `/share/*` | **public** — a shared view, copied at share time |
 | `/auth/*` | public; `/auth/callback` is what sets the cookie |
 | everything else | public: `index.html`, `app.js`, `tiles.js`, `charts.js`, `style.css` |
 
 There is no `/login`. The gate redirects straight to the Cognito Hosted UI, so there is
 nothing for such a path to do.
+
+**`POST /api/share` bodies are signed at the edge.** The share endpoint is a Lambda function
+URL with `AWS_IAM` auth, reached through Origin Access Control, and a function URL rejects an
+unsigned payload — so a POST body needs its SHA-256 in `x-amz-content-sha256` or Lambda
+refuses the request **403 before invoking it**, leaving nothing in the handler's log. The read
+gate adds the header (`includeBody: true` on that behaviour only); nothing a client sends is
+required. See `signPayload()` in `cloud/lambda/auth-edge/index.js` and FINDINGS 27.
 
 **`/view` and `/p/{uid}` are objects with no file extension**, because the URL is the
 contract. `BucketDeployment` derives `Content-Type` from the extension, so they are deployed
@@ -196,6 +204,24 @@ An export's value cannot be changed while it is imported, and the old value's re
 gone, so there is nothing to keep alive. Weak references replace `Fn::ImportValue` with
 `Fn::GetStackOutput`, which the CDK CLI resolves at deploy time and inlines — no export, so
 the deadlock cannot recur. **Do not set this back to `strong`.**
+
+**Never add `--exclusively` to either of those two deploys.** The gate's code asset is
+`AssetHashType.OUTPUT` — hashed from the *bundled* output, because `config.js` is generated at
+synth. `--exclusively SigenSite` does not select the edge stack, so the CLI skips bundling that
+asset and hashes the raw source directory instead. The hash it gets is one that was never
+built, and since the version's logical id embeds it, `SigenSite` asks for a stack output that
+does not exist:
+
+```
+TemplateError: Fn::GetStackOutput references output PublishOutputRefAuthEdgeFnCurrentVersion…
+from stack SigenAuthEdge, but this output was not found. The output may have been deleted.
+```
+
+Harmless — the distribution update rolls back and keeps serving the previous edge version —
+but the message points at the wrong stack. `Bundling asset SigenAuthEdge/AuthEdgeFn/Fn/Code`
+appearing in the output is the check that the hash is real. Without `--exclusively` the
+unchanged stacks report `(no changes)` and are skipped anyway, so it buys nothing: notably
+`SigenAuthPool` is *not* redeployed, and its `GoogleClientSecret` parameter is not needed.
 
 ## Cost
 

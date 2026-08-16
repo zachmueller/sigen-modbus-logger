@@ -24,6 +24,12 @@ IAM refuses anyone who is not this distribution. The alternative -- verifying th
 token here as well -- would mean an RS256 verification, and the Python runtime ships no
 crypto library that does it, leaving only a hand-rolled one.
 
+That choice has one cost, and it is paid elsewhere: OAC signs the origin request with SigV4,
+and a function URL rejects an unsigned payload, so a POST body only arrives here if something
+put its SHA-256 in `x-amz-content-sha256` first. The read gate does it -- see signPayload() in
+cloud/lambda/auth-edge/index.js. Without it Lambda refuses the request 403 BEFORE invoking
+this module, so nothing appears in its log at all. See docs/FINDINGS.md 27.
+
 Environment:
   BUCKET        the one bucket
   AGG_PREFIX    default "agg/"     -- read
@@ -34,6 +40,7 @@ Environment:
 import json
 import os
 import time
+import traceback
 import uuid
 
 import boto3
@@ -139,6 +146,19 @@ def _keys_under(prefix):
     return out
 
 
+def _require(key, missing):
+    """`key`, or a BadRequest saying `missing`. Established by LISTING, for the reason above.
+
+    A one-key listing: the key is its own prefix, so this is a single request, and it answers
+    "is it there?" without asking S3 to confirm an absence it will not confirm. Every read
+    whose absence is a real possibility goes through here -- probing with head_object and
+    reporting the 403 as absence is exactly the collapse _keys_under() exists to avoid.
+    """
+    if key not in _keys_under(key):
+        raise BadRequest(missing)
+    return key
+
+
 def _copy_tile(src_key, dst_key):
     """One tile. The caller has already established that `src_key` exists.
 
@@ -223,14 +243,15 @@ def _strings(value, limit=400):
 # ------------------------------------------------------------------ the handler
 
 def create(body):
-    index = _get_json(AGG_PREFIX + "index.json")
+    index = _get_json(AGG_PREFIX + ingest.INDEX)
     plan = body.get("plan") or index.get("current")
     if not plan or not all(c in "0123456789abcdef" for c in str(plan)):
         raise BadRequest("no plan hash to share from")
-    try:
-        meta = _get_json(f"{AGG_PREFIX}plan={plan}/meta.json")
-    except s3.exceptions.ClientError:
-        raise BadRequest(f"no published tiles for plan {plan}")
+    # Listed, then read. Catching ClientError around the read instead reported a REFUSAL as
+    # "no published tiles for plan x" -- a broken policy wearing the costume of an unpublished
+    # plan, which is the same collapse in the other direction.
+    meta = _get_json(_require(f"{AGG_PREFIX}plan={plan}/{ingest.META}",
+                              f"no published tiles for plan {plan}"))
 
     start, end, hours = _resolve_window(body, meta)
     if start >= end:
@@ -242,6 +263,11 @@ def create(body):
     # ingest.py records a span with no data, and copying nothing preserves that gap exactly
     # as the live page drew it.
     present = _keys_under(f"{AGG_PREFIX}plan={plan}/{kind}/b{width}/")
+    # Before anything is written, because a share without it is a page that hard-errors on a
+    # fetch it makes unconditionally -- and because head_object on a missing key answers 403,
+    # so the copy below would have surfaced as an unhandled ClientError rather than a reason.
+    latest = _require(f"{AGG_PREFIX}plan={plan}/{ingest.LATEST}",
+                      f"plan {plan} has no {ingest.LATEST}, which every share page fetches")
     uid = _fresh_uid()
     dest = f"{SHARE_PREFIX}{uid}/"
     copied = 0
@@ -261,9 +287,9 @@ def create(body):
     # claiming the logger has been down for a week.
     #
     # Required, not optional: tiles.js fetches it non-optionally, so a share without it
-    # would surface as a hard error on a page that otherwise works.
-    _copy_tile(f"{AGG_PREFIX}plan={plan}/{ingest.LATEST}",
-               f"{dest}plan={plan}/{ingest.LATEST}")
+    # would surface as a hard error on a page that otherwise works. Its presence was
+    # established above, before the first write.
+    _copy_tile(latest, f"{dest}plan={plan}/{ingest.LATEST}")
 
     note = str(body.get("note") or "")[:MAX_NOTE_CHARS].strip()
     share_meta = dict(meta)
@@ -320,6 +346,20 @@ def lambda_handler(event, context):
         return _reply(200, create(body))
     except BadRequest as e:
         return _reply(400, {"ok": False, "error": str(e)})
+    except s3.exceptions.ClientError as e:
+        # Ours, not the caller's -- and it must not escape. An unhandled exception behind a
+        # function URL is a 502 carrying {"message": "Internal Server Error"}, which has no
+        # `error` for the page to read, so it renders as a bare "502 " and says nothing about
+        # where to look. FINDINGS 11 was a 403 on HeadObject that took a traceback to find;
+        # this is what makes the next one legible from the page.
+        err = e.response.get("Error") or {}
+        op = getattr(e, "operation_name", None) or "an S3 call"
+        print(json.dumps({"error": "s3", "operation": op, "code": err.get("Code"),
+                          "message": err.get("Message")}))
+        traceback.print_exc()
+        return _reply(500, {"ok": False,
+                            "error": f"S3 refused {op} ({err.get('Code') or 'no code'}) -- "
+                                     f"the share Lambda's log has the key and the traceback"})
     except (ValueError, KeyError) as e:
         # A malformed body, not a broken service. Say which without echoing it back.
         return _reply(400, {"ok": False, "error": f"could not read the request: {e}"})

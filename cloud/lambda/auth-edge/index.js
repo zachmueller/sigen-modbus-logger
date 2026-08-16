@@ -20,10 +20,16 @@
 // a redirect to sign in again, which would loop them through Google forever without ever
 // explaining why.
 //
+// It has one job beyond the gate, and only on /api/share: signing the POST body's hash into
+// `x-amz-content-sha256`, which CloudFront's OAC requires and Lambda function URLs refuse to
+// do without. See signPayload() -- the reasoning is long and belongs next to the code.
+//
 // Lambda@Edge forbids environment variables, so config arrives as a generated module the
 // stack writes at synth time. That is also why this file has no secrets in it: it needs
 // only public identifiers (pool id, client id, region) plus the allowlist.
 'use strict';
+
+const { createHash } = require('crypto');
 
 const cfg = require('./config');
 const { verifyIdToken, readCookie } = require('./jwt');
@@ -36,43 +42,88 @@ function isPublic(uri) {
 	return uri.indexOf('/auth/') === 0;
 }
 
+// Every refusal an API caller can get. `ok: false` and `error` are the shape app.js reads,
+// and it reads them the same way whoever refused -- the gate here, or the share handler
+// behind it. A refusal that does not carry `error` can only reach the page as a bare status
+// code, which is exactly how the OAC signature bug below stayed invisible.
+function refusalJson(status, statusDescription, obj) {
+	return {
+		status: String(status),
+		statusDescription: statusDescription,
+		headers: {
+			'content-type': [{ key: 'Content-Type', value: 'application/json' }],
+			'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+		},
+		body: JSON.stringify(obj),
+	};
+}
+
 // An API call cannot follow a redirect usefully. fetch() would chase the 302 to Google, get
 // a sign-in page back, and hand app.js an HTML body where it expected JSON -- so the page
 // would report a parse error for what is really an expired session. A status it can branch on
 // instead, with `login` naming where to send the person.
 function unauthorizedJson(request, reason) {
 	const host = request.headers.host[0].value;
-	return {
-		status: '401',
-		statusDescription: 'Unauthorized',
-		headers: {
-			'content-type': [{ key: 'Content-Type', value: 'application/json' }],
-			'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
-		},
-		body: JSON.stringify({
-			ok: false,
-			error: reason,
-			login: 'https://' + host + '/view',
-		}),
-	};
+	return refusalJson(401, 'Unauthorized', {
+		ok: false,
+		error: reason,
+		login: 'https://' + host + '/view',
+	});
 }
 
 /** Refused for good: no `login`, because signing in again cannot change the answer. */
 function forbiddenJson(reason) {
-	return {
-		status: '403',
-		statusDescription: 'Forbidden',
-		headers: {
-			'content-type': [{ key: 'Content-Type', value: 'application/json' }],
-			'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
-		},
-		body: JSON.stringify({ ok: false, error: reason }),
-	};
+	return refusalJson(403, 'Forbidden', { ok: false, error: reason });
 }
 
 /** Paths whose caller is a script, not a browser navigating. */
 function isApi(uri) {
 	return uri.indexOf('/api/') === 0;
+}
+
+// ---------------------------------------------------------------- signing the payload
+//
+// /api/share is a Lambda function URL with AWS_IAM auth, reached through CloudFront Origin
+// Access Control. OAC signs every origin request with SigV4 -- and per the CloudFront
+// documentation for a Lambda function URL origin: *if you use PUT or POST, the payload hash
+// of the request body must arrive in the `x-amz-content-sha256` header, because Lambda does
+// not support unsigned payloads.* Without it Lambda recomputes the body hash, the signature
+// does not match, and the function URL answers **403 `{"Message":"Forbidden"}`**.
+//
+// That 403 is refused at Lambda's authorizer, so the handler is never invoked and its log
+// group stays EMPTY. The only trace anywhere was this function's own `{"gate":"allow"}`
+// line, and the page -- reading `error` from a body that has only `Message` -- could say no
+// more than "403 ". Every browser click of "Create link" failed this way; the endpoint had
+// only ever been tested by direct invocation, which does not pass through CloudFront.
+//
+// It is signed HERE rather than in web/app.js because the OAC is what demands it: one place,
+// and any caller of /api/share works. See docs/FINDINGS.md 27.
+const EMPTY_SHA256 = createHash('sha256').update('').digest('hex');
+
+/**
+ * Sets `x-amz-content-sha256` over the body. Returns the number of bytes hashed, or null if
+ * the body was too big to hash -- which is NOT a case to guess at:
+ *
+ *   CloudFront truncates a viewer-request body at 40 KB before exposing it here, but sends
+ *   the FULL original body to the origin whenever the function leaves it read-only, as this
+ *   one does. So hashing a truncated body signs bytes the origin will not receive, and the
+ *   result is the same 403 as signing nothing -- one layer further down, with the header
+ *   present and looking correct. The caller refuses instead.
+ *
+ * A body-less request hashes to the empty digest, which is what CloudFront would sign for it
+ * anyway, so GET and POST take the same path.
+ */
+function signPayload(request) {
+	const body = request.body;
+	if (body && body.inputTruncated) return null;
+	const raw = body && body.data
+		? Buffer.from(body.data, body.encoding === 'text' ? 'utf8' : 'base64')
+		: null;
+	request.headers['x-amz-content-sha256'] = [{
+		key: 'x-amz-content-sha256',
+		value: raw ? createHash('sha256').update(raw).digest('hex') : EMPTY_SHA256,
+	}];
+	return raw ? raw.length : 0;
 }
 
 function loginRedirect(request) {
@@ -190,6 +241,30 @@ exports.handler = async (event) => {
 			? forbiddenJson('this account is not on the viewer\'s list')
 			: forbidden(claims.email);
 	}
-	if (!isTelemetryFetch(request.uri)) log('allow', request);
+	// Signed only for the API paths, which are the only ones behind a function URL, and only
+	// after the allowlist -- an anonymous caller must never get this far. See signPayload().
+	//
+	// The length, never the body: a share note is someone's prose. But it IS logged, because
+	// "did the payload get signed?" was unanswerable from any log while this was broken --
+	// including the case below, where the behaviour was never given a body to sign and a POST
+	// is about to be refused by something that logs nothing at all.
+	let detail;
+	if (isApi(request.uri)) {
+		if (!request.body) {
+			detail = 'no body exposed; a POST will be refused unsigned';
+		} else {
+			const bytes = signPayload(request);
+			if (bytes === null) {
+				log('body-too-large', request);
+				return refusalJson(413, 'Payload Too Large', {
+					ok: false,
+					error: 'that request body is over 40 KB, which is more than this endpoint '
+						+ 'can sign -- shorten the note or the field list',
+				});
+			}
+			detail = bytes + ' body bytes signed';
+		}
+	}
+	if (!isTelemetryFetch(request.uri)) log('allow', request, detail);
 	return request;
 };

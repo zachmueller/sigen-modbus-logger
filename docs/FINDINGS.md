@@ -640,6 +640,69 @@ reasoning. **Mutating the fix back is what exposed the gap.**
 and a test for shared arithmetic has to exercise every implementation of it, not the
 convenient one.**
 
+### 27. CloudFront signs the request; Lambda refuses an unsigned payload, and the 403 lands before any log
+
+"Create link" answered **`Could not create the link: 403 .`** — a status, a space, and a full
+stop. Every browser click had always failed that way, on every window.
+
+`/api/share` is a Lambda function URL with `AWS_IAM` auth behind Origin Access Control, so
+CloudFront signs each origin request with SigV4. For a function URL that is not enough:
+
+> If you use `PUT` or `POST` methods with your Lambda function URL, your users must compute
+> the SHA256 of the body and include the payload hash value of the request body in the
+> `x-amz-content-sha256` header when sending the request to CloudFront. **Lambda doesn't
+> support unsigned payloads.**
+
+Nothing sent it. Lambda recomputed the body hash, the signature did not match, and the
+function URL answered 403.
+
+Both halves of that are measurable against the deployed endpoint, and worth doing before
+believing any of it — sign a POST to the function URL twice with the same body, once over the
+body and once over an empty payload:
+
+```
+signature over the ACTUAL body  : 400 {"ok": false, "error": "hours must be a number, …"}
+signature over an EMPTY payload : 403 {"message":"The request signature we calculated does
+                                       not match the signature you provided…"}
+```
+
+Note the shapes. An *unsigned* request gets `{"Message":"Forbidden"}`; a *mis-signed* one gets
+`{"message":"The request signature…"}`; a crashed handler gets `{"message":"Internal Server
+Error"}`. Capital and lowercase both occur, none of them is `error`, and the 400 is the only
+one of the four that the page could read.
+
+**Three separate things then conspired to say nothing.** The refusal happens at Lambda's
+*authorizer*, so the handler is never invoked and its log group stays **empty** — the deploy
+looked healthy because nothing had failed in it. The gate, one hop earlier, logged
+`{"gate":"allow","uri":"/api/share"}`, so the last thing in any log was a success. And the
+refusal body carries `Message`, not `error`, so `web/app.js` — which reads `error` — fell back
+to `r.status + ' ' + r.statusText`, and `statusText` is always `''` over HTTP/2. Hence "403 ".
+
+What made it findable was the *pair* of logs, read together: the gate said `allow` at
+04:39:21, 04:39:53 and 04:40:08, and the share Lambda had not been invoked since 03:42. A
+refusal between two hops that both claim innocence is the hop *between* them.
+
+It is also why it survived a session of testing that looked thorough. The Lambda had been
+verified by direct invocation, and the resulting `/p/<uid>` page by headless Chrome — both
+real, neither of them through CloudFront. The one untested hop was the only broken one, and
+the handoff notes said so in writing: *"Nobody has clicked the Create link button in a
+browser."*
+
+The gate now hashes the body, because the OAC is what demands it and the gate is already on
+that behaviour: one place, and any caller works. That needs `includeBody: true`, which brings
+its own trap — CloudFront truncates a viewer-request body at 40 KB before exposing it, but
+sends the **full** body to the origin when the function leaves it read-only, so hashing a
+truncated body signs bytes the origin never receives. Same 403, one layer down, with the
+header present and looking correct. So an oversized body is refused with a 413 instead. The
+two limits are now coupled and worth watching: the gate can hash 40 KB, while
+`_strings(value, limit=400)` in the share handler would accept about 41.5 KB. Nothing the UI
+can produce comes near either — all 10 panels, all 259 catalog fields and a full 2000-character
+note is 10.0 KB — but the ceiling above the cap is the next way this breaks.
+
+**The rule: a refusal that happens before your code runs leaves no log in your code. When
+every log you own says "fine", suspect the hop between two of them — and make every layer
+that can refuse a request say so in the one shape the caller already reads.**
+
 ---
 
 ## Known limits
@@ -669,6 +732,13 @@ convenient one.**
   groups are swept and reported, and this unit refuses most of them.
 - **Reboot survival is configured but unobserved.** The LaunchDaemon is correct for
   it — root:wheel 644, not in the disabled list — but no reboot has been tested.
+- **The hosted viewer shows one plan, so history before the last cadence change is
+  invisible.** `web/tiles.js` reads `index.current` and nothing else, so a window that
+  reaches back past a `plan=` boundary draws the older side as a gap even though the tiles
+  exist under the previous hash. A share is faithful to that — it copies what was on
+  screen — but "no data" there means "not in this plan", not "the logger was off". The
+  local viewer has the same seam and answers it differently: `serve.py` groups by plan
+  hash itself.
 - **The viewer is unproven past a few days of archive.** Its per-file summary cache
   is in memory only, so a restart re-warms lazily, and nothing has been measured
   against a month or a year of files. If deep history gets slow, the fix is an

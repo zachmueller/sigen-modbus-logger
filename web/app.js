@@ -321,13 +321,18 @@ async function createShare() {
         note: $('share-note').value || '',
       }),
     });
-    const body = await r.json().catch(() => null);
+    // Read once as text, then parse. A Response body can only be consumed once, and a
+    // refusal that is not JSON -- or is JSON of a shape this page does not own -- still has
+    // to be quotable rather than silently discarded. See refusalText().
+    const raw = await r.text();
+    let body = null;
+    try { body = JSON.parse(raw); } catch (e) { /* not JSON; refusalText() quotes it */ }
     if (!r.ok || !body || !body.ok) {
       // 401 carries a `login`: the session lapsed while the page sat open, and the fix is
       // to sign in again rather than to retry. 403 has no login -- signing in cannot help.
-      const msg = (body && body.error) || (r.status + ' ' + r.statusText);
       C.clear(out);
-      out.appendChild(document.createTextNode('Could not create the link: ' + msg + '. '));
+      out.appendChild(document.createTextNode(
+        'Could not create the link: ' + refusalText(r, body, raw) + ' '));
       if (body && body.login) {
         out.appendChild(C.el('a', { href: body.login, text: 'Sign in again' }));
       }
@@ -339,6 +344,35 @@ async function createShare() {
   } finally {
     btn.disabled = false;
   }
+}
+
+// Whatever refused this, said so that a reader can act on it. Four shapes arrive here, and
+// only the first is ours:
+//
+//   {ok: false, error: …}    the gate or the share handler. The message IS the answer.
+//   {Message: "Forbidden"}   the function URL's IAM authorizer refusing an unsigned request.
+//   {message: "The request   the same authorizer refusing a signature that covers the wrong
+//    signature we …"}        payload hash -- and `{message: "Internal Server Error"}` is a
+//                            502 from the handler crashing. BOTH CASINGS occur, and reading
+//                            only `error` reduced all of it to "403 ": no message, and no
+//                            log either, since that refusal happens BEFORE the handler runs.
+//   anything else            a CloudFront error page, or nothing. `statusText` is no help:
+//                            it is always '' over HTTP/2, which the distribution serves.
+//
+// So the status is always named, and for the failures the page cannot see inside, it says
+// which side of the endpoint they came from -- that is the difference between "retry" and
+// "read the Lambda log".
+function refusalText(r, body, raw) {
+  if (body && body.error) return body.error + '.';
+  const said = (body && (body.Message || body.message))
+    || (raw || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+  return r.status + (said ? ' ' + said : '')
+    + (r.status === 403
+      ? ' — refused before it reached the endpoint, so nothing was created. CloudFront signs '
+        + 'this request and Lambda rejects it if the payload hash is missing or wrong.'
+      : r.status >= 500
+        ? ' — the endpoint failed after accepting the request; its log has the reason.'
+        : ' — no reason was given.');
 }
 
 function showShareLink(body) {

@@ -63,6 +63,17 @@ export class SiteStack extends cdk.Stack {
 			functionVersion: edge,
 			eventType: cdk.aws_cloudfront.LambdaEdgeEventType.VIEWER_REQUEST,
 		}];
+		// The same function version, plus the request body -- for /api/share ONLY, because it
+		// is the only behaviour with a body and the only one behind a Lambda function URL. The
+		// gate has to hash the body into `x-amz-content-sha256` or the OAC's SigV4 signature
+		// does not match and Lambda refuses the request 403 without invoking it; see
+		// signPayload() in cloud/lambda/auth-edge/index.js. Kept separate from `gate` so /view
+		// and /agg/* are not handed a body they have no use for.
+		const gateSigningBody: cdk.aws_cloudfront.EdgeLambda[] = [{
+			functionVersion: edge,
+			eventType: cdk.aws_cloudfront.LambdaEdgeEventType.VIEWER_REQUEST,
+			includeBody: true,
+		}];
 
 		const siteOrigin = cdk.aws_cloudfront_origins.S3BucketOrigin
 			.withOriginAccessControl(bucket, { originPath: '/site' });
@@ -211,14 +222,23 @@ function handler(event) {
 					// ALLOW_ALL because it is a POST, and CloudFront refuses methods a
 					// behaviour does not list -- before the gate ever runs, so the symptom
 					// would be a 403 with nothing in any log.
+					//
+					// A 403 with nothing in any log has a SECOND cause here, and it is the
+					// one that actually happened: OAC signs this request with SigV4, and a
+					// Lambda function URL rejects an unsigned payload, so a POST body must
+					// arrive with its hash in `x-amz-content-sha256`. `gateSigningBody`
+					// above is what puts it there. Both halves are required -- includeBody
+					// without the header, or the header without includeBody, is 403.
 					allowedMethods: cdk.aws_cloudfront.AllowedMethods.ALLOW_ALL,
 					cachePolicy: cdk.aws_cloudfront.CachePolicy.CACHING_DISABLED,
 					// The gate has to see the cookie, and the function has to see the body.
 					// EXCEPT_HOST_HEADER matters for a function URL: SigV4 is computed over
 					// the origin's host, so forwarding the viewer's would break the signature.
+					// It also carries the header the gate adds; a policy that named headers
+					// individually would have to name that one too.
 					originRequestPolicy: cdk.aws_cloudfront.OriginRequestPolicy
 						.ALL_VIEWER_EXCEPT_HOST_HEADER,
-					edgeLambdas: gate,
+					edgeLambdas: gateSigningBody,
 				},
 				// -- public -------------------------------------------------
 				'/auth/*': {

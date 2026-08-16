@@ -22,6 +22,7 @@ So each of those has a test rather than a comment.
 """
 import ast
 import calendar
+import contextlib
 import gzip
 import io
 import json
@@ -1022,6 +1023,210 @@ class TestIngestPackage(unittest.TestCase):
     def test_every_packaged_file_exists(self):
         for rel in self.listed():
             self.assertTrue(os.path.exists(os.path.join(HERE, rel)), rel)
+
+
+class TestSharePostIsSigned(unittest.TestCase):
+    """POST /api/share, and the signature without which it is a 403 that logs nothing.
+
+    `/api/share` is a Lambda function URL with `AWS_IAM` auth behind CloudFront Origin
+    Access Control. OAC signs every origin request with SigV4, and per the CloudFront
+    documentation a function URL **does not support an unsigned payload**: a POST body's
+    SHA-256 has to arrive in `x-amz-content-sha256` or Lambda rejects the request.
+
+    It rejects it at the authorizer, so the handler is never invoked and its log group stays
+    empty -- and the refusal body is `{"Message": "Forbidden"}`, which has no `error` for
+    web/app.js to read, so the page said only `403 `. Every browser click of "Create link"
+    failed that way while `curl` against the Lambda and the rendered `/p/<uid>` page both
+    looked perfect. See docs/FINDINGS.md 27.
+
+    Source-level assertions because there is no JS harness here, and because the bug lives in
+    the AGREEMENT between three files: site-stack.ts must expose the body, index.js must hash
+    it, and app.js must be able to report it when either is missing. Any one of them alone is
+    the same silent 403.
+    """
+
+    EDGE = os.path.join(HERE, "cloud", "lambda", "auth-edge", "index.js")
+    STACK = os.path.join(HERE, "cloud", "infrastructure", "lib", "site-stack.ts")
+    APP = os.path.join(HERE, "web", "app.js")
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def test_the_gate_hashes_the_body_cloudfront_will_not_do_it(self):
+        js = self.read(self.EDGE)
+        fn = re.search(r"function signPayload\(request\)\s*\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "the gate must sign the payload in one function")
+        body = re.sub(r"\s+", " ", fn.group(1))
+        self.assertIn("x-amz-content-sha256", body,
+                      "the header name IS the requirement -- OAC signs the request and "
+                      "Lambda refuses a POST whose payload hash is absent")
+        self.assertIn("createHash('sha256')", body,
+                      "it must be a SHA-256 of the body, not a placeholder")
+        self.assertIn("base64", body,
+                      "CloudFront always base64-encodes a body before exposing it to "
+                      "Lambda@Edge, so the bytes have to be decoded before hashing")
+        self.assertRegex(js, r"if \(isApi\(request\.uri\)\)[\s\S]{0,400}signPayload\(request\)",
+                         "sign only the API paths, and only after the allowlist above -- an "
+                         "anonymous caller must not reach it")
+
+    def test_a_truncated_body_is_refused_rather_than_signed(self):
+        # CloudFront truncates a viewer-request body at 40 KB before exposing it, but sends
+        # the FULL body to the origin when the function leaves it read-only. So hashing a
+        # truncated body signs bytes the origin never receives: the same 403, with the header
+        # present and looking right. It must refuse instead, and say so.
+        js = self.read(self.EDGE)
+        self.assertIn("inputTruncated", js,
+                      "the gate must notice a truncated body before hashing it")
+        self.assertRegex(js, r"inputTruncated\) return null",
+                         "signPayload() reports 'cannot sign this' rather than signing the "
+                         "part it happens to have")
+        self.assertRegex(js, r"413", "a body too large to sign is a 413 the page can print, "
+                                     "not a 403 nobody can explain")
+
+    def test_only_the_share_behaviour_is_handed_a_body(self):
+        # includeBody and the hash are two halves of one mechanism: either alone is a 403.
+        # And /view and /agg/* have no body, so exposing one there buys nothing.
+        ts = self.read(self.STACK)
+        self.assertRegex(ts, r"includeBody: true",
+                         "the gate cannot hash a body CloudFront does not expose")
+        gate_with_body = re.search(r"const gateSigningBody[^;]*;", ts, re.S)
+        self.assertIsNotNone(gate_with_body,
+                            "keep the body-bearing association separate from `gate`")
+        self.assertIn("includeBody", gate_with_body.group(0))
+        plain = re.search(r"const gate:[^;]*;", ts, re.S)
+        self.assertIsNotNone(plain)
+        self.assertNotIn("includeBody", plain.group(0),
+                         "/view and /agg/* are GETs; only /api/share needs its body")
+        share = re.search(r"'/api/share': \{(.*?)\n\t\t\t\t\},", ts, re.S)
+        self.assertIsNotNone(share, "the /api/share behaviour should still be here")
+        self.assertIn("edgeLambdas: gateSigningBody", share.group(1),
+                      "the share behaviour must use the association that carries the body")
+
+    def test_the_page_names_a_refusal_that_carries_no_error(self):
+        # The whole cost of this bug was diagnostic: three layers can refuse a share, and the
+        # page could only read one of their shapes. `{"Message": "Forbidden"}` reduced to
+        # "403 " -- no message, and no log anywhere, because the handler never ran.
+        js = self.read(self.APP)
+        fn = re.search(r"function refusalText\(r, body, raw\)\s*\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "web/app.js should name a refusal in one function")
+        body = re.sub(r"\s+", " ", fn.group(1))
+        self.assertIn("body.error", body, "the gate and the handler both send `error`")
+        # Both casings, measured against the real endpoint: an unsigned request is refused
+        # with {"Message": "Forbidden"}, a signature over the wrong payload hash with
+        # {"message": "The request signature we calculated does not match…"}, and a crashed
+        # handler with {"message": "Internal Server Error"}. Reading only `error` -- or only
+        # one of the two casings -- is what reduced all of them to a bare status code.
+        self.assertIn("body.Message", body, "the unsigned-request refusal uses a capital M")
+        self.assertIn("body.message", body,
+                      "the signature-mismatch refusal and the handler's own 502 use a "
+                      "lowercase m -- both are 403/502 with no `error` at all")
+        self.assertIn("raw", body,
+                      "a CloudFront error page is not JSON at all, and still has to be "
+                      "quotable rather than discarded")
+        # getJSON() may still use statusText: it talks to serve.py over HTTP/1.1, where the
+        # reason phrase exists. Over HTTP/2, which the distribution serves, it is always ''
+        # -- so on this path it can only pad a message that already says nothing.
+        code = "\n".join(re.sub(r"//.*$", "", line) for line in js.split("\n"))
+        share = re.search(r"async function createShare\(\)[\s\S]*?\nfunction showShareLink",
+                          code)
+        self.assertIsNotNone(share)
+        self.assertNotIn("statusText", share.group(0),
+                         "statusText is empty over HTTP/2; '403 ' is what that produced")
+        self.assertRegex(js, r"const raw = await r\.text\(\);",
+                         "read the body once as text, then parse: a Response can only be "
+                         "consumed once, and r.json() throws away a non-JSON refusal")
+
+
+class TestShareHandlerErrors(unittest.TestCase):
+    """The share handler's own refusals, which must not arrive as an unhandled exception.
+
+    An exception that escapes a Lambda behind a function URL is a 502 carrying
+    `{"message": "Internal Server Error"}` -- no `error`, so the page renders `502 ` and
+    names nothing, which is the same dead end as the 403 above. S3 is the thing most likely
+    to refuse (FINDINGS 11: without `s3:ListBucket` a MISSING key answers 403), so that path
+    has to end in a reply the page can print.
+
+    boto3 is stubbed rather than required: every other module in this repo runs on a bare
+    Python, and a test that needs boto3 installed would be the first exception.
+    """
+
+    HANDLER = os.path.join(HERE, "cloud", "lambda", "share", "handler.py")
+
+    class ClientError(Exception):
+        """botocore's shape, which is all the handler touches."""
+
+        def __init__(self, response, operation_name):
+            super().__init__(f"An error occurred ({response['Error']['Code']}) when calling "
+                             f"the {operation_name} operation")
+            self.response = response
+            self.operation_name = operation_name
+
+    def load(self, raises):
+        """The handler module, with an S3 client that refuses everything with `raises`."""
+        import importlib.util
+        import types
+
+        boto3_stub = types.ModuleType("boto3")
+        client = types.SimpleNamespace(
+            exceptions=types.SimpleNamespace(ClientError=self.ClientError))
+
+        def refuse(*a, **kw):
+            raise raises
+        for op in ("get_object", "put_object", "head_object", "copy_object", "get_paginator"):
+            setattr(client, op, refuse)
+        boto3_stub.client = lambda *a, **kw: client
+
+        keep_tz = os.environ.get("TZ")
+        env = {"BUCKET": "test-bucket", "SITE_DOMAIN": "example.test", "CAPTURE_TZ": "UTC"}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        sys.modules["boto3"] = boto3_stub
+        try:
+            spec = importlib.util.spec_from_file_location("share_handler", self.HANDLER)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        finally:
+            del sys.modules["boto3"]
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            # The handler sets TZ and calls tzset() at import, by design -- see its header.
+            # Undo it, or every test after this one reads timestamps in UTC.
+            if keep_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = keep_tz
+            time.tzset()
+
+    def test_a_refused_s3_read_is_a_named_error_not_an_unhandled_raise(self):
+        refusal = self.ClientError({"Error": {"Code": "403", "Message": "Forbidden"}},
+                                   "HeadObject")
+        mod = self.load(refusal)
+        # Captured, not silenced: the handler is SUPPOSED to log the code, the operation and a
+        # traceback -- that is how the key it was refused becomes recoverable -- but a test
+        # that prints one looks like a test that failed.
+        logged = io.StringIO()
+        with contextlib.redirect_stdout(logged), contextlib.redirect_stderr(logged):
+            reply = mod.lambda_handler({"body": json.dumps({"hours": 24})}, None)
+        self.assertIn('"operation": "HeadObject"', logged.getvalue(),
+                      "the log line is the other half: the reply names what refused, the log "
+                      "names which key")
+        self.assertIn("Traceback", logged.getvalue(),
+                      "and the traceback, because FINDINGS 11 was found by reading one")
+        self.assertEqual(reply["statusCode"], 500,
+                         "an S3 refusal is ours, not the caller's -- but it must be a reply, "
+                         "because an escaping exception is a 502 the page cannot read")
+        body = json.loads(reply["body"])
+        self.assertFalse(body["ok"])
+        self.assertIn("HeadObject", body["error"],
+                      "name the operation: FINDINGS 11 took a traceback to find, and the "
+                      "operation is what identified it")
+        self.assertIn("403", body["error"], "and the code, since 403-on-absent is the "
+                                            "failure this endpoint has already had once")
 
 
 # --------------------------------------------------------------------- ingest
