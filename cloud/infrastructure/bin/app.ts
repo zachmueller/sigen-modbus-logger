@@ -4,21 +4,32 @@
  * there and CloudFront can only attach a certificate from there -- so using one region
  * throughout means no stack ever references another across a region boundary.
  *
- * There is no DNS stack. The site lives on a subdomain of a zone we do not host: the
- * parent is at a registrar whose editor has no NS record type, so there is nothing to
- * delegate to. Instead the subdomain is pointed at CloudFront with a plain CNAME, and
- * the certificate is validated by a second CNAME, both added by hand once. See
- * cloud/README.md -- that is also why certificate_arn is config rather than a resource.
+ * There is no DNS stack: the site lives on a subdomain of a zone we do not host, whose
+ * registrar has no NS record type, so it is pointed here with two hand-added CNAMEs. See
+ * cloud/README.md, which is also why certificate_arn is config rather than a resource.
  *
- * Deploy order:
+ * Deploy order. Two of the steps have a human in the middle, and both are there because
+ * something cannot be known until something else exists:
  *
- *   1. cdk deploy SigenData     bucket, ingest Lambda, S3 events
- *   2. cdk deploy SigenAuth     Cognito + Google + the viewer-request edge function
- *   3. cdk deploy SigenSite     CloudFront, behaviours; prints the CNAME target
+ *   1. cdk deploy SigenData        bucket, ingest Lambda, S3 events
+ *   2. cdk deploy SigenAuthPool    Cognito + Google + the callback
+ *      -> put its UserPoolId and ClientId in cloud.json
+ *   3. cdk deploy SigenAuthEdge    the read gate, with those ids baked in
+ *   4. cdk deploy SigenSite        CloudFront; prints the CNAME target
+ *      -> point the subdomain at it
+ *
+ * Steps 2 and 3 are separate because a Lambda@Edge cannot have environment variables and
+ * asset bundling happens before CloudFormation resolves tokens; auth-stack.ts explains it
+ * at length. Step 2 needs the Google client secret:
+ *
+ *   cdk deploy SigenAuthPool \
+ *     --parameters GoogleClientSecret="$(cat ../.google-secret)"
  */
 import * as cdk from 'aws-cdk-lib';
 import { load } from '../lib/config';
 import { DataStack } from '../lib/data-stack';
+import { AuthPoolStack, AuthEdgeStack } from '../lib/auth-stack';
+import { SiteStack } from '../lib/site-stack';
 
 const cfg = load();
 const app = new cdk.App();
@@ -31,7 +42,30 @@ const commonProps: cdk.StackProps = {
 };
 
 new DataStack(app, 'SigenData', {
-	...commonProps,
-	cfg,
+	...commonProps, cfg,
 	description: 'Telemetry bucket, ingest Lambda and the capture host credential',
 });
+
+const pool = new AuthPoolStack(app, 'SigenAuthPool', {
+	...commonProps, cfg,
+	description: 'Cognito user pool, Google identity provider and the OAuth callback',
+});
+
+// Only synthesized once the pool's ids are in cloud.json. Guarded rather than skipped, so
+// `cdk deploy SigenAuthEdge` before step 2 fails with an explanation instead of building a
+// gate that rejects every valid token.
+const edge = cfg.cognitoUserPoolId && cfg.cognitoClientId
+	? new AuthEdgeStack(app, 'SigenAuthEdge', {
+		...commonProps, cfg,
+		description: 'Viewer-request read gate: verified Google identity plus an allowlist',
+	})
+	: null;
+
+if (edge) {
+	new SiteStack(app, 'SigenSite', {
+		...commonProps, cfg,
+		edgeVersionArn: edge.edgeVersion.edgeArn,
+		callbackApiDomain: pool.callbackApiDomain,
+		description: 'CloudFront distribution, behaviours and the published page',
+	});
+}

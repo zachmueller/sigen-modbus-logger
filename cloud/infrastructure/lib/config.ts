@@ -25,6 +25,10 @@ export interface CloudConfig {
 	googleClientId: string;
 	authDomainPrefix: string;
 	allowedEmails: string[];
+	// Only knowable after AuthPoolStack exists, so they arrive by hand afterwards. See
+	// auth-stack.ts for why a Lambda@Edge cannot be told them any other way.
+	cognitoUserPoolId: string;
+	cognitoClientId: string;
 }
 
 const ROOT = path.resolve(__dirname, '../../..');
@@ -59,6 +63,7 @@ export function load(): CloudConfig {
 	const known = new Set([
 		'account_id', 'region', 'profile', 'domain', 'bucket', 'certificate_arn',
 		'capture_tz', 'google_client_id', 'auth_domain_prefix', 'allowed_emails',
+		'cognito_user_pool_id', 'cognito_client_id',
 	]);
 	const unknown = Object.keys(raw).filter((k) => !k.startsWith('_') && !known.has(k));
 	if (unknown.length) {
@@ -131,7 +136,31 @@ export function load(): CloudConfig {
 		googleClientId: typeof raw['google_client_id'] === 'string' ? raw['google_client_id'].trim() : '',
 		authDomainPrefix: str('auth_domain_prefix'),
 		allowedEmails: (emails as string[]).map((e) => e.trim().toLowerCase()).filter(Boolean),
+		cognitoUserPoolId: opt(raw, 'cognito_user_pool_id'),
+		cognitoClientId: opt(raw, 'cognito_client_id'),
 	};
+}
+
+function opt(raw: Record<string, unknown>, key: string): string {
+	const v = raw[key];
+	return typeof v === 'string' ? v.trim() : '';
+}
+
+/** Called by the stack that bakes the pool's ids into code. */
+export function requirePool(cfg: CloudConfig): void {
+	if (!cfg.cognitoUserPoolId || !cfg.cognitoClientId) {
+		fail(
+			'cognito_user_pool_id and cognito_client_id are not set, so the read gate\n' +
+				'  would be built with no pool to verify tokens against.\n' +
+				'  Deploy SigenAuthPool first and copy its UserPoolId and ClientId outputs\n' +
+				'  into cloud.json. They are CloudFormation tokens until that stack exists,\n' +
+				'  and a Lambda@Edge cannot be given them as environment variables.',
+		);
+	}
+	if (!/^[\w-]+_[0-9a-zA-Z]+$/.test(cfg.cognitoUserPoolId)) {
+		fail(`cognito_user_pool_id ${cfg.cognitoUserPoolId} does not look like a pool id ` +
+			`(e.g. us-east-1_AbCdEfGhI)`);
+	}
 }
 
 /** Called by the stacks that cannot work without sign-in configured. */
