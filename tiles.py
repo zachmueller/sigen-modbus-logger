@@ -135,32 +135,36 @@ def columns(win, catalog, keys, counter_keys=frozenset()):
 
 
 def counters(win, keys):
-    """{key: {first, last, first_ts, last_ts, reset}} for the lifetime counters.
+    """{key: {first: [...], last: [...], reset: bool}} for the lifetime counters.
 
-    RAW endpoints, not a delta, because a window total spanning several tiles is
-    last(last tile) - first(first tile) -- so a tile that carried only its own delta
-    could not be composed with its neighbours. serve.py's live path uses
-    series.energy() for the same numbers; this is the composable form of it.
+    PER-BUCKET endpoints, not one pair for the whole tile, and that is the whole point.
 
-    `reset` here is only what happened WITHIN this tile. A counter stepping back across
-    a tile boundary is invisible from inside either one, so whoever concatenates tiles
-    has to compare each tile's `first` against the previous tile's `last` as well. That
-    is a real case, not a theoretical one: the counter loses an unflushed increment
-    across a power cut (FINDINGS 11), and the result must read as "total is a floor",
-    never as negative kWh.
+    A window total is last - first. A tile spans a whole UTC hour, day or month, but the
+    window a reader asks for does not: "the last six hours" starts wherever it starts. Two
+    scalars per tile only let the reader measure from the tile's edge, which is earlier
+    than the window's -- measured at five extra minutes of energy on a six-hour window,
+    a silent 2% overstatement that looked plausible on screen. Per-bucket arrays let the
+    reader clip to the bucket the window actually begins in, which is exactly what
+    series.energy() does on the live path.
+
+    Not a mean, min or max: those are meaningless for a lifetime counter, and a counter is
+    never drawn as a line anyway -- serve.PANELS shows it as one number. So this carries
+    two arrays rather than the usual three, and no unit or cadence.
+
+    `reset` is only what happened WITHIN this tile. A counter stepping back across a tile
+    boundary is invisible from inside either one, so whoever concatenates has to compare
+    each tile's first surviving `first` against the previous tile's last surviving `last`.
+    That is a real case: the device loses an unflushed increment across a power cut
+    (FINDINGS 11), and the result must read as "this total is a floor", never as negative
+    kWh.
     """
     out = {}
     for key in keys:
         col = win["series"].get(key)
         if not col or col["first_value"] is None or col["last_value"] is None:
             continue
-        out[key] = {
-            "first": col["first_value"],
-            "last": col["last_value"],
-            "first_ts": col["first_ts"],
-            "last_ts": col["last_ts"],
-            "reset": bool(col["reset"]),
-        }
+        out[key] = {"first": col["first"], "last": col["last"],
+                    "reset": bool(col["reset"])}
     return out
 
 

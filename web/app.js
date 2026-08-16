@@ -460,6 +460,7 @@ function renderAll() {
   }
 
   if (FROZEN) renderFrozenBanner();
+  renderPickerAvailability();
   renderFreshness();
   renderLiveTiles();
   renderEnergy();
@@ -976,9 +977,47 @@ function buildPicker() {
   renderChosen();
 }
 
+// Whether the current window can answer for an arbitrary register.
+//
+// On this server, always: it decodes the archive and every captured field is available at
+// every width. A tile source materialises the whole catalogue only at the coarser widths,
+// because carrying 240 fields at a 30 s bucket would make a tile larger than the raw
+// archive it came from. picker_min_bucket_s is where that starts, and it comes from meta
+// rather than being hardcoded here, so widening a tile widens the picker with no change to
+// this file.
+//
+// The point of saying so is that the alternative is worse than a disabled control: the
+// field would be accepted, come back absent, and read as "this register is always zero".
+function pickerAvailable() {
+  const min = state.meta.picker_min_bucket_s;
+  if (!min) return true;
+  return !!state.win && state.win.bucket_s >= min;
+}
+
+function renderPickerAvailability() {
+  const min = state.meta.picker_min_bucket_s;
+  if (!min || FROZEN) return;
+  const ok = pickerAvailable();
+  const search = $('field-search');
+  search.disabled = !ok;
+  const note = $('field-count');
+  if (ok) {
+    note.textContent = state.meta.catalog.length + ' fields captured';
+    return;
+  }
+  // Say what to do, and be specific about the number: the threshold is a real
+  // consequence of the bucket ladder, not a round figure.
+  const needS = min * 900;
+  note.textContent = state.meta.catalog.length + ' fields captured — but only the '
+    + (state.meta.fine_fields || []).length + ' the panels use are stored at '
+    + fmtDuration(state.win ? state.win.bucket_s : 0) + ' resolution. Widen the window to '
+    + fmtDuration(Math.ceil(needS / 3600) * 3600) + ' or more to chart any of the others.';
+}
+
 function renderResults(term) {
   const host = $('field-results');
   C.clear(host);
+  if (!pickerAvailable()) return;
   const q = (term || '').trim().toLowerCase();
   if (!q) return;
   let n = 0;

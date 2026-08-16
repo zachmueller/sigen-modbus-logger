@@ -659,25 +659,81 @@ class TestTiles(ViewerFixture):
                              whole["health"][field], field)
         self.assertEqual(a["records"] + b["records"], whole["records"])
 
+    def compose_energy(self, tiles_, key, start, end):
+        """What web/tiles.js does: lay each tile's per-bucket counter endpoints onto the
+        window grid, then take the first and last surviving values.
+
+        Reimplemented here rather than mocked, because this arithmetic is the thing being
+        tested and the JavaScript has no test harness (see the project notes)."""
+        n = (end - start) // self.bucket
+        first = [None] * int(n)
+        last = [None] * int(n)
+        for t in tiles_:
+            c = t["counters"].get(key)
+            if not c:
+                continue
+            for j in range(t["n"]):
+                i = int((t["start"] + j * t["bucket_s"] - start) // self.bucket)
+                if not 0 <= i < n:
+                    continue                  # this bucket is outside the window
+                if c["first"][j] is not None:
+                    first[i] = c["first"][j]
+                if c["last"][j] is not None:
+                    last[i] = c["last"][j]
+        lo = next((v for v in first if v is not None), None)
+        hi = next((v for v in reversed(last) if v is not None), None)
+        return lo, hi
+
     def test_counters_compose_across_tiles(self):
-        # A window total is last(last tile) - first(first tile). If the boundary bucket
-        # leaked, tile A's `last` would be read from tile B and the total would be wrong
-        # by one bucket's worth of energy.
         s = self.seed_walking()
         cat = self.catalog_of(s)
         a, b = self.tile(s, cat, 0), self.tile(s, cat, 1)
-        whole = series.window(s, self.base, self.base + 2 * self.span, [self.KWH],
-                              bucket_s=self.bucket, cache=series.SummaryCache(),
-                              warm_budget_s=0, end_exclusive=True)
+        start, end = self.base, self.base + 2 * self.span
+        whole = series.window(s, start, end, [self.KWH], bucket_s=self.bucket,
+                              cache=series.SummaryCache(), warm_budget_s=0,
+                              end_exclusive=True)
         want = series.energy(whole, [self.KWH])[self.KWH]
 
-        self.assertAlmostEqual(a["counters"][self.KWH]["first"], want["first"], places=6)
-        self.assertAlmostEqual(b["counters"][self.KWH]["last"], want["last"], places=6)
-        composed = b["counters"][self.KWH]["last"] - a["counters"][self.KWH]["first"]
-        self.assertAlmostEqual(composed, want["kwh"], places=3)
+        lo, hi = self.compose_energy([a, b], self.KWH, start, end)
+        self.assertAlmostEqual(lo, want["first"], places=6)
+        self.assertAlmostEqual(hi, want["last"], places=6)
+        self.assertAlmostEqual(hi - lo, want["kwh"], places=3)
         # And the counter travels as endpoints, never as a line: 20 points of a lifetime
         # counter is payload nothing draws.
         self.assertNotIn(self.KWH, a["series"])
+
+    def test_a_counter_is_clipped_to_the_window_not_the_tile(self):
+        # THE bug this format exists to prevent, and it was live before this test.
+        #
+        # A tile spans a whole UTC hour; a window does not. Reading a tile's own endpoints
+        # measures the counter from the top of the hour, so "the last six hours" starting
+        # at :05 picked up five extra minutes of energy -- measured at 5.35 kWh against a
+        # true 5.23, a 2% overstatement that looks entirely plausible on screen.
+        s = self.seed_walking()
+        cat = self.catalog_of(s)
+        tiles_ = [self.tile(s, cat, 0), self.tile(s, cat, 1)]
+
+        # A window starting a third of the way into the first tile, deliberately unaligned.
+        start = self.base + self.span // 3
+        end = self.base + 2 * self.span
+        start = float(int(start) // self.bucket * self.bucket)   # on a bucket boundary
+
+        live = series.window(s, start, end, [self.KWH], bucket_s=self.bucket,
+                             cache=series.SummaryCache(), warm_budget_s=0,
+                             end_exclusive=True)
+        want = series.energy(live, [self.KWH])[self.KWH]
+        lo, hi = self.compose_energy(tiles_, self.KWH, start, end)
+        self.assertAlmostEqual(hi - lo, want["kwh"], places=3,
+                               msg="the total must measure from the WINDOW's edge")
+
+        # And show the mistake it replaces would have been wrong: the tile's own first
+        # value is earlier, and therefore gives a larger total.
+        tile_first = next(v for v in tiles_[0]["counters"][self.KWH]["first"]
+                          if v is not None)
+        self.assertLess(tile_first, lo,
+                        "the fixture must have the window starting inside the tile, or "
+                        "this test proves nothing")
+        self.assertGreater(hi - tile_first, want["kwh"])
 
     def test_a_reset_across_a_tile_boundary_is_visible_to_the_reader(self):
         # Neither tile can see it from inside: A ends high, B starts low, and each is

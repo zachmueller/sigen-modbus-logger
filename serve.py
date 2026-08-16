@@ -55,6 +55,10 @@ STATIC = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
     "/charts.js": ("charts.js", "text/javascript; charset=utf-8"),
+    # Served but unused here: this server IS the source, so app.js never dispatches to
+    # the tile adapter. It is in the page unconditionally so there is one index.html
+    # rather than a local copy and a hosted one drifting apart.
+    "/tiles.js": ("tiles.js", "text/javascript; charset=utf-8"),
     "/style.css": ("style.css", "text/css; charset=utf-8"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }

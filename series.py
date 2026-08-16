@@ -676,13 +676,20 @@ def window(series, start, end, keys, bucket_s=None, cache=None,
         col = {"unit": (by_key.get(k, {}).get("unit") or ""),
                "cadence_s": _cadence_of_field(series, k),
                "n": [0] * n, "mean": [None] * n, "min": [None] * n,
-               "max": [None] * n, "last": [None] * n, "bits": [0] * n}
+               "max": [None] * n, "first": [None] * n, "last": [None] * n,
+               "bits": [0] * n}
         for bkey, acc in acc_by_bucket.items():
             i = index[bkey]
             col["n"][i] = acc[N]
             col["mean"][i] = acc[SUM] / acc[N] if acc[N] else None
             col["min"][i] = acc[MIN]
             col["max"][i] = acc[MAX]
+            # Per-bucket FIRST as well as LAST. Only the lifetime counters need it, and
+            # they need it badly: a window total is last - first, and a reader working
+            # from a tile that spans a whole hour cannot otherwise find the value at a
+            # window edge that falls mid-hour. Measured cost of not having it: 5 minutes
+            # of extra energy on a 6-hour window, a silent 2%.
+            col["first"][i] = acc[FIRST]
             col["last"][i] = acc[LAST]
             col["bits"][i] = acc[BITS]
         ordered = sorted(acc_by_bucket.items())
