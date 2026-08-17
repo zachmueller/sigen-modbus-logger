@@ -105,13 +105,19 @@ export class DataStack extends cdk.Stack {
 			// holds. The ~10 s above does not say where it was taken, so the two are not
 			// comparable; state the machine next time.
 			//
-			// `{"rebuild": <hash>}` is NOT comfortable: it reads the whole raw prefix by
-			// design and is now killed at this limit every time, having written tiles but not
-			// the documents. So the headroom this number was chosen for is gone, and the limit
-			// that bites is time rather than the 512 MB /tmp its docstring watched. Raising it
-			// to the 900 s maximum buys roughly a year; replaying one S3 event is the cheap way
-			// to refresh meta.json meanwhile. See docs/FINDINGS.md 37.
-			timeout: cdk.Duration.seconds(300),
+			// `{"rebuild": <hash>}` is NOT comfortable, and 300 s is why this is now 900. It
+			// reads the whole raw prefix BY DESIGN -- its two jobs, a backfill and a
+			// tile-format change, both assume every tile is wrong -- so its cost is
+			// proportional to the archive and every fixed timeout is a deadline it eventually
+			// crosses. At five days it crossed 300 s, and because ingest.run() writes documents
+			// only after building all tiles, each attempt rewrote tiles and left meta.json
+			// stale: the one artifact a presentation-only change needs. See docs/FINDINGS.md 37.
+			//
+			// 900 s is Lambda's ceiling, so this is the last time this lever can be pulled;
+			// after it, the answer is the month-scoped rebuild that function's docstring
+			// suggests, which needs care not to narrow meta.json's extent to the rebuilt month.
+			// The 512 MB /tmp its docstring watches is the wall after that, in about year two.
+			timeout: cdk.Duration.seconds(900),
 			// Lambda scales CPU with memory and the work is single-threaded Python, so
 			// there is nothing to gain above roughly one vCPU.
 			memorySize: 1769,

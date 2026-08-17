@@ -255,15 +255,15 @@ def rebuild(plan):
     When that day comes the answer is to raise ephemeral storage or rebuild month by
     month, not to make this quietly partial -- so it does not catch the failure.
 
-    **The TIMEOUT binds first, and already does.** Measured 2026-08-18 on four days of
-    archive: three attempts, each killed at the function's 300 s limit with 1235 MB of 1769 MB
-    used, none reaching write_documents() -- so it wrote tiles and never refreshed meta.json,
-    which is the one document a presentation-only change needs. The /tmp note above was
-    watching the wrong resource.
+    **The TIMEOUT binds first.** Measured 2026-08-18 on five days of archive: three attempts,
+    each killed at the function's then-300 s limit with 1235 MB of 1769 MB used, none reaching
+    write_documents() -- so each wrote tiles and left meta.json stale, which is the one document
+    a presentation-only change needs. The /tmp note above was watching the wrong resource. The
+    limit is now 900 s, Lambda's ceiling; see data-stack.ts, which is also where the next move
+    is recorded, since that lever cannot be pulled twice.
 
-    Until the limit is raised, a change that only alters meta.json (PANELS, ENERGY_TILES) is
-    better applied by REPLAYING one S3 event, which is the incremental path and takes about a
-    minute:
+    A change that only alters meta.json (PANELS, ENERGY_TILES) does not want this function at
+    all. REPLAY one S3 event instead -- the incremental path, about a minute, and bounded:
 
         aws lambda invoke --function-name <IngestFunctionName> \\
             --payload '{"Records":[{"s3":{"object":{"key":"raw/plan=<hash>/<newest>.bin.gz"}}}]}' \\
