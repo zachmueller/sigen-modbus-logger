@@ -23,14 +23,15 @@ What it uploads:
                                Nothing triggers on this prefix and no tile is built from
                                it. See below.
 
-Tiles are NOT uploaded. The ingest Lambda builds them, and after a backfill it should be
-asked to do so in one pass:
+Tiles are NOT uploaded here. Build them in one pass afterwards, from this same machine:
 
-    aws lambda invoke --function-name <IngestFunctionName> \\
-        --payload '{"rebuild":"<planhash>"}' --cli-binary-format raw-in-base64-out /dev/stdout
+    python3 cloud/rebuild_tiles.py --data-dir <the same dir> --invalidate
 
 One pass rather than letting the upload's S3 events race each other over the same day
-tiles -- see the note on reserved concurrency in data-stack.ts.
+tiles -- see the note on reserved concurrency in data-stack.ts. Locally rather than in the
+ingest Lambda, which used to answer `{"rebuild": "<planhash>"}` and no longer does: a
+whole-archive rebuild costs time proportional to the archive and outgrew every Lambda
+timeout in the archive's first week (docs/FINDINGS.md 37).
 
 **Repairing a series written before plan-hash fingerprinting.** An early series can have
 no hash in its filenames and `plan_hash: null` in its manifest, which makes it undecodable
@@ -237,11 +238,9 @@ def main():
     print(f"\n{up.count} objects, {up.bytes/1e6:.1f} MB"
           + (" (dry run)" if args.dry_run else ""))
     if not args.dry_run:
-        print("\nNow rebuild the tiles in one pass rather than letting the upload's S3 "
+        print("\nNow build the tiles in one pass, rather than letting the upload's S3 "
               "events race:\n"
-              "  aws lambda invoke --function-name <IngestFunctionName> \\\n"
-              "      --payload '{\"rebuild\":\"<planhash>\"}' \\\n"
-              "      --cli-binary-format raw-in-base64-out /dev/stdout")
+              f"  python3 cloud/rebuild_tiles.py --data-dir {args.data_dir} --invalidate")
 
 
 if __name__ == "__main__":

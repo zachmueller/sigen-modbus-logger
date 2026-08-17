@@ -104,7 +104,9 @@ def _wanted(name, want_dates):
 
     Every manifest, always: it is the format of record, and without one beside the
     records nothing decodes. Raw files only on the dates in the window -- or all of them
-    when `want_dates` is None, which is what a full rebuild asks for.
+    when `want_dates` is None, which no path in THIS function asks for any more. That case
+    is kept for cloud/rebuild_tiles.py, which imports this module to do the whole-archive
+    rebuild a Lambda timeout cannot hold.
     """
     if name.endswith(".manifest.json"):
         return True
@@ -240,63 +242,36 @@ def process(key):
     return n
 
 
-def rebuild(plan):
-    """Every tile for one plan, from every raw file it has. Not event-driven.
-
-    Invoke as {"rebuild": "<planhash>"}. Two jobs:
-
-      - a backfill, where computing the whole archive in one pass is both faster and
-        safer than letting a burst of S3 events race each other over the same day tiles;
-      - a tile-format change, where every tile has to be rewritten and no raw file is
-        arriving to trigger it.
-
-    This pulls the plan's ENTIRE raw prefix down, so its cost is proportional to the archive and
-    every fixed limit is a deadline it eventually crosses. Two limits, and the interesting part
-    is which one:
-
-      - /tmp, 512 MB. At 2.8 MB of compressed raw a day that is roughly 180 archive-days.
-      - the function TIMEOUT. Measured IN LAMBDA 2026-08-18: 356 s and 615 objects for a
-        4.05-day archive, about 88 s per archive-day. Three earlier attempts were killed at the
-        then-300 s limit, each having written tiles but not reached write_documents() -- so they
-        left meta.json stale, the one document a presentation-only change needs.
-
-    The timeout is now 900 s, Lambda's ceiling, which if that rate stays linear is exhausted at
-    about TEN archive-days -- late August 2026. So the /tmp figure above is eighteen times
-    further out than the wall actually ahead, and the lever cannot be pulled again: the fix is
-    rebuilding month by month, bounded per invocation, taking care that a partial rebuild does
-    not rewrite meta.json with an extent covering only the month it read.
-
-    A change that only alters meta.json (PANELS, ENERGY_TILES) does not want this function at
-    all. REPLAY one S3 event instead -- the incremental path, about a minute, and bounded:
-
-        aws lambda invoke --function-name <IngestFunctionName> \\
-            --payload '{"Records":[{"s3":{"object":{"key":"raw/plan=<hash>/<newest>.bin.gz"}}}]}' \\
-            --cli-binary-format raw-in-base64-out --cli-read-timeout 420 /dev/stdout
-
-    Or simply wait: write_documents() is FRESH on every event, so the next rotation carries it.
-    Pass --cli-read-timeout either way. The default is 60 s, and when the CLI gives up it
-    RETRIES -- three concurrent rebuilds of the same plan, since this function has no reserved
-    concurrency (see data-stack.ts for why it cannot). See docs/FINDINGS.md 37.
-    """
-    data_dir = _download_plan(plan, want_dates=None)
-    found = series.discover(data_dir)
-    if plan not in found:
-        raise ValueError(f"no manifest for plan {plan}")
-    out_dir = os.path.join(WORK, "agg")
-    written = ingest.run(data_dir, out_dir)
-    n = _upload(out_dir, written)
-    _rewrite_index()
-    print(f"rebuild {plan}: {n} objects written")
-    return n
-
-
 def lambda_handler(event, context):
+    """S3 events, and nothing else.
+
+    There WAS a `{"rebuild": "<planhash>"}` branch here, calling ingest.run() over a plan's
+    whole raw prefix. It is gone, and its absence is the design: that job costs time
+    proportional to the archive -- ~88 s per archive-day, measured -- so no fixed timeout can
+    hold it. It crossed 300 s in the archive's first week; raising the limit to Lambda's 900 s
+    ceiling bought about six days, and there is no third raise. An unbounded job in a function
+    with a deadline fails by being KILLED PART-WAY, which here meant tiles rewritten and
+    meta.json left stale, so it is not the kind of failure to leave available.
+
+    It now lives in cloud/rebuild_tiles.py, on a workstation, where nothing is watching the
+    clock -- calling this module's own _upload() so the objects are identical. See
+    docs/FINDINGS.md 37.
+
+    What remains is bounded by construction: three local dates of raw, the spans those records
+    touch, ~62 s. That is the only thing that has to run unattended, and it is the only thing
+    left here.
+    """
     # /tmp survives between invocations on a warm container. Stale raw would be harmless
     # (series.discover re-reads the directory) but stale AGG would be uploaded again on
     # every event, so start clean rather than reason about it.
     shutil.rmtree(WORK, ignore_errors=True)
     if event.get("rebuild"):
-        return {"objects": rebuild(event["rebuild"])}
+        # Named explicitly rather than ignored: an old runbook, or a habit, would otherwise
+        # get a cheerful {"objects": 0} and conclude the rebuild had nothing to do.
+        raise ValueError(
+            "the rebuild path was removed -- it cannot fit any Lambda timeout. Run "
+            "cloud/rebuild_tiles.py --from-s3 --plan <hash> from a workstation instead. "
+            "For a meta.json-only change, replay one S3 event, or wait one rotation.")
     total = 0
     for rec in event.get("Records", []):
         key = urllib.parse.unquote_plus(rec["s3"]["object"]["key"])

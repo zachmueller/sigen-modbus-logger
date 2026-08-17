@@ -914,7 +914,9 @@ aws s3 ls s3://<bucket>/raw/ --recursive --profile <p> | awk '{print $4}' \
 # 2. Prove equivalence before deleting either: sha256(.bin) == sha256(gunzip -c .bin.gz).
 # 3. Delete the .bin, keep .bin.gz -- the form that travels. Versioned bucket, so it is a
 #    delete marker, not a loss. Note the logger principal is denied delete; use an admin.
-# 4. Rebuild in ONE pass -- '{"rebuild":"<plan>"}' -- then invalidate /agg/*.
+# 4. Rebuild in ONE pass, which invalidates /agg/* for you:
+#    python3 cloud/rebuild_tiles.py --from-s3 --plan <plan> --invalidate
+#    (this step used to be '{"rebuild":"<plan>"}' on the ingest Lambda -- see FINDINGS 37)
 ```
 
 **A warning that a fix adds is an instruction someone will follow. FINDINGS 28 made the stranded
@@ -1174,10 +1176,22 @@ eighteen times further out than the wall actually ahead. The docstring had been 
 resource with the most headroom and predicting trouble "in the second year", while the binding
 limit was days away.
 
+**Where it ended up: not in Lambda at all.** The 900 s was reverted. A rebuild's cost is
+proportional to the archive, so no fixed timeout can hold it — and the *shape* of the failure is
+what settles the argument: an unbounded job under a deadline is killed part-way, and
+`ingest.run()` writes documents only after every tile, so "part-way" specifically means tiles
+rewritten and `meta.json` stale. That is worse than not running. So the job moved to
+`cloud/rebuild_tiles.py` on a workstation, where nothing watches the clock, importing the
+handler's own `_upload()` and `_rewrite_index()` so the objects it writes are the objects the
+Lambda wrote. The ingest function's timeout came back down to 300 s, which against a bounded 62 s
+path is honest headroom rather than hope, and `{"rebuild": ...}` now raises instead of quietly
+answering `{"objects": 0}` to an old runbook.
+
 **A background job's stated limit is a guess until something measures it, and the resource that
 runs out first is rarely the one the comment is watching. Verify the effect, not the exit code —
 and never from a file the failing command did not write. Then measure again AFTER the fix: a limit
-raised without a cost-per-unit is not headroom, it is an unread number.**
+raised without a cost-per-unit is not headroom, it is an unread number. And when a job's cost
+grows with the data, the fix is not a bigger deadline — it is somewhere without one.**
 
 ---
 

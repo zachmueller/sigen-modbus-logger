@@ -95,36 +95,24 @@ export class DataStack extends cdk.Stack {
 			runtime: cdk.aws_lambda.Runtime.PYTHON_3_12,
 			handler: 'handler.lambda_handler',
 			code: ingestCode,
-			// Measured at ~10 s for the incremental path on two days of archive, and it
-			// is constant-time: the day rebuild always reads one day however old the
-			// archive gets. 300 s is headroom for a backfill storm, not the steady state.
+			// 300 s for a job measured at 62 s, and that ratio is now honest -- because the
+			// only path left here is the BOUNDED one. run_for() reads three local dates and
+			// writes the spans those records touch, whatever the archive holds, so this is
+			// headroom rather than hope.
 			//
-			// Re-measured 2026-08-18, IN LAMBDA on five days of archive (a three-day window,
-			// ~9 MB of raw): the incremental path is 62 s cold, 221 MB peak. Still comfortable,
-			// and still bounded -- run_for() reads three local dates whatever the archive
-			// holds. The ~10 s above does not say where it was taken, so the two are not
-			// comparable; state the machine next time.
+			// Measured IN LAMBDA 2026-08-18 (five days of archive, a ~9 MB three-day window):
+			// 62 s cold, 221 MB peak. Stating the machine matters: the ~10 s this comment used
+			// to claim recorded neither where it ran nor whether the cache was warm, so it
+			// could not be compared with anything.
 			//
-			// `{"rebuild": <hash>}` is NOT comfortable, and 300 s is why this is now 900. It
-			// reads the whole raw prefix BY DESIGN -- its two jobs, a backfill and a
-			// tile-format change, both assume every tile is wrong -- so its cost is
-			// proportional to the archive and every fixed timeout is a deadline it eventually
-			// crosses. At five days it crossed 300 s, and because ingest.run() writes documents
-			// only after building all tiles, each attempt rewrote tiles and left meta.json
-			// stale: the one artifact a presentation-only change needs. See docs/FINDINGS.md 37.
-			//
-			// 900 s is Lambda's ceiling, so this is the last time this lever can be pulled --
-			// and it buys FAR less than it looks like. Measured in Lambda 2026-08-18: a full
-			// rebuild of a 4.05-day archive took 356 s and wrote 615 objects, i.e. about 88 s
-			// per day of archive. If that stays linear, 900 s is exhausted at roughly ten
-			// archive-days, which is late August 2026. Days, not years.
-			//
-			// So the month-scoped rebuild that function's docstring suggests is the real fix,
-			// not a someday: `{"rebuild": hash, "month": "YYYY-MM"}`, bounded per invocation at
-			// any archive size, with care not to narrow meta.json's extent to the month it read.
-			// The 512 MB /tmp its docstring watches is nowhere near binding by comparison --
-			// 2.8 MB of raw per day is about 180 archive-days, eighteen times further out.
-			timeout: cdk.Duration.seconds(900),
+			// It was briefly 900 s, to fit `{"rebuild": <hash>}`. That was the wrong shape of
+			// answer. A whole-archive rebuild costs ~88 s per archive-day, so 900 s -- Lambda's
+			// ceiling -- would have been exhausted at about ten archive-days, days away rather
+			// than the year it was raised for. And an unbounded job under a deadline fails by
+			// being killed part-way: each attempt rewrote tiles and left meta.json stale. So it
+			// moved to cloud/rebuild_tiles.py, on a workstation, and the ceiling came back down
+			// with it. See docs/FINDINGS.md 37.
+			timeout: cdk.Duration.seconds(300),
 			// Lambda scales CPU with memory and the work is single-threaded Python, so
 			// there is nothing to gain above roughly one vCPU.
 			memorySize: 1769,

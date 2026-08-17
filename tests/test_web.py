@@ -1063,6 +1063,93 @@ class TestIngestPackage(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(HERE, rel)), rel)
 
 
+class TestTheUnboundedJobIsNotInLambda(unittest.TestCase):
+    """A whole-archive rebuild costs time proportional to the archive, so it cannot live under
+    a deadline -- and the SHAPE of that failure is why it is worth a test rather than a comment.
+
+    `ingest.run()` writes every tile and only then the documents. A run killed part-way has
+    therefore rewritten tiles and left `meta.json` stale, which is the one artifact a
+    presentation-only change needs: worse than not having run. That is what happened three times
+    at a 300 s limit, and raising the limit to Lambda's 900 s ceiling bought about six days at the
+    measured ~88 s per archive-day. See docs/FINDINGS.md 37.
+
+    So the job lives in cloud/rebuild_tiles.py now, on a workstation. These tests pin the three
+    ways it could quietly come back: the branch reappearing, the timeout creeping up to
+    accommodate it, and the script drifting into its own copy of the upload.
+    """
+
+    HANDLER = os.path.join(HERE, "cloud", "lambda", "ingest", "handler.py")
+    SCRIPT = os.path.join(HERE, "cloud", "rebuild_tiles.py")
+    STACK = os.path.join(HERE, "cloud", "infrastructure", "lib", "data-stack.ts")
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def test_the_lambda_has_no_whole_archive_rebuild(self):
+        # Parsed with ast rather than grepped, so the docstrings that DESCRIBE the removed
+        # path -- and they should, or the next reader re-adds it -- are not evidence of it.
+        tree = ast.parse(self.read(self.HANDLER))
+        names = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        self.assertNotIn("rebuild", names,
+                         "a job whose cost grows with the archive cannot live in a function "
+                         "with a timeout -- it fails by being killed part-way")
+        called = {n.func.attr for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and isinstance(n.func.value, ast.Name) and n.func.value.id == "ingest"}
+        self.assertNotIn("run", called,
+                         "ingest.run() rebuilds EVERYTHING; the Lambda's path is run_for()")
+        self.assertIn("run_for", called, "the bounded path is the one that stays")
+
+    def test_an_old_rebuild_invocation_is_refused_rather_than_ignored(self):
+        # The quiet failure to avoid: an old runbook or a habit sends {"rebuild": ...}, the
+        # branch is gone, no Records are present, and the answer is a cheerful {"objects": 0}
+        # that reads as "there was nothing to do".
+        py = self.read(self.HANDLER)
+        fn = re.search(r"def lambda_handler\(event, context\):(.*?)\n    total = 0", py, re.S)
+        self.assertIsNotNone(fn, "lambda_handler should still be findable")
+        body = fn.group(1)
+        self.assertIn('event.get("rebuild")', body,
+                      "the removed payload must still be recognised, to be refused")
+        self.assertIn("raise ValueError", body)
+        self.assertIn("rebuild_tiles.py", body, "say where the job went")
+
+    def test_the_timeout_is_not_sized_for_a_job_that_left(self):
+        # 900 s was Lambda's ceiling and bought days, not years. With only the bounded path
+        # left, a large timeout is not headroom -- it is an invitation to put the unbounded job
+        # back, and the next reader has no way to tell which one the number was chosen for.
+        ts = self.read(self.STACK)
+        m = re.search(r"timeout: cdk\.Duration\.seconds\((\d+)\)", ts)
+        self.assertIsNotNone(m, "the ingest timeout should be stated in seconds")
+        self.assertLessEqual(int(m.group(1)), 300,
+                             "the only path left is bounded at ~62 s; a bigger ceiling would "
+                             "be sized for the job that moved to a workstation")
+
+    def test_the_local_rebuild_reuses_the_lambda_s_upload(self):
+        # Otherwise there are two implementations of "what an agg object looks like", and the
+        # one that runs rarely is the one that rots: Cache-Control, Content-Encoding on .gz,
+        # and the deliberate refusal to upload index.json directly.
+        py = self.read(self.SCRIPT)
+        self.assertIn("import handler", py)
+        self.assertIn("handler._upload(", py)
+        self.assertIn("handler._rewrite_index()", py)
+        self.assertNotIn("put_object", py,
+                         "uploading is the handler's job, imported rather than restated")
+        self.assertNotIn("ContentEncoding", py)
+
+    def test_the_local_rebuild_does_not_write_the_index_itself(self):
+        # A rebuild sees only the plans it was given, so an index built from those would drop
+        # every other plan -- which happened once, to the recovered 1 Hz series. _rewrite_index()
+        # derives it from S3 instead, and _upload() skips it for exactly this reason.
+        py = self.read(self.SCRIPT)
+        self.assertIn("ingest.INDEX", py,
+                      "the script should be explicit that the index is not its to upload")
+        handler = self.read(self.HANDLER)
+        self.assertIn("if rel == ingest.INDEX:", handler,
+                      "_upload() must keep skipping the index, which is what makes the "
+                      "script's reuse of it safe")
+
+
 class TestSharePostIsSigned(unittest.TestCase):
     """POST /api/share, and the signature without which it is a 403 that logs nothing.
 
