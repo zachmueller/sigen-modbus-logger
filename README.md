@@ -514,6 +514,14 @@ Arrow keys move through history, `+`/`−` zoom, `n` jumps to now. Focus a chart
 the arrows move its crosshair instead. The window is in the URL, so a view can be
 bookmarked or sent to anyone who can reach the viewer.
 
+**Two of these controls exist only here.** The *Updates* group — `Live (10 s)` and `Reload` —
+and `Download CSV` are marked `data-server-only`, and the hosted viewer hides them. It reads
+precomputed tiles that are published when the logger rotates, roughly hourly, and
+`web/tiles.js` caches every object it fetches for the life of the page, so polling there
+cannot return anything new at any interval; `/api/csv` is not a route a tile source has at
+all. `app.js` derives that from the source rather than being told (`POLLS`), so there is
+nothing for a deployment to remember. This viewer is the live one, and it is unchanged.
+
 ### Windows, buckets and stride
 
 The page asks for a *window*; how to build it is `series.py`'s business, and every

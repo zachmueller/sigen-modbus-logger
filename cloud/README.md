@@ -33,11 +33,51 @@ before the script loads. The page here is byte-for-byte the page `serve.py` serv
 | `/agg/*` (tiles) | same gate — a gate on the HTML alone would leave the data open |
 | `POST /api/share` | same gate, **plus** the payload hash below — it mints public copies |
 | `/p/{uid}`, `/share/*` | **public** — a shared view, copied at share time |
-| `/auth/*` | public; `/auth/callback` is what sets the cookie |
+| `/auth/*` | public; `/auth/callback` sets the cookies, `/auth/refresh` renews them |
 | everything else | public: `index.html`, `app.js`, `tiles.js`, `charts.js`, `style.css` |
 
 There is no `/login`. The gate redirects straight to the Cognito Hosted UI, so there is
 nothing for such a path to do.
+
+### The session: 30 days, and one hop a day
+
+Three cookies, all `HttpOnly; Secure; SameSite=Lax`, all set by the callback Lambda:
+
+| Cookie | Path | Holds |
+|---|---|---|
+| `sigen_id` | `/` | the Cognito id token — 24 h, and what the gate actually verifies |
+| `sigen_rt` | **`/auth/`** | the refresh token, i.e. the session. 30 days |
+| `sigen_sess` | `/` | epoch seconds when the id token was last minted. Not a credential |
+
+The refresh token's `Path` is the point: a page makes hundreds of `/agg/*` fetches and this
+long-lived credential rides on none of them — only on the endpoint that spends it. Which is why
+there is a third cookie at all: the gate **cannot see** `sigen_rt`, so `sigen_sess` is how it
+knows a refresh is worth attempting, and its value is the loop-breaker (a refresh from seconds
+ago that still left no usable token cannot help, so the gate goes to Google instead).
+
+So an expired id token is the ordinary once-a-day case, not a failure. A browser gets a 302 to
+`/auth/refresh`, which spends the grant and sends it back — invisible, and the `#h=…&panels=…`
+fragment survives because a browser reapplies it across a redirect whose `Location` carries none.
+Google is reached about once a month, when the refresh token's 30 days are up. It does **not**
+slide: Cognito's refresh grant returns no new refresh token, so the month runs from sign-in.
+
+This replaced a 12-hour cookie wrapped around a **one-hour** id token, with the refresh token
+discarded at the callback — so Google was in practice the session store and signing in was a
+several-times-a-day event. See FINDINGS 33, including why a 30-day credential is affordable
+here: the allowlist is re-checked at the edge on *every request*, so removing an address takes
+effect immediately whatever a token's lifetime says.
+
+**A script gets a status, never a redirect.** `/agg/*` refusals are JSON with `ok: false` and an
+`error`, because a `fetch()` handed a 302 to the Hosted UI follows it cross-origin, fails CORS,
+and arrives in `web/tiles.js` as "cannot reach…" — indistinguishable from a dropped connection.
+The page recovers from a 401 by reloading once, which turns the fetch into the navigation that
+can take the silent refresh hop. It does not recover from a 403: that means the allowlist, and
+signing in again cannot change it.
+
+**Revoking access** is `allowed_emails` plus `cdk deploy SigenAuthEdge && cdk deploy SigenSite`,
+which takes effect on the next request. To kill a *session* — a stolen laptop — delete the user
+from the pool (`aws cognito-idp admin-delete-user`) or rotate the app client, since the cookie
+itself now lasts a month.
 
 **`POST /api/share` bodies are signed at the edge.** The share endpoint is a Lambda function
 URL with `AWS_IAM` auth, reached through Origin Access Control, and a function URL rejects an
@@ -198,6 +238,14 @@ its own error (`Error 403: access_denied`, "has not completed the Google verific
 process"). Publishing avoids maintaining the same addresses twice, and needs no verification
 review: the app requests only `openid email profile`, all non-sensitive.
 
+*Testing* now has a second consequence, and it is the one limit on the 30-day session above:
+**Google expires refresh tokens after 7 days while an app is in Testing.** Cognito's refresh
+grant for a federated user can then answer `invalid_grant`, capping the session at a week
+however long the app client says. It degrades to the old behaviour rather than breaking — the
+refresh endpoint clears the cookies and the next hop is one Google sign-in — but if sessions
+end sooner than a month, look here first, and `refresh-refused` in the callback's log is the
+line that says so.
+
 `SigenAuthPool` and `SigenAuthEdge` refuse to synth with an empty `google_client_id` or an
 empty `allowed_emails`. The second is the one worth stating: Cognito will authenticate *any*
 Google account, so the allowlist is what actually gates the site — empty does not mean
@@ -251,7 +299,11 @@ Cognito is free under 50 monthly active users; ACM certificates are free.
 ## What is deliberately not here
 
 - **No live view.** Tiles appear when the logger rotates, so the hosted page is up to an
-  hour behind and says so. `serve.py` on the LAN is the live one.
+  hour behind and says so. `serve.py` on the LAN is the live one. The page now agrees: the
+  *Updates* group and `Download CSV` are `data-server-only` and hidden here, because a poll
+  cannot return anything new (`web/tiles.js` caches for the life of the page) and `/api/csv`
+  is not a route a tile source has. A browser reload is what picks up a new batch, and the
+  hint on the page says so. See FINDINGS 34.
 - **No field picker below a 15-hour window.** Hour tiles carry the **32** fields the panels,
   energy tiles and live strip draw. **240** — the whole **259**-field catalogue less the 6
   counters, which travel as endpoints, and the duplicate registers — is materialised from

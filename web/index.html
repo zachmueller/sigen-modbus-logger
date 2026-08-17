@@ -33,11 +33,21 @@
 
 <!-- Filters: one row, above everything they scope.
 
+     Two attributes hide a control, for two different reasons, and a control can carry
+     both:
+
      data-live-only marks a control that asks for a window other than the one on
      screen. A shared view is one fixed window, so applyFrozenMode() hides everything
      carrying the attribute rather than leaving dead buttons on the page. The chips
      beside them have no attribute and stay: bucket width and stride are how the
-     numbers were made, and they are as true in a shared view as they are here. -->
+     numbers were made, and they are as true in a shared view as they are here.
+
+     data-server-only marks a control that needs serve.py behind it. The hosted viewer
+     reads precomputed tiles from a CDN, where a poll cannot return anything new -- the
+     archive publishes when the logger rotates, about hourly -- and where /api/csv is
+     not a route at all. app.js hides these when the source is not a server; see POLLS
+     there, and FINDINGS 34. Both hidings are declarative here so that the page and the
+     reason are in the same place. -->
 <div class="filters" id="filters">
   <div class="group" role="group" aria-label="Window length" data-live-only>
     <span class="glabel">Window</span>
@@ -51,7 +61,12 @@
     <label class="stack"><span class="tiny">End of window</span>
       <input type="datetime-local" id="endat" step="1"></label>
   </div>
-  <div class="group" data-live-only>
+  <!-- Both attributes: a frozen share has nothing to update, and a tile source has nothing
+       NEW to update to. Reload goes with the checkbox rather than staying behind, because on
+       a tile source it cannot work either -- tiles.js caches every object it fetches for the
+       life of the page, so re-asking returns the same bytes. A browser reload is the honest
+       way to pick up a new batch, and the hint says so. -->
+  <div class="group" data-live-only data-server-only>
     <span class="glabel">Updates</span>
     <label class="check"><input type="checkbox" id="live" checked> <span>Live (10 s)</span></label>
     <button id="reload" title="Reload now">Reload</button>
@@ -60,7 +75,10 @@
     <span class="chip" id="chip-bucket" hidden></span>
     <span class="chip" id="chip-stride" hidden></span>
     <span class="chip warn" id="chip-warming" hidden></span>
-    <a class="chip link" id="csv" download data-live-only>Download CSV</a>
+    <!-- data-server-only: /api/csv is one of serve.py's routes and a tile source cannot
+         answer it. On the hosted viewer this link resolved to /agg/api/csv?… -- a key that
+         does not exist in the bucket -- so clicking it downloaded a 404. -->
+    <a class="chip link" id="csv" download data-live-only data-server-only>Download CSV</a>
     <!-- Only shown when the page is reached through an SSH tunnel, i.e. on
          localhost. It hands off to the Stop app via a URL scheme, because the
          tunnel lives on THIS machine and the server does not. -->

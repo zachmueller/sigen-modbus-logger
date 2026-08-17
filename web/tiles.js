@@ -54,6 +54,27 @@ const Tiles = (() => {
       cache.set(url, null);
       return null;
     }
+    // A lapsed session, and the ONE failure here that the page can do something about: the
+    // read gate refused this because the id token expired while the page sat open. It is
+    // flagged rather than thrown flat because app.js recovers from it by reloading -- the gate
+    // answers a NAVIGATION with a silent hop through /auth/refresh, which it has no way to do
+    // for a fetch. See recoverSession() there.
+    //
+    // 401 and only 401. A 403 from the gate means "not on the allowlist", where signing in
+    // again cannot help and a reload would loop forever, so it falls through to the throw
+    // below and is reported like any other refusal.
+    //
+    // This is also why the gate answers /agg/* with a status at all: it used to redirect, and
+    // a fetch following a 302 to the Cognito Hosted UI fails CORS, so an expired session
+    // arrived here as "cannot reach" -- the same words as a dropped connection.
+    if (r.status === 401) {
+      let body = null;
+      try { body = await r.json(); } catch (e) { /* the status is the answer */ }
+      const err = new Error((body && body.error) || 'your session has expired');
+      err.unauthorized = true;
+      err.login = (body && body.login) || null;
+      throw err;
+    }
     if (!r.ok) throw new Error(url + ': ' + r.status + ' ' + r.statusText);
     // The tiles are stored gzipped with Content-Encoding: gzip, so the browser has
     // already inflated the body by the time we see it. Nothing to decompress here.

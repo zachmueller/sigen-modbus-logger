@@ -1290,6 +1290,402 @@ class TestShareHandlerErrors(unittest.TestCase):
                                             "failure this endpoint has already had once")
 
 
+class TestTheSessionOutlivesTheIdToken(unittest.TestCase):
+    """Thirty days of being signed in, and the four files that have to agree about it.
+
+    The viewer used to ask for a Google sign-in several times a day. The id token in the
+    session cookie was Cognito's default -- **one hour** -- and `auth-callback` kept only that
+    token, discarding the `refresh_token` the exchange had already handed it. So the gate
+    refused the cookie every hour and sent the browser back through Google, which made Google
+    this site's session store and every hop subject to its account chooser. See FINDINGS 33.
+
+    Now the refresh token IS the session: 30 days, spent at `/auth/refresh` by the same Lambda
+    that runs the callback, and the browser is sent there instead of to Google.
+
+    Source-level assertions because there is no JS harness here -- see `TestSharePostIsSigned`
+    -- and for the same reason as there: every one of these bugs lives in the AGREEMENT between
+    files. `auth-stack.ts` names the cookies, the callback sets them, the gate reads them, and
+    any one of the three disagreeing is a site that signs you in and then does not know you.
+    """
+
+    STACK = os.path.join(HERE, "cloud", "infrastructure", "lib", "auth-stack.ts")
+    CALLBACK = os.path.join(HERE, "cloud", "lambda", "auth-callback", "index.js")
+    EDGE = os.path.join(HERE, "cloud", "lambda", "auth-edge", "index.js")
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def fn(self, path, signature):
+        """One function's body, comments stripped -- the shape these tests assert on."""
+        code = self.read(path)
+        m = re.search(r"function " + re.escape(signature) + r"\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(m, f"{os.path.basename(path)} should define {signature}")
+        body = "\n".join(re.sub(r"//.*$", "", line) for line in m.group(1).split("\n"))
+        return re.sub(r"\s+", " ", body)
+
+    def test_both_token_lifetimes_are_stated_not_defaulted(self):
+        # THE bug. Cognito issues an id token valid for one hour unless the app client says
+        # otherwise, and nothing said otherwise -- so the gate was correct to refuse it and the
+        # refusal was the whole problem. 24 h is Cognito's maximum, and the refresh token is
+        # what carries the month.
+        ts = self.read(self.STACK)
+        self.assertRegex(ts, r"idTokenValidity: cdk\.Duration\.hours\(24\)",
+                         "an id token left to its default lasts an hour, and every hour was a "
+                         "trip through Google")
+        self.assertRegex(ts, r"refreshTokenValidity: cdk\.Duration\.seconds\(SESSION_MAX_AGE_S\)",
+                         "the session length must come from the same constant the COOKIE does, "
+                         "or a cookie outlives the token it carries")
+        self.assertRegex(ts, r"SESSION_MAX_AGE_S = 30 \* 24 \* 3600",
+                         "thirty days, written as days")
+
+    def test_the_refresh_grant_is_explicitly_permitted(self):
+        # Measured against the deployed client before this change: ExplicitAuthFlows was null,
+        # which means Cognito's legacy defaults. Those do include refresh-token auth, so the
+        # grant probably worked already -- and "probably" is not good enough for the one
+        # mechanism a 30-day session rests on.
+        #
+        # `{ userSrp: false }` is not a mistake, and that is why this test pins the shape: CDK
+        # emits ExplicitAuthFlows only for a NON-EMPTY authFlows object, appending
+        # ALLOW_REFRESH_TOKEN_AUTH itself, and treats `{}` as unspecified. So one flag set to
+        # false is how you ask for exactly the refresh flow -- and it narrows a Google-only
+        # client to the one flow it uses. Synthesizes to ['ALLOW_REFRESH_TOKEN_AUTH'].
+        ts = self.read(self.STACK)
+        self.assertRegex(ts, r"authFlows: \{ userSrp: false \}",
+                         "an empty object emits no ExplicitAuthFlows at all, which is how this "
+                         "was left to Cognito's defaults in the first place")
+
+    def test_a_refusal_says_which_refusal_it_was(self):
+        # Both of these are a bare 400 from Cognito, and they want opposite responses:
+        # `invalid_grant` is a session that legitimately ended, `invalid_client` means this
+        # function's own credential is broken and EVERY refresh will fail the same way. Logging
+        # the status alone makes an outage indistinguishable from routine. FINDINGS 32 is the
+        # same confusion from the other direction.
+        js = self.read(self.CALLBACK)
+        self.assertRegex(js, r"log\('refresh-refused', res\.status \+ ' ' \+ oauthError",
+                         "name the OAuth error, not just the status")
+        self.assertRegex(js, r"log\('exchange-refused', res\.status \+ ' ' \+ oauthError",
+                         "the code exchange has the same two failure modes")
+        body = self.fn(self.CALLBACK, "oauthError(body)")
+        self.assertRegex(body, r"\[a-z_\]\{1,40\}",
+                         "guarded to the RFC 6749 shape: nothing in a response body should be "
+                         "able to decide what lands in CloudWatch")
+
+    def test_the_cookie_names_are_decided_in_one_place(self):
+        # The callback SETS them and the gate READS them, from separate deployment artefacts:
+        # one takes environment variables, the other has a module generated into it at synth.
+        # A name typed twice is a name that can drift, and the symptom of drift is a site that
+        # authenticates you and then behaves as though you had never arrived.
+        ts = self.read(self.STACK)
+        cookies = re.search(r"const COOKIES = \{(.*?)\};", ts, re.S)
+        self.assertIsNotNone(cookies, "auth-stack.ts should name the cookies once")
+        for key in ("id:", "refresh:", "session:"):
+            self.assertIn(key, cookies.group(1))
+        self.assertRegex(ts, r"cookies: COOKIES",
+                         "the edge function's generated config must be given the same object")
+        for env, field in (("COOKIE_NAME", "COOKIES.id"),
+                           ("REFRESH_COOKIE_NAME", "COOKIES.refresh"),
+                           ("SESSION_COOKIE_NAME", "COOKIES.session")):
+            self.assertRegex(ts, rf"{env}: {re.escape(field)}",
+                             f"the callback must be told {env} from the same list")
+        edge = self.read(self.EDGE)
+        self.assertRegex(edge, r"const COOKIE = cfg\.cookies\.id;",
+                         "the gate must read the name rather than repeat the literal")
+        self.assertNotIn("'sigen_id'", edge,
+                         "a second copy of a cookie name is the drift this prevents")
+
+    def test_the_callback_keeps_the_refresh_token_it_used_to_discard(self):
+        js = self.read(self.CALLBACK)
+        self.assertIn("tokens.refresh_token", js,
+                      "the exchange has always returned it; keeping it is the whole fix")
+        self.assertRegex(js, r"grant_type: 'refresh_token'",
+                         "and something has to spend it")
+        self.assertRegex(js, r"MAX_AGE = process\.env\.COOKIE_MAX_AGE \|\| String\(30 \* 24 \* 3600\)",
+                         "the fallback was 3600 -- an hour, which is what this change is about")
+        attrs = self.fn(self.CALLBACK, "cookie(name, value, path, maxAge)")
+        for attr in ("HttpOnly", "Secure", "SameSite=Lax"):
+            self.assertIn(attr, attrs, f"every cookie here needs {attr}")
+
+    def test_the_refresh_token_is_never_sent_to_a_telemetry_path(self):
+        # The security property that makes a 30-day credential defensible. A page makes
+        # hundreds of /agg/* fetches; the refresh token rides on none of them, because its Path
+        # is /auth/ and that is the only place that spends it. The id token, which expires in a
+        # day and is verified on arrival, is the one that travels.
+        body = self.fn(self.CALLBACK, "sessionCookies(idToken, refreshToken)")
+        self.assertRegex(body, r"cookie\(REFRESH_COOKIE, refreshToken, '/auth/'",
+                         "the refresh token must be scoped to the endpoint that spends it")
+        self.assertRegex(body, r"cookie\(ID_COOKIE, idToken, '/'",
+                         "the id token is the one the gate needs on every path")
+        # Cognito's refresh grant returns no new refresh token. Re-setting the cookie anyway
+        # would extend, in the browser, a session Cognito is going to retire on schedule.
+        self.assertRegex(body, r"if \(refreshToken\)",
+                         "a refresh must leave the existing refresh cookie exactly as it is")
+
+    def test_a_cleared_cookie_is_cleared_at_the_path_it_was_set_with(self):
+        # Path is part of a cookie's identity. A Max-Age=0 at the wrong path leaves the
+        # original in place, and the next request behaves as though nothing was cleared --
+        # which here means the gate keeps sending the browser to a refresh that keeps failing.
+        body = self.fn(self.CALLBACK, "clearedCookies()")
+        self.assertRegex(body, r"cookie\(REFRESH_COOKIE, '', '/auth/', 0\)")
+        self.assertRegex(body, r"cookie\(ID_COOKIE, '', '/', 0\)")
+        self.assertRegex(body, r"cookie\(SESSION_COOKIE, '', '/', 0\)")
+
+    def test_neither_auth_endpoint_can_redirect_to_itself(self):
+        # `state` and `next` both come back from the outside world. The open-redirect check was
+        # already here; /auth/ is excluded for a second reason, which is termination -- sending
+        # the end of a sign-in, or of a refresh, back to an auth endpoint is a redirect that
+        # arrives where it started, and a browser will follow it as often as it is offered.
+        # The raw source for the first one: "//" is a comment to the stripper the other tests
+        # use, and here it is the assertion.
+        self.assertIn("!p.startsWith('//')", self.read(self.CALLBACK),
+                      "the open-redirect check stays -- //evil.example is a protocol-relative "
+                      "URL a browser follows off-site")
+        body = self.fn(self.CALLBACK, "safePath(state)")
+        self.assertIn("/auth", body, "and a destination under /auth/ must be refused")
+        self.assertRegex(self.read(self.CALLBACK), r"safePath\(q\.next\)",
+                         "the refresh route's destination goes through the same check")
+
+    def test_a_refresh_that_did_not_help_is_not_attempted_again(self):
+        # The loop this prevents is in a browser, not a log: /view sends them to /auth/refresh,
+        # which sends them back to /view, which sends them to /auth/refresh. The marker cookie's
+        # VALUE is the breaker -- it says when the id token was last minted, so a gate that
+        # still has no usable token seconds later knows refreshing is not the answer and goes
+        # to Google instead.
+        edge = self.read(self.EDGE)
+        self.assertRegex(edge, r"REFRESH_SETTLE_S = \d+",
+                         "the settle window has to be a named number")
+        body = self.fn(self.EDGE, "notSignedIn(request, minted, decision, apiMessage, detail)")
+        self.assertRegex(body, r"minted && age >= REFRESH_SETTLE_S",
+                         "refresh only if the last one is old enough to have been a different "
+                         "attempt -- and `age >= 0` is what makes a future timestamp fall "
+                         "through to a real sign-in rather than be trusted")
+        self.assertIn("refreshRedirect(request)", body)
+        self.assertIn("loginRedirect(request)", body,
+                      "and Google is still the answer when there is nothing to refresh")
+        # The other half of termination: the endpoint clears the marker when it cannot help.
+        callback = self.read(self.CALLBACK)
+        self.assertRegex(callback, r"if \(!token\)[\s\S]{0,300}clearedCookies\(\)",
+                         "no refresh cookie means clear the marker, or the gate keeps sending "
+                         "people to an endpoint that can only shrug")
+        self.assertRegex(callback, r"res\.status >= 500[\s\S]{0,200}restamp\(\)",
+                         "a transient failure must keep the refresh token and move the marker: "
+                         "clearing it would throw a good month-long session away because "
+                         "Cognito was briefly unreachable")
+
+    def test_the_gate_answers_a_script_with_a_status_not_a_redirect(self):
+        # A fetch cannot follow a redirect usefully: it chases the 302 to the Cognito Hosted UI
+        # cross-origin, fails CORS, and arrives in web/tiles.js as "cannot reach …: Failed to
+        # fetch" -- the same words a dropped connection produces. So an expired session was
+        # indistinguishable from an outage on the one path the page uses for everything, and
+        # the page could neither report it nor recover from it.
+        edge = self.read(self.EDGE)
+        body = self.fn(self.EDGE, "isFetched(uri)")
+        self.assertIn("isApi(uri)", body)
+        self.assertIn("'/agg/'", body, "the telemetry the page fetches is the case that matters")
+        # isApi() must stay exactly what it was: it also guards signPayload(), which is about
+        # request bodies, and /agg/* has none.
+        self.assertRegex(self.fn(self.EDGE, "isApi(uri)"), r"'/api/'")
+        self.assertNotIn("agg", self.fn(self.EDGE, "isApi(uri)"),
+                         "widening isApi() would sign a body /agg/* does not have")
+        for branch in ("no-cookie", "verify-failed"):
+            self.assertRegex(edge, rf"notSignedIn\(request, minted, '{branch}'",
+                             f"the {branch} branch must go through the one place that decides")
+        self.assertRegex(edge, r"isFetched\(request\.uri\)\s*\n?\s*\? forbiddenJson",
+                         "a 403 must reach a tile fetch as JSON too, or the page can only "
+                         "report the status code")
+
+    def test_the_authorize_url_is_built_in_exactly_one_place(self):
+        # The refresh endpoint could have redirected to Google itself when it had nothing to
+        # spend. It clears the marker and hands the browser back instead, precisely so that
+        # the one construction of the Cognito authorize URL -- client id, scopes, the
+        # identity_provider that skips the "choose a provider" page -- stays in the gate.
+        hits = []
+        for root, dirs, files in os.walk(HERE):
+            # `tests` too: this file names the string in order to look for it, which is not a
+            # second place a sign-in is built.
+            dirs[:] = [d for d in dirs
+                       if d not in ("node_modules", "cdk.out", ".git", "__pycache__", "tests")]
+            for name in files:
+                if not name.endswith((".js", ".ts", ".py")):
+                    continue
+                path = os.path.join(root, name)
+                with open(path, errors="ignore") as fh:
+                    if "oauth2/authorize" in fh.read():
+                        hits.append(os.path.relpath(path, HERE))
+        self.assertEqual(hits, [os.path.join("cloud", "lambda", "auth-edge", "index.js")],
+                         "one place decides how a sign-in starts")
+
+    def test_the_refresh_route_exists_and_only_it_and_the_callback_may_invoke(self):
+        ts = self.read(self.STACK)
+        self.assertIn("'GET /auth/refresh'", ts, "the route has to be on the HTTP API")
+        self.assertIn("'GET /auth/callback'", ts)
+        # One permission per route rather than a wildcard over /auth/*: what may invoke a
+        # function holding the client secret is a boundary, and a boundary is worth writing out.
+        perms = re.findall(r"addPermission\('(\w+)'[\s\S]*?auth/(\w+)`", ts)
+        self.assertEqual(sorted(p[1] for p in perms), ["callback", "refresh"])
+        self.assertNotRegex(ts, r"execute-api[^`]*auth/\*",
+                            "a wildcard would grant a third route in advance")
+
+
+class TestTheHostedViewerDoesNotPoll(unittest.TestCase):
+    """"Live (10 s)" on a source that publishes hourly, and why it is gone from the cloud page.
+
+    It was worse than wasteful. `web/tiles.js` caches every object it fetches in a Map with no
+    expiry, so a poll re-rendered bytes the page already held -- it could not return new data
+    at any interval. The only request it did make was one tile at each UTC hour boundary, and
+    that tile is normally not published yet, so the 404 was cached as "no data here" for the
+    life of the page.
+
+    `cloud/README.md` has always said so: *"No live view. Tiles appear when the logger
+    rotates… serve.py on the LAN is the live one."* The page was contradicting it with a box
+    that was checked by default. See FINDINGS 34.
+
+    The functionality is kept, not deleted: serve.py decodes on demand and polling it is
+    exactly right. Which is what the last test here is for.
+    """
+
+    APP = os.path.join(HERE, "web", "app.js")
+    PAGE = os.path.join(HERE, "web", "index.html")
+    TILES = os.path.join(HERE, "web", "tiles.js")
+
+    def code(self, path):
+        with open(path) as fh:
+            return "\n".join(re.sub(r"//.*$", "", line) for line in fh.read().split("\n"))
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def test_whether_polling_pays_is_derived_from_the_source(self):
+        # Not a flag in SIGEN_SOURCE. A tile source cannot answer a poll usefully by
+        # construction -- that is a property of tiles and of the cache in front of them, not a
+        # deployment choice -- so there is nothing for site-stack.ts to remember and nothing to
+        # forget when a third entry point is added.
+        code = self.code(self.APP)
+        self.assertRegex(code, r"const POLLS = SRC\.kind === 'server';",
+                         "one derivation, next to FROZEN, from the source itself")
+
+    def test_the_poll_is_started_in_one_place_and_that_place_checks(self):
+        body = re.search(r"function schedule\(\)\s*\{(.*?)\n\}", self.code(self.APP), re.S)
+        self.assertIsNotNone(body)
+        line = re.sub(r"\s+", " ", body.group(1))
+        self.assertIn("setInterval", line, "this is still the only timer")
+        self.assertRegex(line, r"if \(POLLS && state\.live && !FROZEN\)",
+                         "schedule() is the choke point, so the rule is enforced here")
+
+    def test_asking_to_go_live_cannot_start_a_poll_that_cannot_help(self):
+        # The clamp matters more than the hidden checkbox. `Now`, the `n` key and panning past
+        # the newest record all call setLive(true), and all of them still work on a tile
+        # source -- so without this, jumping to the present would start a 10-second timer that
+        # no visible control admits to and none can stop.
+        body = re.sub(r"\s+", " ",
+                      re.search(r"function setLive\(on\)\s*\{(.*?)\n\}",
+                                self.code(self.APP), re.S).group(1))
+        self.assertRegex(body, r"state\.live = on && POLLS;")
+        code = self.code(self.APP)
+        self.assertRegex(code, r"if \(q\.has\('live'\) && POLLS\)",
+                         "a hash is a bookmark and outlives a deployment: a URL saved from the "
+                         "local viewer must not switch polling on against the hosted one")
+
+    def test_the_controls_a_tile_source_cannot_honour_are_hidden(self):
+        html = self.read(self.PAGE)
+        updates = re.search(r'<div class="group"[^>]*>\s*<span class="glabel">Updates</span>',
+                            html)
+        self.assertIsNotNone(updates, "the Updates group should still be in the one page")
+        self.assertIn("data-server-only", updates.group(0),
+                      "the checkbox and Reload go together: on a tile source Reload cannot "
+                      "work either, because the tile cache has no expiry")
+        csv = re.search(r'<a class="chip link" id="csv"[^>]*>', html)
+        self.assertIsNotNone(csv)
+        self.assertIn("data-server-only", csv.group(0),
+                      "/api/csv is one of serve.py's routes; on the hosted viewer this link "
+                      "resolved to /agg/api/csv, which downloads a 404")
+        self.assertRegex(self.code(self.APP), r"querySelectorAll\('\[data-server-only\]'\)",
+                         "and app.js has to act on the attribute")
+        self.assertRegex(self.code(self.APP), r"if \(POLLS\) \$\('csv'\)\.href",
+                         "nor should the href be built where the route does not exist")
+
+    def test_the_dead_controls_go_before_anything_is_fetched(self):
+        # Found in a browser, not by reading: a lapsed session aborts boot() at its very first
+        # fetch, and while the hiding lived in wireControls() -- which runs after that fetch --
+        # the failed page sat there showing a `Download CSV` link that resolves to a missing key.
+        #
+        # Which controls a source can honour is a fact about SRC and needs no data to decide, so
+        # it is applied first. wireControls() is the obvious home and the wrong one.
+        code = self.code(self.APP)
+        boot = re.search(r"async function boot\(\)\s*\{(.*?)\n\}", code, re.S).group(1)
+        self.assertRegex(boot, r"if \(!POLLS\) applyServerOnlyMode\(\);",
+                         "boot() should apply it up front")
+        self.assertLess(boot.index("applyServerOnlyMode"), boot.index("getJSON('/api/meta')"),
+                        "before the first fetch, or a page that cannot load keeps the controls")
+        wire = re.search(r"function wireControls\(\)\s*\{(.*?)\n\}", code, re.S).group(1)
+        self.assertNotIn("data-server-only", wire,
+                         "wireControls() runs after the first fetch; that was the bug")
+
+    def test_the_page_says_how_to_pick_up_a_new_batch(self):
+        # With Reload gone there is no control that asks for newer data, and a browser reload
+        # genuinely is the only thing that works -- the tile cache is per page load. A viewer
+        # that quietly stops being current without saying how to refresh it is the failure this
+        # avoids.
+        code = self.code(self.APP)
+        hint = re.search(r"\$\('hint'\)\.appendChild\((.*?)\);", code, re.S)
+        self.assertIsNotNone(hint, "the non-polling page should extend the hint")
+        said = re.sub(r"\s+", " ", hint.group(1))
+        self.assertIn("reload", said.lower())
+        self.assertRegex(said, r"hour|batch", "and say why: it publishes in batches, hourly")
+        # appendChild, never `textContent +=`. That is a read-modify-write over the whole
+        # element, and this hint has three <kbd> children -- they come back as plain text and
+        # the keyboard hints quietly lose their styling. Caught in a browser.
+        self.assertNotRegex(code, r"\$\('hint'\)\.textContent \+=",
+                            "appending to textContent flattens the <kbd> children")
+
+    def test_the_local_viewer_still_polls(self):
+        # The functionality is scoped, not removed. serve.py decodes the archive on demand, so
+        # a poll there returns a genuinely newer record -- and this is the assertion that fails
+        # if a later change turns "disabled on the cloud page" into "deleted".
+        html = self.read(self.PAGE)
+        box = re.search(r'<input type="checkbox" id="live"[^>]*>', html)
+        self.assertIsNotNone(box, "the checkbox stays in the page serve.py serves")
+        self.assertIn("checked", box.group(0),
+                      "and stays checked: for a server source, live is the right default")
+        # The header comment MENTIONS window.SIGEN_SOURCE, which is how a reader learns the
+        # arrangement; what must not be here is an assignment. site-stack.ts injects one for
+        # each hosted entry point, and serve.py serves this file with none -- which is what
+        # makes POLLS true on the capture host without anything having to say so.
+        self.assertNotRegex(html, r"window\.SIGEN_SOURCE\s*=",
+                            "the page must not name a source itself")
+        code = self.code(self.APP)
+        self.assertRegex(code, r"live: POLLS,", "and the initial state follows the source")
+        self.assertIn("setInterval(() => refresh(true), 10000)", code,
+                      "the 10-second poll itself is untouched")
+
+    def test_only_a_401_makes_the_page_reload_itself(self):
+        # A 403 from the gate means "not on the allowlist". Signing in again cannot change it,
+        # so a page that reloaded on 403 would loop forever in front of someone it will never
+        # admit. A 401 is the recoverable one: the id token expired under an open page, and a
+        # NAVIGATION gets the silent hop through /auth/refresh that a fetch cannot.
+        tiles = self.code(self.TILES)
+        self.assertRegex(tiles, r"if \(r\.status === 401\)",
+                         "tiles.js has to tell a lapsed session from any other refusal")
+        self.assertRegex(tiles, r"err\.unauthorized = true;")
+        self.assertNotRegex(tiles, r"status === 403", "403 falls through to the plain throw")
+        app = self.code(self.APP)
+        self.assertRegex(app, r"if \(e && e\.unauthorized\) return recoverSession\(e\)",
+                         "and app.js has to act on the flag rather than print it")
+        body = re.sub(r"\s+", " ",
+                      re.search(r"function recoverSession\(err\)\s*\{(.*?)\n\}", app, re.S)
+                      .group(1))
+        self.assertIn("sessionStorage", body,
+                      "the one-shot guard has to survive the reload it is guarding")
+        self.assertIn("location.reload()", body)
+        self.assertIn("sign in again", body,
+                      "the second refusal inside the window offers the link instead of "
+                      "reloading again, because that would be a loop")
+        self.assertRegex(app, r"function sessionHeld\(\)",
+                         "and a fetch that succeeds must clear the breadcrumb, or one "
+                         "recovery suppresses the next one a day later")
+
+
 # --------------------------------------------------------------------- ingest
 
 class TestIngest(ViewerFixture):

@@ -10,6 +10,50 @@ import {
 const LAMBDA_DIR = path.resolve(__dirname, '../../lambda');
 
 /**
+ * The three cookies a session is made of, named ONCE for the two things that must agree.
+ *
+ * The callback Lambda SETS them and the edge gate READS them, and they are separate
+ * deployment artefacts -- one takes environment variables, the other has them baked into a
+ * generated module. So a name typed twice is a name that can drift, and the symptom of the
+ * drift is a site that signs you in and then behaves as though you had never arrived.
+ *
+ *   id       the Cognito id token. What the gate verifies; short-lived by Cognito's rules.
+ *   refresh  the Cognito refresh token, and the actual session. Path=/auth/ -- see below.
+ *   session  epoch seconds when the id token was last minted. NOT a credential.
+ *
+ * `session` exists because the gate cannot see `refresh`, deliberately: the refresh token is
+ * scoped to Path=/auth/ so it never rides along on /view or the /agg/* telemetry fetches that
+ * make up almost every request. The gate therefore needs some other way to know a refresh is
+ * worth attempting, and its value doubles as the loop-breaker -- a refresh that just happened
+ * and did not produce a usable token must not be attempted again. Both clocks in that
+ * comparison are AWS-side.
+ */
+const COOKIES = {
+	id: 'sigen_id',
+	refresh: 'sigen_rt',
+	session: 'sigen_sess',
+};
+
+/**
+ * Thirty days, and what that gave up.
+ *
+ * This was twelve hours, with the reasoning "long enough not to interrupt an afternoon of
+ * looking at charts, short enough that a laptop left somewhere stops working today". But the
+ * id token inside expired in an HOUR -- Cognito's default -- and nothing here kept the refresh
+ * token, so the gate sent people back through Google every hour and Google was in practice
+ * this site's session store. Several re-authentications a day, each one at the mercy of
+ * Google's account chooser.
+ *
+ * What makes a month defensible is not the cookie: it is that the ALLOWLIST IS RE-CHECKED AT
+ * THE EDGE ON EVERY REQUEST. Removing an address takes effect on the next tile fetch no matter
+ * what any token's lifetime says, so the long-lived credential does not extend anyone's
+ * access -- it only saves them a redirect. What is genuinely given up is the stolen-laptop
+ * case, which is now revoked by deleting the user from the pool or rotating the app client
+ * rather than by waiting until this evening.
+ */
+const SESSION_MAX_AGE_S = 30 * 24 * 3600;
+
+/**
  * Google sign-in, in two stacks, and the reason it is two.
  *
  * A viewer-request Lambda@Edge cannot have environment variables -- AWS forbids them --
@@ -97,6 +141,38 @@ export class AuthPoolStack extends cdk.Stack {
 				callbackUrls: [callbackUrl],
 				logoutUrls: [`https://${cfg.domain}/`],
 			},
+			// ALLOW_REFRESH_TOKEN_AUTH, and nothing else -- which is what this odd-looking
+			// literal spells. CDK emits ExplicitAuthFlows only when `authFlows` is a NON-EMPTY
+			// object, and then always appends ALLOW_REFRESH_TOKEN_AUTH itself; `{}` is treated
+			// as "unspecified" and emits nothing. So one flag set to false is how you ask for
+			// exactly the refresh flow. (aws-cdk-lib 2.265.0, configureAuthFlows().)
+			//
+			// Left unspecified, the deployed client reported ExplicitAuthFlows: null and got
+			// Cognito's legacy defaults -- which do include refresh-token auth, so this
+			// probably worked already. "Probably" is not good enough for the one mechanism the
+			// whole 30-day session rests on, and being explicit also narrows the client to what
+			// it actually uses: nothing here ever signs in with a password or SRP, since Google
+			// is the only provider and self-signup is off.
+			//
+			// This does NOT touch the hosted UI's code exchange, which is governed by
+			// allowedOAuthFlows above -- a separate property, and a separate mechanism.
+			authFlows: { userSrp: false },
+			// Both explicit, because the DEFAULT is what made signing in a daily chore:
+			// Cognito issues an id token good for one hour unless told otherwise, and the
+			// gate has no choice but to refuse it after that.
+			//
+			// 24 h is Cognito's maximum for an id token. It is not the security boundary
+			// here -- the allowlist is, and it is re-read on every request -- so the only
+			// question it settles is how often a browser takes the silent /auth/refresh
+			// hop, and the answer is once a day.
+			idTokenValidity: cdk.Duration.hours(24),
+			// The actual session length. Stated rather than left to the default, which
+			// happens to be 30 days today: a value this change depends on should not be
+			// one a future Cognito release could quietly alter.
+			//
+			// It does NOT slide. Cognito's refresh grant returns no new refresh token, so
+			// the month runs from sign-in and a browser goes through Google once a month.
+			refreshTokenValidity: cdk.Duration.seconds(SESSION_MAX_AGE_S),
 		});
 		client.node.addDependency(google);
 
@@ -117,18 +193,22 @@ export class AuthPoolStack extends cdk.Stack {
 				// Explicit rather than derived from the Host header, so it cannot drift
 				// from the URI registered on the app client.
 				REDIRECT_URI: callbackUrl,
-				COOKIE_NAME: 'sigen_id',
-				// Twelve hours: long enough not to interrupt an afternoon of looking at
-				// charts, short enough that a laptop left somewhere stops working today.
-				// The id token inside expires in an hour, so the edge function sends them
-				// back through Google after that -- silent while their Google session holds.
-				COOKIE_MAX_AGE: '43200',
+				// All three from COOKIES above, which the edge gate is given the same way.
+				// Two artefacts, one list of names.
+				COOKIE_NAME: COOKIES.id,
+				REFRESH_COOKIE_NAME: COOKIES.refresh,
+				SESSION_COOKIE_NAME: COOKIES.session,
+				// Thirty days; see SESSION_MAX_AGE_S for what that traded away. The refresh
+				// token's own validity is set on the app client above, and this is the cookie
+				// that carries it -- a cookie outliving the token would leave the gate
+				// attempting a refresh that can only fail, which costs a redirect.
+				COOKIE_MAX_AGE: String(SESSION_MAX_AGE_S),
 			},
 			logGroup: new cdk.aws_logs.LogGroup(this, 'CallbackLogs', {
 				retention: cdk.aws_logs.RetentionDays.ONE_MONTH,
 				removalPolicy: cdk.RemovalPolicy.DESTROY,
 			}),
-			description: 'OAuth code -> id token -> first-party session cookie.',
+			description: 'OAuth code -> id token -> cookie, and the refresh that renews it.',
 		});
 
 		const api = new cdk.aws_apigatewayv2.CfnApi(this, 'AuthApi', {
@@ -139,16 +219,33 @@ export class AuthPoolStack extends cdk.Stack {
 			integrationUri: callbackFn.functionArn,
 			integrationMethod: 'POST', payloadFormatVersion: '2.0',
 		});
-		new cdk.aws_apigatewayv2.CfnRoute(this, 'AuthRoute', {
-			apiId: api.ref, routeKey: 'GET /auth/callback',
-			target: cdk.Fn.join('', ['integrations/', integration.ref]),
-		});
+		// Two routes, one integration, one function. /auth/refresh needs exactly what
+		// /auth/callback needs -- the client secret, the token endpoint and the cookie names --
+		// and it spends a refresh token through the same POST to /oauth2/token, so a second
+		// Lambda would be a second copy of all of it.
+		for (const [name, routeKey] of [
+			['AuthRoute', 'GET /auth/callback'],
+			['AuthRefreshRoute', 'GET /auth/refresh'],
+		] as const) {
+			new cdk.aws_apigatewayv2.CfnRoute(this, name, {
+				apiId: api.ref, routeKey: routeKey,
+				target: cdk.Fn.join('', ['integrations/', integration.ref]),
+			});
+		}
 		new cdk.aws_apigatewayv2.CfnStage(this, 'AuthStage', {
 			apiId: api.ref, stageName: '$default', autoDeploy: true,
 		});
+		// One permission per route, named, rather than one wildcard over /auth/*. What may
+		// invoke a function holding the client secret is a security boundary, and a boundary
+		// is worth writing out: adding a third route should be a deliberate line here, not
+		// something a wildcard grants in advance.
 		callbackFn.addPermission('ApiInvoke', {
 			principal: new cdk.aws_iam.ServicePrincipal('apigateway.amazonaws.com'),
 			sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${api.ref}/*/*/auth/callback`,
+		});
+		callbackFn.addPermission('ApiInvokeRefresh', {
+			principal: new cdk.aws_iam.ServicePrincipal('apigateway.amazonaws.com'),
+			sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${api.ref}/*/*/auth/refresh`,
 		});
 		this.callbackApiDomain = `${api.ref}.execute-api.${this.region}.amazonaws.com`;
 
@@ -203,6 +300,10 @@ export class AuthEdgeStack extends cdk.Stack {
 			jwksUri: issuer + '/.well-known/jwks.json',
 			hostedUiDomain: hostedUiDomain(cfg),
 			allowedEmails: cfg.allowedEmails,
+			// The same object the callback Lambda is given as environment variables, so the
+			// function that READS the cookies and the function that SETS them cannot disagree
+			// about what they are called. See COOKIES at the top of this file.
+			cookies: COOKIES,
 		};
 
 		const code = cdk.aws_lambda.Code.fromAsset(path.join(LAMBDA_DIR, 'auth-edge'), {

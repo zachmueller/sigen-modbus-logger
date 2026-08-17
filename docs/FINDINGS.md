@@ -960,6 +960,86 @@ FINDINGS 30, where the clock was evidence about the clock.**
 
 ---
 
+## Two controls the cloud viewer could not honour
+
+Both were found by asking why the hosted page behaves worse than the local one. Neither is a
+bug in anything that was measured; both are a control whose *precondition* was never true, and
+in both cases the repository's own documentation already said so.
+
+### 33. The id token was the session, so Google was the session store
+
+The hosted viewer asked for a Google sign-in several times a day. Three facts, none of which is
+wrong on its own:
+
+- `auth-callback` read `id_token` out of the token exchange and discarded the rest of the
+  response. The `refresh_token` was in it the whole time.
+- The Cognito app client set no `idTokenValidity`, so Cognito issued one valid for **one hour**
+  — its default. `describe-user-pool-client` reported `IdTokenValidity: null`.
+- The session cookie's `Max-Age` was 12 hours, with a comment explaining that as "long enough
+  not to interrupt an afternoon of looking at charts".
+
+The cookie was therefore never the thing that expired. The gate refused the token inside it
+every hour and redirected to Cognito, which redirected to Google — and *that* was the session:
+whether the hop was silent depended on Google's account chooser, on the consent screen's
+publishing status, and on whatever else the browser had signed into. The 12-hour comment
+described a property the code did not have, which is why nobody looked at the hour.
+
+What makes it hard to see from the outside is that the mechanism was *working*. Every hop
+succeeded. The gate logged `allow` afterwards, the callback Lambda logged no errors, and a
+CloudWatch reader would find nothing at all wrong. It is the same blind spot as FINDINGS 32,
+where `allow` decisions rode an existing cookie and never touched Google: **a log of successes
+cannot show you how often success was needed.**
+
+The fix is the token that was being thrown away, held in a cookie scoped to `Path=/auth/` so it
+never rides along on the hundreds of `/agg/*` fetches a page makes, and spent at a new
+`/auth/refresh` route on the same Lambda. Google is now touched about once a month.
+
+Two things fell out of it that are worth keeping apart from the fix:
+
+- **A long-lived credential is not the same as a long-lived permission.** A 30-day session gives
+  up the stolen-laptop case, and the reason that is affordable is that the allowlist is
+  re-checked *at the edge on every single request*. Removing an address takes effect on the next
+  tile fetch whatever any token's lifetime says. The cookie buys a redirect, not access.
+- **`ExplicitAuthFlows: null` is not "the defaults are fine", it is "nobody decided".** Cognito's
+  legacy defaults do include `ALLOW_REFRESH_TOKEN_AUTH`, so the grant would probably have worked
+  — but the entire session now rests on it. CDK emits the property only for a *non-empty*
+  `authFlows` object and appends the refresh flag itself, so `authFlows: {}` silently emits
+  nothing and `authFlows: { userSrp: false }` is how you ask for exactly the refresh flow.
+
+**A credential's lifetime is a fact about a system, not about the comment above the cookie.
+Read it back from the system — `describe-user-pool-client` answers in one call.**
+
+### 34. "Live (10 s)" could not return new data at any interval
+
+The hosted page shipped with a checked *Live (10 s)* box. It could never work, and the reason is
+one line in `web/tiles.js`: `getObject()` caches every fetched object in a `Map` with no expiry,
+and `ensureMeta()` caches `index.json`, `meta.json` and `latest.json` the same way. A poll
+re-rendered bytes the page already held.
+
+The only network traffic it did produce was the one case that makes it worse. As the window
+slides, a poll eventually asks for a tile in a new UTC hour — which is normally *not published
+yet*, because tiles appear when the logger rotates and `sync.py` uploads within five minutes of
+that. The 404 is then cached as `null`, which is how this reader represents "the logger was off
+for that span". So the one thing polling accomplished was to record a permanent gap over the
+hour that was merely still in flight.
+
+`Reload` has the same defect, which is why it is hidden rather than kept: a browser reload is
+genuinely the only thing that picks up a new batch. `Download CSV` was a third one — it resolved
+to `/agg/api/csv?…`, a key that does not exist, so it downloaded a 404. All three are now
+`data-server-only` in the one page, hidden by a `POLLS` derived from `SRC.kind` rather than by a
+flag anyone has to remember in `site-stack.ts`.
+
+`cloud/README.md` had said it all along: *"No live view. Tiles appear when the logger rotates, so
+the hosted page is up to an hour behind and says so. `serve.py` on the LAN is the live one."* The
+page had been contradicting the design document for as long as both existed, and the contradiction
+was the default state of a checkbox.
+
+**When one renderer serves two sources, a control is only real if the source can answer it. Derive
+that from the source — a capability a deployment has to remember to switch off is one it will
+eventually ship switched on.**
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is
@@ -987,6 +1067,15 @@ FINDINGS 30, where the clock was evidence about the clock.**
   groups are swept and reported, and this unit refuses most of them.
 - **Reboot survival is configured but unobserved.** The LaunchDaemon is correct for
   it — root:wheel 644, not in the disabled list — but no reboot has been tested.
+- **The hosted viewer cannot pick up a new batch without a browser reload.** `web/tiles.js`
+  caches every object it fetches for the life of the page and has no invalidation, so nothing
+  in the page can ask for a newer tile — which is why `Reload` is hidden there rather than
+  wired up, and why the hint says to reload the browser (FINDINGS 34). A negative result is
+  cached too: a tile that 404s because it is not published yet stays "absent" until the page
+  is reloaded. If this becomes worth fixing, the shape is `getObject()` recording whether the
+  response was `immutable` and dropping only the mutable entries and the cached 404s;
+  `Tiles._reset()` exists for the tests and is too blunt, since it re-fetches a year of
+  immutable tiles.
 - **The hosted viewer shows one plan, so history before the last cadence change is
   invisible.** `web/tiles.js` reads `index.current` and nothing else, so a window that
   reaches back past a `plan=` boundary draws the older side as a gap even though the tiles

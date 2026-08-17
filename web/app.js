@@ -43,6 +43,21 @@ const SRC = window.SIGEN_SOURCE || { kind: 'server', base: '' };
 // be current -- a view read tomorrow must not present yesterday's reading as now.
 const FROZEN = !!SRC.frozen;
 
+// Whether a poll can return anything new, which is a property of the SOURCE and so is
+// derived rather than configured -- there is nothing for site-stack.ts to remember.
+//
+// serve.py decodes the archive on demand, so asking again a second later can genuinely
+// show a newer record. A tile source cannot: tiles are published when the logger
+// rotates, roughly hourly, and web/tiles.js caches every object it fetches for the life
+// of the page -- so a poll re-renders bytes it already holds, and an hour boundary makes
+// it fetch one tile that is normally not published yet and cache that ABSENCE. "Live
+// (10 s)" was therefore a checkbox that could only ever redraw the same data; the local
+// viewer is the live one, which is what cloud/README.md always said. See FINDINGS 34.
+//
+// This is also what hides [data-server-only]: /api/csv is likewise not a route a tile
+// source has.
+const POLLS = SRC.kind === 'server';
+
 const PRESETS = [
   { label: '15m', hours: 0.25 }, { label: '1h', hours: 1 },
   { label: '6h', hours: 6 }, { label: '24h', hours: 24 },
@@ -62,7 +77,7 @@ const state = {
   disconnected: false,
   hours: 6,
   end: null,              // null means "the newest data there is"
-  live: true,
+  live: POLLS,            // false wherever a poll cannot return anything new
   expanded: new Set(),
   custom: [],
   showDupes: false,
@@ -78,9 +93,18 @@ const state = {
 
 async function boot() {
   state.group = new C.CrosshairGroup($('tooltip'));
+  // BEFORE the first fetch, unlike the frozen banner and unlike everything in wireControls():
+  // what this source can answer is known from SRC alone, and a page that fails to boot must not
+  // be left offering a CSV link that resolves to a missing key. The harness found that -- a
+  // lapsed session aborts boot() below, and wireControls() then never runs.
+  if (!POLLS) applyServerOnlyMode();
   try {
     state.meta = await getJSON('/api/meta');
   } catch (e) {
+    // The narrow race the recovery below also covers: the session was good enough to serve
+    // this page and expired before its first fetch. A dead end otherwise, since fatal() has
+    // no way back.
+    if (e && e.unauthorized) return recoverSession(e);
     return fatal('Cannot reach the viewer API: ' + e.message);
   }
   if (!state.meta.ok) return fatal(state.meta.reason);
@@ -124,7 +148,9 @@ function readHash() {
   if (q.has('end')) state.end = parseFloat(q.get('end')) || null;
   if (q.has('panels')) state.expanded = new Set(q.get('panels').split(',').filter(Boolean));
   if (q.has('fields')) state.custom = q.get('fields').split(',').filter(Boolean);
-  if (q.has('live')) state.live = q.get('live') === '1';
+  // POLLS, because a hash is a bookmark and bookmarks outlive deployments: a URL saved from
+  // the local viewer must not switch polling back on when it is opened against the hosted one.
+  if (q.has('live') && POLLS) state.live = q.get('live') === '1';
 }
 
 function hashHas(k) {
@@ -138,7 +164,10 @@ function writeHash() {
   if (state.end) q.set('end', String(Math.round(state.end)));
   q.set('panels', [...state.expanded].join(','));
   if (state.custom.length) q.set('fields', state.custom.join(','));
-  q.set('live', state.live ? '1' : '0');
+  // Omitted rather than written as 0 where there is no such control: the hash is what a person
+  // copies out of the address bar, and a key naming a setting the page does not have invites
+  // someone to try setting it.
+  if (POLLS) q.set('live', state.live ? '1' : '0');
   history.replaceState(null, '', '#' + q.toString());
 }
 
@@ -211,9 +240,11 @@ function wireControls() {
   $('back').onclick = () => pan(-0.5);
   $('fwd').onclick = () => pan(0.5);
   $('now').onclick = () => { state.end = null; setLive(true); refresh(); };
-  $('reload').onclick = () => refresh();
-  $('live').checked = state.live;
-  $('live').onchange = (e) => setLive(e.target.checked);
+  if (POLLS) {
+    $('reload').onclick = () => refresh();
+    $('live').checked = state.live;
+    $('live').onchange = (e) => setLive(e.target.checked);
+  }
   $('endat').onchange = (e) => {
     const ts = C.fromLocalInput(e.target.value, state.meta.tz);
     if (ts) { state.end = ts; setLive(false); refresh(); }
@@ -257,6 +288,33 @@ function applyFrozenMode() {
   if (!state.custom.length) $('custom-card').hidden = true;
   else document.querySelector('#custom-card .note').textContent =
     'The extra fields this view was built with.';
+}
+
+// ------------------------------------------------ reading a source with no server behind it
+
+// Every control that needs serve.py to answer it: the poll, and the CSV route. Removed rather
+// than left in place doing nothing, the same choice applyFrozenMode() makes and for the same
+// reason -- a control that silently fails reads as a broken viewer.
+//
+// Called from boot() before anything is fetched, because POLLS is a fact about SRC and needs no
+// data to decide. wireControls() would be the obvious home and is the wrong one: it runs after
+// the first fetch, so a page that cannot load leaves the dead controls on screen.
+function applyServerOnlyMode() {
+  for (const el of document.querySelectorAll('[data-server-only]')) el.hidden = true;
+  // Said once, where the Reload button used to be. This source publishes in batches and a
+  // browser reload is the only thing that picks up a new one -- the tile cache is per page
+  // load -- so a page with no Reload owes the reader that sentence.
+  //
+  // Not in a frozen share: there is no next batch for it to pick up, and reloading a fixed
+  // window gets the same fixed window. applyFrozenMode() rewrites this hint wholesale anyway,
+  // but relying on which of the two runs last would be a poor way to mean it.
+  // appendChild, not `textContent +=`: that is a read-modify-write which flattens the hint's
+  // three <kbd> children into plain text, so the keyboard hints silently lose their styling.
+  if (!FROZEN) {
+    $('hint').appendChild(document.createTextNode(
+      ' This archive is published in batches about an hour apart — reload the page to pick up '
+      + 'a new one.'));
+  }
 }
 
 // Anything that was merely current when the view was shared has to say so -- a view
@@ -466,9 +524,13 @@ async function verifyClosed(attempt) {
   }
 }
 
+// The clamp is the load-bearing part, not the checkbox. `Now`, the left/right pan past the
+// newest record and the `n` key all ask for live and all still work on a tile source, so
+// without `&& POLLS` panning to the present would start a 10-second timer that no visible
+// control admits to and no visible control can stop.
 function setLive(on) {
-  state.live = on;
-  $('live').checked = on;
+  state.live = on && POLLS;
+  $('live').checked = state.live;
   writeHash();
   schedule();
 }
@@ -498,10 +560,12 @@ function zoom(factor) {
   refresh();
 }
 
+// The one place a poll is ever started, and therefore the place the rule is enforced:
+// state.live is clamped and the hash is filtered, but this is the line that has to hold.
 function schedule() {
   if (state.timer) clearInterval(state.timer);
   state.timer = null;
-  if (state.live && !FROZEN) state.timer = setInterval(() => refresh(true), 10000);
+  if (POLLS && state.live && !FROZEN) state.timer = setInterval(() => refresh(true), 10000);
 }
 
 function debounce(fn, ms) {
@@ -547,17 +611,65 @@ async function refresh(quiet) {
     if (state.inflight !== token) return;    // a newer request already landed
     state.win = win;
     if (latest) state.latest = latest;
+    sessionHeld();
     // Merge, don't replace: the window carries only first_ts/last_ts, while
     // /api/meta's extent also holds the file count and size the footer reports.
     if (win.extent) Object.assign(state.meta.extent, win.extent);
     renderAll();
   } catch (e) {
+    if (e && e.unauthorized) return recoverSession(e);
     const chip = $('chip-warming');
     chip.hidden = false;
     chip.textContent = 'reload failed: ' + e.message;
   } finally {
     cards.forEach((c) => c.classList.remove('loading'));
   }
+}
+
+// ------------------------------------------------------- a session that lapsed mid-page
+
+// The id token behind the hosted viewer lasts a day and the session behind it lasts a month,
+// so a page left open overnight will have one fetch refused and can then carry on -- but only
+// a NAVIGATION gets the silent hop through /auth/refresh that renews it. A fetch cannot follow
+// a redirect usefully, so the page turns itself into a navigation by reloading.
+//
+// Nothing is lost by that: the window, the open panels and the custom fields are all in the
+// hash, and a browser reapplies the fragment across a 302 whose Location carries none.
+//
+// Once, though. A reload that comes back and is refused again means reloading is not the
+// answer, and a page that reloads on every refusal is a page in a loop -- so the second one
+// inside a minute says so and offers the link instead. The breadcrumb is in sessionStorage
+// because it has to survive exactly one reload and nothing more.
+const RECOVERY_KEY = 'sigen.session.reloaded';
+const RECOVERY_QUIET_MS = 60000;
+
+function recoverSession(err) {
+  let last = 0;
+  // Storage can be denied outright (a hardened private window). Then the guard is gone, so
+  // the safe reading is "we have already tried" -- an error message is recoverable by hand,
+  // a reload loop is not.
+  let usable = true;
+  try {
+    last = Number(sessionStorage.getItem(RECOVERY_KEY)) || 0;
+    sessionStorage.setItem(RECOVERY_KEY, String(Date.now()));
+  } catch (e) {
+    usable = false;
+  }
+  if (usable && Date.now() - last > RECOVERY_QUIET_MS) {
+    location.reload();
+    return;
+  }
+  const chip = $('chip-warming');
+  chip.hidden = false;
+  C.clear(chip);
+  chip.appendChild(document.createTextNode(err.message + ' — '));
+  chip.appendChild(C.el('a', { href: (err.login || '/view'), text: 'sign in again' }));
+}
+
+/** A fetch got through, so whatever the last reload was for is over. Without this, one
+ *  recovery would suppress the next one for a minute -- and the next one may be a day later. */
+function sessionHeld() {
+  try { sessionStorage.removeItem(RECOVERY_KEY); } catch (e) { /* never mind */ }
 }
 
 // -------------------------------------------------------------------- rendering
@@ -590,10 +702,12 @@ function renderAll() {
   } else {
     warm.hidden = true;
   }
-  if (!FROZEN) {
-    $('csv').href = (SRC.base || '') + '/api/csv' + windowURL();
-    $('endat').value = C.toLocalInput(win.end, win.tz);
-  }
+  // The CSV link only where /api/csv is a route. It is hidden otherwise, so this is about not
+  // writing a URL that resolves to a missing S3 key -- the link was pointing at
+  // /agg/api/csv?… on the hosted viewer, which downloads a 404.
+  if (POLLS) $('csv').href = (SRC.base || '') + '/api/csv' + windowURL();
+  // The end-of-window input is not server-only: panning and jumping work on tiles too.
+  if (!FROZEN) $('endat').value = C.toLocalInput(win.end, win.tz);
 
   if (FROZEN) renderFrozenBanner();
   renderShareSummary();
