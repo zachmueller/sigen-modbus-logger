@@ -1,4 +1,5 @@
 import * as cdk from 'aws-cdk-lib';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Construct } from 'constructs';
@@ -21,6 +22,43 @@ const HTML_ENTRY_POINTS = ['view', 'share-view'] as const;
 
 /** Copied verbatim; their extensions tell S3 what they are. */
 const WEB_ASSETS = ['app.js', 'tiles.js', 'charts.js', 'style.css', 'favicon.svg'] as const;
+
+/**
+ * Everything a rendered page is made of: the one page, and every file it loads.
+ *
+ * This is the list the bundle identity below is computed over, so a file the page starts loading
+ * without being added here would be a change the version cannot see -- and a share pinned to an
+ * unchanged version would then drift after all. `pinAssets()` catches that by deriving the
+ * references from the page itself and insisting every one of them was rewritten.
+ */
+const VIEWER_SOURCES = ['index.html', ...WEB_ASSETS] as const;
+
+/**
+ * The identity of the viewer bundle: sha256 over the name and bytes of every file above,
+ * truncated to 12 hex.
+ *
+ * **A hash rather than a counter, so that a redeploy is an overwrite.** Deploying the same web/
+ * twice writes the same keys twice, which is idempotent and free; only a real change to the page
+ * or the code creates a second bundle. That is what makes it affordable to keep every bundle a
+ * share has ever named, forever.
+ *
+ * Computed in the stack CONSTRUCTOR rather than inside the bundling callback, because it has to
+ * reach two places: the object keys buildSite() writes, and the share Lambda's environment. Asset
+ * bundling runs during synth, after the construct tree is built, so a value discovered there
+ * could not be handed to a function that was already declared.
+ */
+function viewerVersion(): string {
+	const h = crypto.createHash('sha256');
+	// Sorted and name-delimited, so the digest depends on the contents rather than on the order
+	// this file happens to list them in, and so two files cannot shift bytes across the boundary
+	// between them and leave the hash unchanged.
+	for (const f of [...VIEWER_SOURCES].sort()) {
+		h.update(f, 'utf-8');
+		h.update('\0');
+		h.update(fs.readFileSync(path.join(WEB, f)));
+	}
+	return h.digest('hex').slice(0, 12);
+}
 
 /**
  * CloudFront, and the decision about what is gated.
@@ -52,6 +90,7 @@ export class SiteStack extends cdk.Stack {
 	constructor(scope: Construct, id: string, props: SiteStackProps) {
 		super(scope, id, props);
 		const { cfg } = props;
+		const version = viewerVersion();
 
 		const bucket = cdk.aws_s3.Bucket.fromBucketName(this, 'Bucket', cfg.bucket);
 		const cert = cdk.aws_certificatemanager.Certificate.fromCertificateArn(
@@ -104,6 +143,11 @@ export class SiteStack extends cdk.Stack {
 				SITE_DOMAIN: cfg.domain,
 				// Reserved as TZ; see the handler.
 				CAPTURE_TZ: cfg.captureTz,
+				// Which viewer bundle a share made from now on is pinned to. Passed in rather
+				// than discovered by the function, so the page a share renders with is decided
+				// by the deploy that published it and cannot move afterwards.
+				SITE_PREFIX: 'site/',
+				VIEWER_VERSION: version,
 			},
 			logGroup: new cdk.aws_logs.LogGroup(this, 'ShareLogs', {
 				retention: cdk.aws_logs.RetentionDays.ONE_MONTH,
@@ -121,6 +165,13 @@ export class SiteStack extends cdk.Stack {
 			actions: ['s3:PutObject', 's3:GetObject'],
 			resources: [`arn:aws:s3:::${cfg.bucket}/share/*`],
 		}));
+		// The pinned viewer bundles, and nothing else under site/. A share copies one page out of
+		// `site/v/<version>/` into itself; it has no business with the live entry points beside
+		// them, so the grant stops at that prefix.
+		shareFn.addToRolePolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['s3:GetObject'],
+			resources: [`arn:aws:s3:::${cfg.bucket}/site/v/*`],
+		}));
 		// ListBucket, for the same reason CloudFront needs it a few lines below: without it
 		// S3 answers 403 for a key that does NOT exist, because it will not confirm absence
 		// to a caller that cannot list. The share function has to know which tiles are
@@ -131,7 +182,7 @@ export class SiteStack extends cdk.Stack {
 		shareFn.addToRolePolicy(new cdk.aws_iam.PolicyStatement({
 			actions: ['s3:ListBucket'],
 			resources: [`arn:aws:s3:::${cfg.bucket}`],
-			conditions: { StringLike: { 's3:prefix': ['agg/*', 'share/*'] } },
+			conditions: { StringLike: { 's3:prefix': ['agg/*', 'share/*', 'site/v/*'] } },
 		}));
 
 		// AWS_IAM, not NONE. The read gate is a Lambda@Edge on a CloudFront behaviour, so
@@ -374,7 +425,7 @@ function handler(event) {
 			assetHashType: cdk.AssetHashType.OUTPUT,
 			bundling: {
 				image: cdk.DockerImage.fromRegistry('scratch'),
-				local: { tryBundle: (out: string) => buildSite(out, cfg) },
+				local: { tryBundle: (out: string) => buildSite(out, cfg, version) },
 			},
 		});
 		const siteBucket = cdk.aws_s3.Bucket.fromBucketName(this, 'SiteBucket', cfg.bucket);
@@ -388,7 +439,13 @@ function handler(event) {
 			// it keeps the entry points out of THIS upload, and it withholds them from
 			// `--delete`. Without it, whichever deployment ran last would delete the
 			// other's objects.
-			exclude: [...HTML_ENTRY_POINTS],
+			//
+			// `v/*` is here for the second reason only, and it is the line the whole pinning
+			// arrangement rests on. Those bundles are not in this source -- each was deployed
+			// and forgotten -- so without withholding them from `--delete`, this deploy removes
+			// the renderer that every existing share names. The symptom is not a failed build:
+			// it is links sent months ago going blank.
+			exclude: [...HTML_ENTRY_POINTS, 'v/*'],
 			// Only this prefix, so a deployment cannot reach raw/ or agg/.
 			prune: true,
 			distribution: dist,
@@ -413,23 +470,55 @@ function handler(event) {
 			distributionPaths: ['/view', '/share-view'],
 		});
 
+		// The pinned bundle, for a share to copy its page out of. Every object here is immutable
+		// and content-addressed, so this deployment neither prunes nor invalidates: there is
+		// nothing to remove -- an existing share still names an older bundle -- and nothing to
+		// invalidate, since a changed page produces a changed key.
+		const bundle = new cdk.aws_s3_deployment.BucketDeployment(this, 'SiteViewerBundle', {
+			destinationBucket: siteBucket,
+			destinationKeyPrefix: 'site',
+			sources: [webSource],
+			exclude: ['*'],
+			include: ['v/*'],
+			prune: false,
+			cacheControl: [cdk.aws_s3_deployment.CacheControl.fromString(
+				'public, max-age=31536000, immutable')],
+		});
+		// So the bundle exists before the function that names it. CloudFormation does not order a
+		// Lambda environment update against a custom resource, and in the other order a share
+		// created in the seconds between them would copy a page that is not there yet -- which
+		// _require() reports as a refusal, but a refused share is still a failed share.
+		shareFn.node.addDependency(bundle);
+
 		new cdk.CfnOutput(this, 'DistributionDomain', {
 			value: dist.distributionDomainName,
 			description: 'CNAME target: point the site subdomain here at your registrar',
 		});
 		new cdk.CfnOutput(this, 'SiteUrl', { value: `https://${cfg.domain}/view` });
+		new cdk.CfnOutput(this, 'ViewerVersion', {
+			value: version,
+			description: 'The viewer bundle shares created by this deployment are pinned to',
+		});
 	}
 }
 
 /**
- * The three HTML entry points, built from the ONE page in web/.
+ * The three HTML entry points, built from the ONE page in web/ -- plus one immutable,
+ * content-addressed copy of the whole bundle for shares to pin themselves to.
  *
  * They differ by a single inline script that sets window.SIGEN_SOURCE before app.js loads.
  * That is the entire difference between the local viewer, the hosted viewer and a frozen
  * share -- there is no second copy of the page, and web/index.html stays the file serve.py
  * serves, so the two cannot drift.
+ *
+ * **Why a second, pinned copy exists.** A share copies its tiles rather than pointing at them,
+ * so that re-aggregating history cannot change what someone was sent -- the share handler says
+ * so at length. The RENDERER was not copied, and it is overwritten in place on every deploy:
+ * /p/<uid> loaded /app.js, /charts.js and /style.css from the bucket root. So a share was frozen
+ * in its data and live in its code, and a link sent in August was drawn by whatever existed when
+ * it was opened. The bundle below is the other half of that promise.
  */
-function buildSite(out: string, cfg: CloudConfig): boolean {
+function buildSite(out: string, cfg: CloudConfig, version: string): boolean {
 	const page = fs.readFileSync(path.join(WEB, 'index.html'), 'utf-8');
 	const ANCHOR = '<script src="/tiles.js"></script>';
 	if (!page.includes(ANCHOR)) {
@@ -454,10 +543,25 @@ function buildSite(out: string, cfg: CloudConfig): boolean {
 	// A frozen share. The id comes out of the path, so one object answers for all of them,
 	// and its data comes from /share/<id>/ -- public, and a copy, so re-aggregating history
 	// can never change what someone was sent.
-	fs.writeFileSync(path.join(out, 'share-view'), withSource(
+	const sharePage = withSource(
 		`(function(){var m=location.pathname.match(/^\\/p\\/([A-Za-z0-9_-]{4,64})/);`
 		+ `if(!m){document.title="Not a share link";return;}`
-		+ `window.SIGEN_SOURCE={kind:"tiles",base:"/share/"+m[1]+"/",frozen:true};})();`));
+		+ `window.SIGEN_SOURCE={kind:"tiles",base:"/share/"+m[1]+"/",frozen:true};})();`);
+	fs.writeFileSync(path.join(out, 'share-view'), sharePage);
+
+	// The same share page with every asset reference pinned, under a key named for the bundle's
+	// contents. The share Lambda copies THIS file into each share it creates, byte for byte, so
+	// what a share renders with is settled the moment it is made.
+	//
+	// A `.html` extension deliberately, unlike the entry points beside it: nothing has to route
+	// to this name, so it can carry the extension that tells S3 what it is instead of needing a
+	// place in HTML_ENTRY_POINTS.
+	const pinned = path.join(out, 'v', version);
+	fs.mkdirSync(pinned, { recursive: true });
+	fs.writeFileSync(path.join(pinned, 'share-view.html'), pinAssets(sharePage, version));
+	for (const f of WEB_ASSETS) {
+		fs.copyFileSync(path.join(WEB, f), path.join(pinned, f));
+	}
 
 	fs.writeFileSync(path.join(out, 'index.html'), landingPage(cfg));
 
@@ -471,6 +575,9 @@ function buildSite(out: string, cfg: CloudConfig): boolean {
 		}
 	}
 	for (const f of fs.readdirSync(out)) {
+		// Directories are exempt: `v/` holds the pinned bundles, whose files all carry
+		// extensions. This check is about OBJECTS whose key would arrive without a Content-Type.
+		if (fs.statSync(path.join(out, f)).isDirectory()) continue;
 		if (!path.extname(f) && !(HTML_ENTRY_POINTS as readonly string[]).includes(f)) {
 			throw new Error(`buildSite() wrote "${f}", which has no file extension and is `
 				+ `not in HTML_ENTRY_POINTS. It would deploy as binary/octet-stream and a `
@@ -478,6 +585,38 @@ function buildSite(out: string, cfg: CloudConfig): boolean {
 		}
 	}
 	return true;
+}
+
+/**
+ * The page with every root-absolute asset reference moved into `/v/<version>/`.
+ *
+ * Derived from the page by regex rather than from a list of filenames, for the same reason the
+ * bundle identity is: a page that starts loading a sixth file must not be able to half-pin
+ * itself. Every reference found is rewritten, and then every one is checked to be gone -- because
+ * a missed rewrite is invisible. The share would render perfectly today, load the live /app.js
+ * tomorrow, and be exactly the drift this exists to prevent.
+ *
+ * The inline SIGEN_SOURCE script is untouched: it names no src or href, and its `/share/<id>/`
+ * base is data rather than an asset -- a share's tiles are its own and belong to no bundle.
+ */
+function pinAssets(html: string, version: string): string {
+	const refs = [...new Set(Array.from(html.matchAll(/(?:src|href)="(\/[^"]*)"/g),
+		(m) => m[1]))];
+	if (!refs.length) {
+		throw new Error('buildSite() found no root-absolute asset references in web/index.html, '
+			+ 'so there is nothing to pin -- which means the page now loads its code some other '
+			+ 'way and pinAssets() has silently stopped doing anything.');
+	}
+	let out = html;
+	// Matched with its quotes, so one reference cannot be rewritten through another's prefix.
+	for (const ref of refs) out = out.split(`"${ref}"`).join(`"/v/${version}${ref}"`);
+	for (const ref of refs) {
+		if (out.includes(`"${ref}"`)) {
+			throw new Error(`buildSite() left "${ref}" unpinned in the frozen share page. It `
+				+ `would load the live asset, so the share would drift on the next deploy.`);
+		}
+	}
+	return out;
 }
 
 /** The public landing page. Deliberately says what this is and what it is not. */

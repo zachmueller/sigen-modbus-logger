@@ -592,6 +592,17 @@ From this server, what is left is:
 - **The URL.** The window, the expanded panels and the custom fields are all in the
   page's hash, so a view is a link for anyone who can reach the viewer — over the LAN,
   or through `bin/tunnel.sh`.
+- **A link to one panel.** `#focus=<panel>` opens that panel and scrolls to it, leaving
+  everything else as the rest of the hash says. The link icon in a panel's heading copies
+  such a link for you. It is accepted on every form of this page — this server, the hosted
+  viewer, and a `/p/<id>` share, which is where it earns the most: the reason for sending a
+  view is usually one panel, and until now that reason could only be written out in the note.
+
+  A panel is named by its id or by its title, so `#focus=temps` and `#focus=temperatures`
+  are the same request, as are `#focus=stringv` and `#focus=pv-string-voltage`. Both come
+  from `PANELS` in `serve.py`, so a new chart there is focusable with no other change. A
+  name that matches nothing is ignored — a link outlives the deployment that made it, and a
+  stale name should still render the page.
 - **Download CSV.** The bucketed numbers behind the view, matching the table view
   exactly; `&raw=1` gives per-record rows in `decode.py`'s shape.
 

@@ -1040,6 +1040,56 @@ eventually ship switched on.**
 
 ---
 
+## What "frozen" turned out not to cover
+
+Found while adding a way to point a link at one panel, which meant reading what a share link
+actually resolves to.
+
+### 35. A share was frozen in its data and live in its code
+
+The share handler is emphatic about why it copies rather than points, and it is right:
+
+> **Copies, not pointers.** A pointer into `agg/*` could not be read anonymously — that prefix is
+> gated — and re-aggregating history would silently change what someone was sent. A copy costs a
+> few hundred kilobytes and means a link keeps showing what it showed on the day.
+
+Every word of that is about the numbers. None of it was true of the code that draws them.
+`/p/<uid>` was rewritten at the edge to one `site/share-view` object serving every share id, and
+that object loaded `/app.js`, `/tiles.js`, `/charts.js` and `/style.css` from the bucket root —
+the same five keys `cdk deploy SigenSite` overwrites in place. A share's tiles were immutable for
+a year; its renderer was immutable until the next deploy.
+
+Nothing about it looks wrong from either end. The share is genuinely a copy, the tiles genuinely
+cannot change, and the page genuinely renders — today, with today's code, which is also the code
+that was current when the share was made. The defect has a *latency* built into it: it cannot be
+observed at all until the renderer changes, and by then whoever holds the link is not looking at
+it beside the original. FINDINGS 24 was the same shape one layer up — a frozen share whose *ages*
+were still measured against the clock, so it aged into accusing the logger of dying. Both are the
+word "frozen" asserted about one half of a page.
+
+Two things made the fix cheap enough not to argue about:
+
+- **Content-addressing turns "keep every version" into "keep every distinct version".** The bundle
+  key is a hash of the page and everything it loads, so a redeploy of unchanged code writes the
+  same keys again rather than accumulating one bundle per deploy. What is retained is bounded by
+  how often the viewer actually changes, not by how often it is deployed.
+- **The page is copied; the code is shared.** Each share gets its own ~9 KB `page.html`, a
+  byte-for-byte copy of the published bundle's page, and that page names `/v/<version>/app.js`.
+  Twenty shares made from one bundle are twenty small HTML objects and one copy of the renderer.
+  Copying the JS per share would have been simpler to write and would have needed the page
+  rewritten per share, which trades a guarantee ("the same bytes") for a string operation.
+
+The pruning line is the one to be careful with. The deployment that uploads the site owns
+`--delete` over the `site/` prefix, and previously published bundles are not in its source — each
+was deployed and forgotten. They survive only because `v/*` is in its `exclude` list, which
+withholds a key from deletion as well as from upload. Removing that line as untidy would leave a
+green build, a working `/view`, and every share sent before that day rendering blank.
+
+**"Immutable" is a claim about a whole page, and a page is code plus data. Check the claim against
+both halves — the half nobody thought of as content is the half that gets overwritten in place.**
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is

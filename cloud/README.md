@@ -33,6 +33,7 @@ before the script loads. The page here is byte-for-byte the page `serve.py` serv
 | `/agg/*` (tiles) | same gate — a gate on the HTML alone would leave the data open |
 | `POST /api/share` | same gate, **plus** the payload hash below — it mints public copies |
 | `/p/{uid}`, `/share/*` | **public** — a shared view, copied at share time |
+| `/v/{version}/*` | public, immutable — the pinned viewer bundles a share renders with |
 | `/auth/*` | public; `/auth/callback` sets the cookies, `/auth/refresh` renews them |
 | everything else | public: `index.html`, `app.js`, `tiles.js`, `charts.js`, `style.css` |
 
@@ -216,6 +217,47 @@ stacks rather than one.
 
 `SigenSite` prints the distribution domain. That is the target for the second `CNAME`
 above, and it is the last manual step — after it propagates, the site is live.
+
+### A share is pinned to the viewer that made it
+
+A share copies its tiles rather than pointing at them, so re-aggregating history cannot change
+what someone was sent. That was true of the data and false of the code: `/p/<uid>` served one
+`site/share-view` object that loaded `/app.js`, `/charts.js` and `/style.css` from the bucket
+root, and every one of those is overwritten in place by `cdk deploy SigenSite`. A link sent in
+August was drawn by whatever renderer existed when it was opened.
+
+So each deploy also publishes an immutable bundle, and each share copies that bundle's page:
+
+```
+site/v/<version>/share-view.html   the page, with its asset refs rewritten to /v/<version>/…
+site/v/<version>/{app,tiles,charts}.js, style.css, favicon.svg
+share/<uid>/page.html              a byte-for-byte copy of that page — what /p/<uid> serves
+```
+
+`<version>` is a 12-hex sha256 of `web/index.html` and every file it loads, computed by
+`site-stack.ts`. Because it is a hash of the contents, redeploying unchanged code **overwrites
+the same keys** rather than accumulating a bundle per deploy; only a real change to the page or
+the renderer publishes a second one. `SigenSite` prints it as the `ViewerVersion` output, and the
+share Lambda receives it as `VIEWER_VERSION` — passed in, not looked up, so which renderer a
+share gets is decided by the deploy that created it.
+
+Two things follow, and both are deliberate:
+
+- **Old bundles are never deleted.** The `Site` deployment prunes the `site/` prefix, and `v/*`
+  is excluded from it — not to keep it out of the upload, but to withhold it from `--delete`.
+  Without that line, a deploy would remove the renderer every existing share names, and the
+  symptom would not be a failed build: it would be links sent months ago going blank. The cost is
+  about 110 KB per distinct `web/` content ever deployed, which is the price of the promise.
+- **There is no prettier 404 for a bad `/p/<id>`.** CloudFront error responses are
+  distribution-wide, and `web/tiles.js` reads a 404 as "no tile was published for that span, so
+  the logger was off". Mapping 404 to an HTML page would hand `JSON.parse` a document and turn a
+  gap in the data into a hard failure across the whole viewer.
+
+Shares that predate this get a page written by `python3 cloud/backfill_share_pages.py`, pinned to
+the bundle being deployed — which is the code they have been rendering with all along. **Run it
+between the two deploys**, i.e. with the bundle published and `/p/*` still on its old route. In
+that order no link is ever broken; in the other order every existing share 404s until it
+finishes.
 
 ### Register the redirect URI with Google — and it is not this site
 

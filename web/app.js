@@ -80,6 +80,8 @@ const state = {
   live: POLLS,            // false wherever a poll cannot return anything new
   expanded: new Set(),
   custom: [],
+  focus: null,            // a panel to land on, from #focus= -- see readHash()
+  focusDone: false,       // landed on it already; a poll must not re-scroll
   showDupes: false,
   charts: [],
   group: null,
@@ -117,6 +119,11 @@ async function boot() {
     for (const p of state.meta.panels) if (!p.collapsed) state.expanded.add(p.id);
   }
   if (!FROZEN && !hashHas('h')) state.hours = state.meta.default_hours || 6;
+  // A focus target is a panel to LAND on, so it has to be open -- including one PANELS marks
+  // collapsed, and including one a shared view was made without. AFTER the defaults above
+  // rather than instead of them: `#focus=temps` should be the ordinary page with that panel
+  // open and scrolled to, not that panel alone.
+  if (state.focus) state.expanded.add(state.focus);
   buildPresets();
   buildPanelCards();
   buildPicker();
@@ -127,6 +134,12 @@ async function boot() {
 }
 
 function readHash() {
+  // BEFORE the frozen branch, and the only key read on that side of it. Everything else in the
+  // hash asks for a window other than the one on screen, which a frozen view has no answer to;
+  // `focus` asks which panel to land on, and that is as answerable in a shared view as it is
+  // here. It is also where it earns the most: the reason for sending a view is usually one
+  // panel, and until now that reason could only be written out in the note.
+  state.focus = resolveFocus(hashParams().get('focus'));
   if (FROZEN) {
     // A frozen view is the one it was shared with, whatever the URL says: there is
     // nothing to ask for another, and a panel that was open when it was shared has to
@@ -143,7 +156,7 @@ function readHash() {
     state.live = false;
     return;
   }
-  const q = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const q = hashParams();
   if (q.has('h')) state.hours = q.get('h') === 'all' ? null : parseFloat(q.get('h'));
   if (q.has('end')) state.end = parseFloat(q.get('end')) || null;
   if (q.has('panels')) state.expanded = new Set(q.get('panels').split(',').filter(Boolean));
@@ -153,8 +166,54 @@ function readHash() {
   if (q.has('live') && POLLS) state.live = q.get('live') === '1';
 }
 
+function hashParams() {
+  return new URLSearchParams(location.hash.replace(/^#/, ''));
+}
+
 function hashHas(k) {
-  return new URLSearchParams(location.hash.replace(/^#/, '')).has(k);
+  return hashParams().has(k);
+}
+
+// -- what #focus= accepts
+
+// The names, derived from the panel list rather than restated here. Two per panel, because the
+// two audiences differ: `panels=` already carries ids, so an id is what a copied hash contains,
+// while a title is what someone hand-editing a URL would write -- `#focus=temperatures` for a
+// panel whose id is `temps`. A new dict in serve.py's PANELS is focusable with no change to
+// this file.
+let _focusTargets = null;
+function focusTargets() {
+  if (!_focusTargets) {
+    _focusTargets = new Map();
+    for (const p of state.meta.panels) {
+      _focusTargets.set(slug(p.id), p.id);
+      _focusTargets.set(slug(p.title), p.id);
+    }
+  }
+  return _focusTargets;
+}
+
+function slug(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+/** The panel id `name` means, or null. Unknown is ignored rather than reported: a fragment is
+ *  hand-editable and a link outlives the deployment that made it, so a name that no longer
+ *  matches a panel should render the ordinary page -- not an error about a chart that used to
+ *  exist beside charts that still do. */
+function resolveFocus(name) {
+  if (!name) return null;
+  return focusTargets().get(slug(name)) || null;
+}
+
+/** The URL that opens this page with `id` expanded and scrolled to. Absolute, because it is
+ *  written to a clipboard and sent to someone: a bare fragment pasted into a message is not a
+ *  link. Built from the hash the page is already maintaining, so the window and the panels
+ *  travel with it. */
+function focusURL(id) {
+  const q = hashParams();
+  q.set('focus', id);
+  return location.origin + location.pathname + '#' + q.toString();
 }
 
 function writeHash() {
@@ -168,6 +227,10 @@ function writeHash() {
   // copies out of the address bar, and a key naming a setting the page does not have invites
   // someone to try setting it.
   if (POLLS) q.set('live', state.live ? '1' : '0');
+  // Kept rather than dropped, so the address bar stays the link it was: a hash that forgot the
+  // focus on the first render would mean the URL someone pasted is not the URL they could copy
+  // back out a second later.
+  if (state.focus) q.set('focus', state.focus);
   history.replaceState(null, '', '#' + q.toString());
 }
 
@@ -284,7 +347,8 @@ function applyFrozenMode() {
   document.querySelector('.brand h1').textContent += ' — shared view';
   $('hint').textContent =
     'Hover a chart, or focus it and use the arrow keys, for exact values; Table '
-    + 'shows the numbers behind a panel. This is a fixed window, so nothing else moves.';
+    + 'shows the numbers behind a panel. The link icon on a panel copies a link that opens '
+    + 'this same view on that panel. This is a fixed window, so nothing else moves.';
   if (!state.custom.length) $('custom-card').hidden = true;
   else document.querySelector('#custom-card .note').textContent =
     'The extra fields this view was built with.';
@@ -436,7 +500,11 @@ function refusalText(r, body, raw) {
 function showShareLink(body) {
   const out = $('share-result');
   C.clear(out);
-  const link = C.el('a', { href: body.url, text: body.url });
+  // The sharer's focus travels with the link, so the recipient lands on the panel that prompted
+  // the share instead of at the top of a page of charts. Added here rather than by the Lambda
+  // because a fragment is never sent to a server: it is not the endpoint's to know.
+  const url = body.url + (state.focus ? '#focus=' + encodeURIComponent(state.focus) : '');
+  const link = C.el('a', { href: url, text: url });
   link.target = '_blank';
   link.rel = 'noopener';
   const copy = C.el('button', {
@@ -445,7 +513,7 @@ function showShareLink(body) {
       // clipboard.writeText needs a secure context and a user gesture; both hold here. The
       // link is on screen and selectable either way, so a refusal is not a dead end.
       if (navigator.clipboard) {
-        navigator.clipboard.writeText(body.url)
+        navigator.clipboard.writeText(url)
           .then(() => { copy.textContent = 'Copied'; })
           .catch(() => { copy.textContent = 'Copy failed — select it instead'; });
       } else {
@@ -718,6 +786,7 @@ function renderAll() {
   renderPanels();
   renderCustom();
   renderFooter();
+  if (state.focus && !state.focusDone) focusScroll();
 }
 
 function renderProvenance() {
@@ -879,6 +948,67 @@ function renderEnergy() {
 
 // -- panels
 
+// U+2212, not a hyphen: it is the same character the keyboard hint already prints as
+// <kbd>−</kbd>, and at this size a hyphen reads as a dash rather than as the opposite of `+`.
+const MINUS = '−';
+
+function toggleLabel(p, open) {
+  return (open ? 'Collapse ' : 'Expand ') + p.title;
+}
+
+// A link to ONE panel, on every panel. Deliberately an <a> with a real href rather than a
+// button: it IS a link, so it should be keyboard-reachable, right-clickable and visible in the
+// status bar. The click is intercepted all the same, because what is wanted from it is the
+// absolute URL on the clipboard -- not a navigation to the page it is already on.
+//
+// Not [data-live-only]: whoever opens a share may want to point a third person at one panel of
+// it, and a fragment is answerable in a frozen view. See readHash().
+function focusLinkFor(p) {
+  const label = 'Copy a link that opens ' + p.title;
+  const a = C.el('a', {
+    class: 'panel-link', href: '#focus=' + p.id, title: label, 'aria-label': label,
+  }, [linkIcon()]);
+  a.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    const url = focusURL(p.id);
+    // The address bar becomes that link too, so selecting it by hand gets the same thing.
+    // Written here rather than left to writeHash(), which returns early in a frozen view --
+    // where this button still works.
+    state.focus = p.id;
+    history.replaceState(null, '', url.slice(url.indexOf('#')));
+    saidCopied(a, label, navigator.clipboard ? navigator.clipboard.writeText(url) : null);
+  });
+  return a;
+}
+
+// Two interlocking capsules on the diagonal. Drawn here rather than pulled in, for the reason
+// the whole viewer has no dependencies: an icon font or an SVG sprite from elsewhere would be
+// the one part of this page that needs the network, and it would need a line in
+// THIRD_PARTY_NOTICES.md for fourteen pixels.
+function linkIcon() {
+  const ring = (x) => C.svg('rect', {
+    x: String(x), y: '5.6', width: '7.4', height: '4.8', rx: '2.4',
+  });
+  return C.svg('svg', {
+    width: '14', height: '14', viewBox: '0 0 16 16', 'aria-hidden': 'true',
+    fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5',
+  }, [C.svg('g', { transform: 'rotate(-45 8 8)' }, [ring(1.6), ring(7)])]);
+}
+
+/** Whether the clipboard took it, said on the control that was clicked. Same shape as the share
+ *  card's Copy button and for the same reason: the URL is in the address bar either way, so a
+ *  refusal is a message rather than a dead end. */
+function saidCopied(a, label, promise) {
+  const say = (cls, text) => {
+    a.classList.add(cls);
+    a.setAttribute('title', text);
+    setTimeout(() => { a.classList.remove(cls); a.setAttribute('title', label); }, 2000);
+  };
+  if (!promise) return say('warn', 'Select the address bar to copy — no clipboard here');
+  promise.then(() => say('copied', 'Link copied'))
+    .catch(() => say('warn', 'Copy failed — the link is in the address bar'));
+}
+
 function buildPanelCards() {
   const host = $('panels');
   C.clear(host);
@@ -888,10 +1018,17 @@ function buildPanelCards() {
     const chartHost = C.el('div', { class: 'chart-host' });
     const legend = C.el('div', { class: 'legend' });
     const foot = C.el('div', { class: 'card-foot' });
+    // A glyph, not a word: `Show`/`Hide` also changed width as it changed state, which nudged
+    // the rest of the card head sideways on every click. aria-expanded already says which state
+    // this is in, but a one-character button has no accessible NAME without the label -- the
+    // word used to be doing both jobs.
     const toggle = C.el('button', {
-      text: open ? 'Hide' : 'Show', 'aria-expanded': String(open),
+      class: 'toggle', text: open ? MINUS : '+',
+      'aria-expanded': String(open),
+      'aria-label': toggleLabel(p, open), title: toggleLabel(p, open),
       onclick: () => togglePanel(p.id),
     });
+    const focusBtn = focusLinkFor(p);
     const tableBtn = C.el('button', {
       text: 'Table', 'aria-pressed': String(state.tables.has(p.id)),
       onclick: () => {
@@ -905,7 +1042,7 @@ function buildPanelCards() {
       C.el('div', { class: 'card-head' }, [
         C.el('h2', { text: p.title + (p.unit ? '  (' + p.unit + ')' : '') }),
         C.el('div', { class: 'spacer' }),
-        tableBtn, toggle,
+        focusBtn, tableBtn, toggle,
       ]),
       p.note ? C.el('p', { class: 'note', text: p.note }) : null,
       legend, chartHost, tableHost, foot,
@@ -920,9 +1057,33 @@ function togglePanel(id) {
   if (state.expanded.has(id)) state.expanded.delete(id);
   else state.expanded.add(id);
   const c = state.panelCards.get(id);
-  c.toggle.textContent = state.expanded.has(id) ? 'Hide' : 'Show';
-  c.toggle.setAttribute('aria-expanded', String(state.expanded.has(id)));
+  const open = state.expanded.has(id);
+  c.toggle.textContent = open ? MINUS : '+';
+  c.toggle.setAttribute('aria-expanded', String(open));
+  // Both, together: the glyph alone reverses meaning between the two states and a stale label
+  // would then say the opposite of what the button does.
+  c.toggle.setAttribute('aria-label', toggleLabel(c.panel, open));
+  c.toggle.setAttribute('title', toggleLabel(c.panel, open));
   refresh();
+}
+
+// Land on the focused panel, once. Called from renderAll() rather than boot() because the card
+// has to exist and its chart has to have been drawn before a scroll offset means anything --
+// and ONCE, because renderAll() also runs on every 10 s poll, and a page that re-scrolled each
+// time would fight whoever is reading it.
+function focusScroll() {
+  state.focusDone = true;
+  const c = state.panelCards.get(state.focus);
+  if (!c) return;
+  // .topbar is sticky and wraps to two rows on a narrow screen, so its height is measured
+  // rather than assumed: a fixed offset hides the card's heading under the header exactly when
+  // the screen is small enough for that to matter.
+  const bar = document.querySelector('.topbar');
+  const clear = (bar ? bar.getBoundingClientRect().height : 0) + 8;
+  const top = c.card.getBoundingClientRect().top + window.scrollY - clear;
+  const still = window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  window.scrollTo({ top: Math.max(0, top), behavior: still ? 'auto' : 'smooth' });
 }
 
 function regionsFor(win) {

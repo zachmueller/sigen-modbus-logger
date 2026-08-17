@@ -2509,6 +2509,286 @@ class TestPageServerContract(HTTPFixture):
                       "app.js must gate the card on the source offering an endpoint")
 
 
+class TestFocusTravelsInTheFragment(unittest.TestCase):
+    """`#focus=<panel>`, and the two ways it could quietly not work.
+
+    The window, the open panels and the custom fields have always been in the page's hash, so a
+    view is a link. What was missing is WHICH panel to look at -- and the place that matters most
+    is a shared view, whose whole purpose is usually one panel. A frozen view discards the hash
+    on principle, because every other key in it asks for a window it cannot supply; `focus` is
+    the exception, and being the exception is the thing a later edit would tidy away.
+
+    The other way is silence: an unknown name, or a hash rewritten on the first render, both
+    leave a link that simply does nothing.
+
+    Source-level assertions because there is no JS harness. What they cannot see -- that the
+    panel actually opens and the scroll lands below the sticky header -- was checked with
+    headless Chrome against the fixture archive.
+    """
+
+    APP = os.path.join(HERE, "web", "app.js")
+    HTML = os.path.join(HERE, "web", "index.html")
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def code(self, path):
+        """The file with its comments stripped, so prose naming a thing is not evidence."""
+        return "\n".join(re.sub(r"//.*$", "", line) for line in self.read(path).split("\n"))
+
+    def test_the_fragment_is_read_before_a_frozen_view_gives_up_on_the_hash(self):
+        code = self.code(self.APP)
+        fn = re.search(r"function readHash\(\)\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(fn, "readHash() should still be one function")
+        body = fn.group(1)
+        focus_at = body.find("state.focus")
+        frozen_at = body.find("if (FROZEN)")
+        self.assertNotEqual(focus_at, -1, "readHash() must read the focus target")
+        self.assertNotEqual(frozen_at, -1, "the frozen early return should still be here")
+        self.assertLess(focus_at, frozen_at,
+                        "a shared view returns early from readHash(), so a focus read after "
+                        "that line works everywhere EXCEPT the page it matters most on")
+
+    def test_the_hash_the_page_writes_keeps_the_focus_it_was_given(self):
+        # writeHash() runs on the first refresh, i.e. immediately. A version that did not carry
+        # the focus forward would strip it out of the address bar before anyone could copy it
+        # back out -- the link would work once, for whoever was sent it, and never again.
+        code = self.code(self.APP)
+        fn = re.search(r"function writeHash\(\)\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(fn)
+        self.assertRegex(re.sub(r"\s+", " ", fn.group(1)),
+                         r"state\.focus\) q\.set\('focus', state\.focus\)")
+
+    def test_the_names_focus_accepts_come_from_the_panel_list(self):
+        # Two names per panel: the id, which is what `panels=` already carries, and the title
+        # slugified, which is what a person hand-editing a URL writes. Both derived from
+        # meta.panels, so a new dict in serve.py's PANELS is focusable with no JavaScript
+        # change -- the same rule the rest of the page follows.
+        code = self.code(self.APP)
+        fn = re.search(r"function focusTargets\(\)\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(fn, "the accepted names should be built in one place")
+        body = re.sub(r"\s+", " ", fn.group(1))
+        self.assertIn("state.meta.panels", body,
+                      "derived from the panel list, never a second list to keep in step")
+        self.assertIn("slug(p.id)", body)
+        self.assertIn("slug(p.title)", body)
+        # And the ids are not written down anywhere in the page.
+        for panel_id in ("temps", "stringv", "health"):
+            self.assertNotIn(f"'{panel_id}'", code,
+                             f"'{panel_id}' is serve.py's to name, not app.js's")
+
+    def test_an_unknown_focus_target_is_ignored_rather_than_reported(self):
+        # A fragment is hand-editable and a link outlives the deployment that made it. A stale
+        # name should render the ordinary page; an error about a chart that no longer exists,
+        # beside nine charts that do, is worse than no message.
+        code = self.code(self.APP)
+        fn = re.search(r"function resolveFocus\(name\)\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(fn)
+        body = re.sub(r"\s+", " ", fn.group(1))
+        self.assertIn("|| null", body, "an unmatched name resolves to nothing")
+        self.assertNotIn("fatal(", body)
+        self.assertNotIn("throw", body)
+
+    def test_a_one_glyph_toggle_still_has_a_name(self):
+        # `Show`/`Hide` was doing two jobs: saying what the button does, and being the button's
+        # accessible name. Replacing it with `+`/`−` keeps the first only if the label is set
+        # explicitly -- and set again on every toggle, since the glyph reverses meaning.
+        code = self.code(self.APP)
+        for fname in ("buildPanelCards", "togglePanel"):
+            fn = re.search(r"function %s\(\w*\)\s*\{(.*?)\n\}" % fname, code, re.S)
+            self.assertIsNotNone(fn, f"{fname}() should still be one function")
+            body = re.sub(r"\s+", " ", fn.group(1))
+            self.assertIn("MINUS", body, f"{fname}() should use the minus SIGN, not a hyphen")
+            self.assertIn("aria-label", body,
+                          f"{fname}() leaves a one-character button with no accessible name")
+            self.assertIn("aria-expanded", body)
+        self.assertNotIn("'Hide'", code, "the word-button is gone, not hidden behind a branch")
+        self.assertNotIn("'Show'", code)
+
+    def test_the_link_control_survives_a_frozen_view(self):
+        # Whoever receives a share may want to point a third person at one panel of it, and
+        # everything the fragment needs is already in the page. So the control must not carry
+        # data-live-only, and it must write the fragment itself -- writeHash() returns early in
+        # a frozen view, which is exactly where this still has to work.
+        code = self.code(self.APP)
+        fn = re.search(r"function focusLinkFor\(p\)\s*\{(.*?)\n\}", code, re.S)
+        self.assertIsNotNone(fn, "the per-panel link should be built in one place")
+        body = re.sub(r"\s+", " ", fn.group(1))
+        self.assertNotIn("data-live-only", body)
+        self.assertIn("history.replaceState", body,
+                      "the address bar is updated here, not by writeHash()")
+        self.assertIn("state.focus = p.id", body)
+        self.assertIn("aria-label", body, "an icon-only control needs a name")
+
+    def test_the_page_says_the_control_exists(self):
+        # Two hint strings, because applyFrozenMode() rewrites the hint wholesale -- so a
+        # sentence added to only one of them is missing from exactly the page where the link is
+        # most useful.
+        self.assertIn("link icon on a panel", self.read(self.HTML))
+        frozen = re.search(r"function applyFrozenMode\(\)\s*\{(.*?)\n\}",
+                           self.read(self.APP), re.S)
+        self.assertIsNotNone(frozen)
+        self.assertIn("link icon on a panel", frozen.group(1))
+
+
+class TestAShareIsPinnedToTheViewerThatMadeIt(unittest.TestCase):
+    """A share was frozen in its data and live in its code.
+
+    The share handler copies its tiles rather than pointing at them, and says why at length: a
+    pointer would let re-aggregating history change what someone was sent. The renderer was not
+    copied. `/p/<uid>` served one `site/share-view` object that loaded `/app.js`, `/charts.js`
+    and `/style.css` from the bucket root, and every one of those is overwritten in place by
+    `cdk deploy SigenSite` -- so a link sent in August was drawn by whatever code existed when it
+    was opened.
+
+    Each deploy now publishes an immutable `site/v/<version>/` bundle, named for a hash of the
+    page and everything it loads, and each share copies that bundle's page into itself. Three
+    things have to hold, and each fails silently:
+
+      - every asset the page loads must be pinned, or the share half-drifts;
+      - previously published bundles must survive the next deploy's pruning, or old links go
+        blank months later;
+      - the bundle must exist before the function that names it.
+    """
+
+    STACK = os.path.join(HERE, "cloud", "infrastructure", "lib", "site-stack.ts")
+    HANDLER = os.path.join(HERE, "cloud", "lambda", "share", "handler.py")
+    BACKFILL = os.path.join(HERE, "cloud", "backfill_share_pages.py")
+    HTML = os.path.join(HERE, "web", "index.html")
+
+    def read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def page_refs(self):
+        """Every root-absolute reference the one page makes -- what a pin has to cover."""
+        return set(re.findall(r'(?:src|href)="(/[^"]*)"', self.read(self.HTML)))
+
+    def test_the_bundle_covers_the_page_and_everything_it_loads(self):
+        # The hash is the bundle's identity, so a file the page starts loading without joining
+        # this list is a change the version cannot see -- and a share pinned to an unchanged
+        # version would then drift after all.
+        ts = self.read(self.STACK)
+        self.assertRegex(ts, r"VIEWER_SOURCES = \['index\.html', \.\.\.WEB_ASSETS\]",
+                         "the identity must cover the page as well as its assets")
+        assets = re.search(r"const WEB_ASSETS = \[(.*?)\] as const;", ts, re.S)
+        self.assertIsNotNone(assets)
+        listed = set(re.findall(r"'([^']+)'", assets.group(1)))
+        for ref in sorted(self.page_refs()):
+            self.assertIn(ref.lstrip("/"), listed,
+                          f"web/index.html loads {ref}, which WEB_ASSETS does not name -- so it "
+                          f"is neither deployed nor part of the bundle identity")
+
+    def test_every_asset_the_page_loads_is_pinned_in_the_share_copy(self):
+        # Derived from the page by regex rather than from a list of filenames, because a missed
+        # rewrite is invisible: the share renders perfectly today and loads the live /app.js
+        # tomorrow, which is precisely the drift being fixed.
+        ts = self.read(self.STACK)
+        fn = re.search(r"function pinAssets\(html: string, version: string\): string \{(.*?)\n\}",
+                       ts, re.S)
+        self.assertIsNotNone(fn, "the rewrite should live in one function")
+        body = re.sub(r"\s+", " ", fn.group(1))
+        self.assertIn(r'matchAll(/(?:src|href)="(\/[^"]*)"/g)', body,
+                      "the references are found in the page, not restated here")
+        self.assertIn("throw new Error", body,
+                      "a reference left unpinned must fail the synth, not ship")
+        for ref in sorted(self.page_refs()):
+            self.assertNotIn(f'"{ref}"', body,
+                             f"{ref} is named literally in pinAssets(); the point is that it "
+                             f"does not have to be")
+
+    def test_previously_published_bundles_are_withheld_from_pruning(self):
+        # The line the whole arrangement rests on. Old bundles are not in the deployment source
+        # -- each was deployed and forgotten -- so without excluding them from `--delete` this
+        # deploy removes the renderer every existing share names. The build stays green; links
+        # sent months ago go blank.
+        ts = self.read(self.STACK)
+        self.assertIn("exclude: [...HTML_ENTRY_POINTS, 'v/*']", ts,
+                      "the pruning deployment must withhold every published bundle")
+        bundle = re.search(r"'SiteViewerBundle', \{(.*?)\n\t\t\}\);", ts, re.S)
+        self.assertIsNotNone(bundle, "the bundle should have its own deployment")
+        body = re.sub(r"\s+", " ", bundle.group(1))
+        self.assertIn("prune: false", body,
+                      "this deployment holds one bundle and must not remove the others")
+        self.assertIn("include: ['v/*']", body)
+        self.assertIn("immutable", body, "a content-addressed key can be cached forever")
+        self.assertNotIn("distribution:", body,
+                         "a changed page produces a changed key, so there is nothing to "
+                         "invalidate -- and invalidating /v/* would pay for nothing")
+
+    def test_the_bundle_exists_before_the_function_that_names_it(self):
+        # CloudFormation does not order a Lambda environment update against a custom resource.
+        # In the wrong order, a share created in the seconds between them copies a page that is
+        # not there yet.
+        ts = self.read(self.STACK)
+        self.assertIn("shareFn.node.addDependency(bundle)", ts)
+
+    def test_the_stack_tells_the_function_which_bundle_to_pin_to(self):
+        # Passed in, not discovered by the function: which renderer a share gets is decided by
+        # the deploy that published it. A function that looked up "the newest bundle" would move
+        # every share forward on the next deploy, which is the bug.
+        ts = self.read(self.STACK)
+        self.assertRegex(ts, r"VIEWER_VERSION: version")
+        py = self.read(self.HANDLER)
+        self.assertIn('VIEWER_VERSION = os.environ.get("VIEWER_VERSION", "")', py)
+        # The bundle prefix is named in exactly one place, and that place reads the environment.
+        # A second mention would be somewhere choosing a version for itself.
+        named = [line for line in py.split("\n") if 'v/{' in line or 'v/" +' in line]
+        self.assertEqual(len(named), 1, f"the bundle prefix is built in {len(named)} places; "
+                                       f"one of them is picking a renderer at share time")
+        self.assertIn("version or VIEWER_VERSION", named[0])
+        # And a share must refuse rather than proceed unpinned if the deploy said nothing.
+        self.assertIn("if not VIEWER_VERSION:", py)
+
+    def test_the_share_copies_a_page_of_its_own(self):
+        py = self.read(self.HANDLER)
+        create = re.search(r"\ndef create\(body\):(.*?)\n\ndef ", py, re.S)
+        self.assertIsNotNone(create, "create() should still be one function")
+        body = create.group(1)
+        self.assertIn("_copy(page, dest + PAGE", body,
+                      "the share must carry the page it was made with")
+        self.assertIn("content_type=PAGE_TYPE", body,
+                      "a page served as octet-stream downloads instead of rendering")
+        # Established before the first write, like latest.json and for the same reason: a share
+        # missing its page is not a partial share, it is a link that 404s.
+        require_at = body.find("page = _require(page_key()")
+        first_write = body.find("_copy(AGG_PREFIX + rel")
+        self.assertNotEqual(require_at, -1, "the page's presence must be established, by listing")
+        self.assertLess(require_at, first_write,
+                        "check the page exists before writing any of the share")
+
+    def test_the_share_function_may_read_the_bundle_and_nothing_else_under_site(self):
+        ts = self.read(self.STACK)
+        grants = re.findall(r"shareFn\.addToRolePolicy\(new cdk\.aws_iam\.PolicyStatement\("
+                            r"\{(.*?)\}\)\);", ts, re.S)
+        site = [g for g in grants if "/site" in g]
+        self.assertEqual(len(site), 1, "one grant into site/, for the pinned page")
+        self.assertIn("/site/v/*", site[0],
+                      "scoped to the bundles: a share has no business with the live entry "
+                      "points beside them")
+        self.assertNotIn("s3:PutObject", site[0], "read-only into site/")
+
+    def test_there_is_no_distribution_wide_error_page(self):
+        # The obvious way to make a bad /p/<id> friendlier, and it must not be taken: CloudFront
+        # error responses are distribution-wide, and web/tiles.js treats a 404 as "no tile was
+        # published for that span, so the logger was off". Mapping 404 to an HTML page would hand
+        # JSON.parse a document and turn a gap in the data into a hard failure.
+        self.assertNotIn("errorResponses", self.read(self.STACK))
+
+    def test_the_backfill_reuses_the_handler_rather_than_reimplementing_it(self):
+        # The version is a hash computed in TypeScript. A Python re-implementation would be a
+        # second source of truth for the one value that decides which renderer a link gets, so
+        # the script discovers the published bundle by listing instead. The copy itself is the
+        # handler's own function, so the backfilled page and a fresh share are made the same way.
+        py = self.read(self.BACKFILL)
+        self.assertNotIn("sha256", py, "the bundle is discovered, never recomputed here")
+        self.assertNotIn("hashlib", py)
+        self.assertIn("import handler", py)
+        self.assertIn("handler._copy(", py)
+        self.assertIn("handler.page_key(", py)
+
+
 class TestWireFormat(unittest.TestCase):
     """How a value is written, which is not the same question as what it is."""
 

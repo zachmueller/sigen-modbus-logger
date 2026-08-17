@@ -9,6 +9,16 @@ pointed at ordinary tiles. There is no share renderer.
 is gated -- and re-aggregating history would silently change what someone was sent. A copy
 costs a few hundred kilobytes and means a link keeps showing what it showed on the day.
 
+**The renderer is copied too, which it was not at first.** The paragraph above was true of the
+data and false of the code: `/p/<uid>` served one `site/share-view` object that loaded
+`/app.js`, `/charts.js` and `/style.css` from the bucket root, and every one of those is
+overwritten in place by `cdk deploy SigenSite`. So a share was frozen in its numbers and live in
+its drawing, and a link sent today would be rendered by whatever existed when it was opened.
+Each share now also copies one page -- `page.html`, taken byte for byte out of the immutable
+`site/v/<VIEWER_VERSION>/` bundle the deploy published -- and that page names its own bundle's
+assets. The JS and CSS are NOT copied per share: they are content-addressed, so every share made
+from the same `web/` shares one bundle, and a redeploy of unchanged code overwrites it in place.
+
 **The tile geometry is imported, never restated.** series.choose_bucket picks the width,
 tiles.granularity_for maps it to hour/day/month, and ingest.path_for names the object. Those
 are the same functions the ingest Lambda writes tiles with and the same arithmetic
@@ -31,11 +41,13 @@ cloud/lambda/auth-edge/index.js. Without it Lambda refuses the request 403 BEFOR
 this module, so nothing appears in its log at all. See docs/FINDINGS.md 27.
 
 Environment:
-  BUCKET        the one bucket
-  AGG_PREFIX    default "agg/"     -- read
-  SHARE_PREFIX  default "share/"   -- written
-  SITE_DOMAIN   for the URL handed back to the page
-  CAPTURE_TZ    the capture host's zone; see the tzset note below
+  BUCKET          the one bucket
+  AGG_PREFIX      default "agg/"     -- read
+  SHARE_PREFIX    default "share/"   -- written
+  SITE_PREFIX     default "site/"    -- read, for the pinned viewer bundle only
+  VIEWER_VERSION  which bundle under SITE_PREFIX + "v/" a share is pinned to
+  SITE_DOMAIN     for the URL handed back to the page
+  CAPTURE_TZ      the capture host's zone; see the tzset note below
 """
 import json
 import os
@@ -62,6 +74,8 @@ s3 = boto3.client("s3")
 BUCKET = os.environ["BUCKET"]
 AGG_PREFIX = os.environ.get("AGG_PREFIX", "agg/")
 SHARE_PREFIX = os.environ.get("SHARE_PREFIX", "share/")
+SITE_PREFIX = os.environ.get("SITE_PREFIX", "site/")
+VIEWER_VERSION = os.environ.get("VIEWER_VERSION", "")
 SITE_DOMAIN = os.environ.get("SITE_DOMAIN", "")
 
 # Matches the textarea's maxlength in web/index.html. Truncated rather than refused: losing
@@ -70,6 +84,10 @@ MAX_NOTE_CHARS = 2000
 # A frozen span is finished by definition, so every object here is immutable.
 IMMUTABLE = "public, max-age=31536000, immutable"
 UID_HEX = 8
+# The share's own copy of the viewer page. `/p/<uid>` serves this object, so a share carries the
+# renderer it was made with rather than borrowing whichever one is current.
+PAGE = "page.html"
+PAGE_TYPE = "text/html; charset=utf-8"
 
 
 class BadRequest(Exception):
@@ -159,17 +177,22 @@ def _require(key, missing):
     return key
 
 
-def _copy_tile(src_key, dst_key):
-    """One tile. The caller has already established that `src_key` exists.
+def _copy(src_key, dst_key, content_type=None):
+    """One object into the share. The caller has already established that `src_key` exists.
 
     MetadataDirective REPLACE, not COPY, because Cache-Control has to change: an agg tile for
     the current day carries max-age=60 so it can be rebuilt, while a share is frozen and
     immutable forever. The other two headers are read off the source rather than guessed --
     Content-Encoding especially, since dropping it would hand the browser gzip bytes to
     JSON.parse.
+
+    `content_type` overrides what the source says, for the one caller that knows better than the
+    upload did: the viewer page is served as the share's whole document, and a page delivered as
+    application/octet-stream downloads instead of rendering -- the failure site-stack.ts already
+    carries a long comment about.
     """
     head = s3.head_object(Bucket=BUCKET, Key=src_key)
-    extra = {"ContentType": head.get("ContentType") or "application/json",
+    extra = {"ContentType": content_type or head.get("ContentType") or "application/json",
              "CacheControl": IMMUTABLE}
     if head.get("ContentEncoding"):
         extra["ContentEncoding"] = head["ContentEncoding"]
@@ -177,6 +200,12 @@ def _copy_tile(src_key, dst_key):
                    CopySource={"Bucket": BUCKET, "Key": src_key},
                    MetadataDirective="REPLACE", **extra)
     return True
+
+
+def page_key(version=None):
+    """The pinned page a share of this deployment copies. One place, because the backfill script
+    and this handler have to agree on it exactly."""
+    return f"{SITE_PREFIX}v/{version or VIEWER_VERSION}/share-view.html"
 
 
 def _fresh_uid():
@@ -268,13 +297,23 @@ def create(body):
     # so the copy below would have surfaced as an unhandled ClientError rather than a reason.
     latest = _require(f"{AGG_PREFIX}plan={plan}/{ingest.LATEST}",
                       f"plan {plan} has no {ingest.LATEST}, which every share page fetches")
+    # Also before anything is written, and for a second reason beside the first: a share whose
+    # page is missing is not a partial share, it is a link that 404s. If VIEWER_VERSION names a
+    # bundle this bucket does not hold, the deploy that set it did not publish -- which is worth
+    # saying out loud rather than discovering from a dead link.
+    if not VIEWER_VERSION:
+        raise BadRequest("this deployment did not say which viewer bundle to pin a share to, "
+                         "so a share would drift on the next deploy")
+    page = _require(page_key(),
+                    f"the viewer bundle {VIEWER_VERSION} is not published, so a share made now "
+                    f"would have no page of its own")
     uid = _fresh_uid()
     dest = f"{SHARE_PREFIX}{uid}/"
     copied = 0
     for span_start in covering(kind, start, end):
         rel = ingest.path_for(plan, width, span_start, kind)
         if AGG_PREFIX + rel in present:
-            _copy_tile(AGG_PREFIX + rel, dest + rel)
+            _copy(AGG_PREFIX + rel, dest + rel)
             copied += 1
     if not copied:
         # Every tile was absent, so the window has no records in it. Better to say so than
@@ -289,7 +328,13 @@ def create(body):
     # Required, not optional: tiles.js fetches it non-optionally, so a share without it
     # would surface as a hard error on a page that otherwise works. Its presence was
     # established above, before the first write.
-    _copy_tile(latest, f"{dest}plan={plan}/{ingest.LATEST}")
+    _copy(latest, f"{dest}plan={plan}/{ingest.LATEST}")
+
+    # The renderer, beside the data it renders. A verbatim copy rather than a page generated
+    # here: the pinned bundle's own HTML already resolves the share id out of `/p/<uid>`, so
+    # there is nothing to substitute -- and "the same bytes the deploy published" is then true by
+    # construction instead of being a claim about a string operation.
+    _copy(page, dest + PAGE, content_type=PAGE_TYPE)
 
     note = str(body.get("note") or "")[:MAX_NOTE_CHARS].strip()
     share_meta = dict(meta)
@@ -309,6 +354,10 @@ def create(body):
                           "custom": _strings(body.get("fields"))}
     share_meta["note"] = note
     share_meta["shared_at"] = time.time()
+    # Recorded rather than used: the page it names is already copied in beside this file, so
+    # nothing reads this back. It is here so that a share can be asked which renderer drew it,
+    # which is the question this whole arrangement exists to be able to answer.
+    share_meta["viewer"] = VIEWER_VERSION
     _put_json(f"{dest}plan={plan}/{ingest.META}", share_meta)
 
     # One plan, its extent already narrowed, so ensureMeta() resolves without an agg lookup.
@@ -320,7 +369,7 @@ def create(body):
     })
 
     print(json.dumps({"share": uid, "plan": plan, "bucket_s": width, "kind": kind,
-                      "tiles": copied, "hours": hours}))
+                      "tiles": copied, "hours": hours, "viewer": VIEWER_VERSION}))
     return {"ok": True, "uid": uid, "url": f"https://{SITE_DOMAIN}/p/{uid}",
             "tiles": copied, "bucket_s": width, "start": start, "end": end}
 
