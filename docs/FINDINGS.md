@@ -1162,9 +1162,22 @@ decode on one Lambda vCPU against an M-series laptop accounts for the rest witho
 wrong. The lesson is the missing provenance: a performance number in a comment needs to say where
 it was taken, or the next person cannot tell a regression from a different machine.
 
+**Raising the limit bought six days, not a year.** With the timeout at 900 s — Lambda's ceiling —
+the rebuild completed: 356 s, 615 objects, over a 4.05-day archive. That is ~88 s per archive-day,
+so 900 s is exhausted at roughly **ten** archive-days, which is late August 2026. The estimate
+offered when the lever was pulled was "roughly a year"; it was wrong by about sixty times, because
+it was reasoning about headroom in seconds without a cost-per-day to divide by. One measurement
+after the change turned a year into a week.
+
+The /tmp bound makes the point sharper. At 2.8 MB of raw a day, 512 MB is ~180 archive-days —
+eighteen times further out than the wall actually ahead. The docstring had been watching the
+resource with the most headroom and predicting trouble "in the second year", while the binding
+limit was days away.
+
 **A background job's stated limit is a guess until something measures it, and the resource that
 runs out first is rarely the one the comment is watching. Verify the effect, not the exit code —
-and never from a file the failing command did not write.**
+and never from a file the failing command did not write. Then measure again AFTER the fix: a limit
+raised without a cost-per-unit is not headroom, it is an unread number.**
 
 ---
 

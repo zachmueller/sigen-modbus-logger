@@ -250,17 +250,21 @@ def rebuild(plan):
       - a tile-format change, where every tile has to be rewritten and no raw file is
         arriving to trigger it.
 
-    Bounded by /tmp, which is 512 MB: this pulls the plan's ENTIRE raw prefix down, so at
-    roughly 1.2 GB of compressed raw a year it stops fitting somewhere in the second year.
-    When that day comes the answer is to raise ephemeral storage or rebuild month by
-    month, not to make this quietly partial -- so it does not catch the failure.
+    This pulls the plan's ENTIRE raw prefix down, so its cost is proportional to the archive and
+    every fixed limit is a deadline it eventually crosses. Two limits, and the interesting part
+    is which one:
 
-    **The TIMEOUT binds first.** Measured 2026-08-18 on five days of archive: three attempts,
-    each killed at the function's then-300 s limit with 1235 MB of 1769 MB used, none reaching
-    write_documents() -- so each wrote tiles and left meta.json stale, which is the one document
-    a presentation-only change needs. The /tmp note above was watching the wrong resource. The
-    limit is now 900 s, Lambda's ceiling; see data-stack.ts, which is also where the next move
-    is recorded, since that lever cannot be pulled twice.
+      - /tmp, 512 MB. At 2.8 MB of compressed raw a day that is roughly 180 archive-days.
+      - the function TIMEOUT. Measured IN LAMBDA 2026-08-18: 356 s and 615 objects for a
+        4.05-day archive, about 88 s per archive-day. Three earlier attempts were killed at the
+        then-300 s limit, each having written tiles but not reached write_documents() -- so they
+        left meta.json stale, the one document a presentation-only change needs.
+
+    The timeout is now 900 s, Lambda's ceiling, which if that rate stays linear is exhausted at
+    about TEN archive-days -- late August 2026. So the /tmp figure above is eighteen times
+    further out than the wall actually ahead, and the lever cannot be pulled again: the fix is
+    rebuilding month by month, bounded per invocation, taking care that a partial rebuild does
+    not rewrite meta.json with an extent covering only the month it read.
 
     A change that only alters meta.json (PANELS, ENERGY_TILES) does not want this function at
     all. REPLAY one S3 event instead -- the incremental path, about a minute, and bounded:

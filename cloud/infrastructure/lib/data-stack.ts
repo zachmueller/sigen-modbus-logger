@@ -113,10 +113,17 @@ export class DataStack extends cdk.Stack {
 			// only after building all tiles, each attempt rewrote tiles and left meta.json
 			// stale: the one artifact a presentation-only change needs. See docs/FINDINGS.md 37.
 			//
-			// 900 s is Lambda's ceiling, so this is the last time this lever can be pulled;
-			// after it, the answer is the month-scoped rebuild that function's docstring
-			// suggests, which needs care not to narrow meta.json's extent to the rebuilt month.
-			// The 512 MB /tmp its docstring watches is the wall after that, in about year two.
+			// 900 s is Lambda's ceiling, so this is the last time this lever can be pulled --
+			// and it buys FAR less than it looks like. Measured in Lambda 2026-08-18: a full
+			// rebuild of a 4.05-day archive took 356 s and wrote 615 objects, i.e. about 88 s
+			// per day of archive. If that stays linear, 900 s is exhausted at roughly ten
+			// archive-days, which is late August 2026. Days, not years.
+			//
+			// So the month-scoped rebuild that function's docstring suggests is the real fix,
+			// not a someday: `{"rebuild": hash, "month": "YYYY-MM"}`, bounded per invocation at
+			// any archive size, with care not to narrow meta.json's extent to the month it read.
+			// The 512 MB /tmp its docstring watches is nowhere near binding by comparison --
+			// 2.8 MB of raw per day is about 180 archive-days, eighteen times further out.
 			timeout: cdk.Duration.seconds(900),
 			// Lambda scales CPU with memory and the work is single-threaded Python, so
 			// there is nothing to gain above roughly one vCPU.
