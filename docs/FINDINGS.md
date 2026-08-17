@@ -858,6 +858,108 @@ that the input is finished — the clock is evidence about the clock.**
 
 ---
 
+## Verifying the handoff: two ways a finished task can still be wrong
+
+Both of these came out of a pass whose only goal was to confirm that work already recorded as
+done really was done. Neither is a new feature's bug. One is a trap laid by the *fix* in
+FINDINGS 28, and the other is the difference between "I rotated the credential" and "the
+credential works".
+
+### 31. Gzipping a stranded file recreated the collision FINDINGS 28 had just described
+
+FINDINGS 28 added a `sync.py --status` warning naming the four stranded `.bin` files, and closed
+by saying two `.bin` extensions for one span is a collision the reader does not detect: *check
+for it after any backfill that predates the uploader.* The collision then happened again — from
+the opposite direction, and by acting on that very entry's suggestion to gzip them so the
+permanent warning would go quiet.
+
+`gzip` on the Studio, one sync tick, and `raw/plan=08c047b8/` held both
+`sigen-…T092508-08c047b8.bin` (uploaded by `backfill.py` on 2026-08-16) and `….bin.gz`
+(uploaded by `sync.py` on 2026-08-17) for all four stems. `backfill.py`'s `upload_series()` keys
+on `os.path.basename(p)` and does not care about the extension, so the `.bin` had been there all
+along under a name nobody thought to look for.
+
+**The first check was wrong, and confidently.** Asking "are these already in S3?" by listing
+`….bin.gz` found exactly one version, created minutes earlier, and produced the conclusion that
+the handoff's "already offsite via `backfill.py`" was false — that four hours of raw had sat on
+one disk for three days. It was true; it was under `.bin`. **When two extensions can carry the
+same content, the absence of one proves nothing.** Same shape as FINDINGS 21: a lookup that
+cannot see the other case answers the wrong question without hesitating.
+
+**The detection signal is cheap and specific.** Duplicated identical samples vanish into mean,
+min and max (FINDINGS 28), the tiles render, and the numbers look plausible. What does not hide
+is the tile's own bookkeeping — a **zero-length `covered` sub-range**, which is
+`sort_chronologically` breaking the identical-stamp tie on basename so the `.bin` sorts first
+and `spans()` hands it `last_ts == first_ts`:
+
+```
+BEFORE  records 1554   covered: 3 sub-ranges
+          21:25:08Z .. 21:25:08Z   (0s)      <- the giveaway
+          21:25:08Z .. 21:38:25Z   (797s)
+          21:38:25Z .. 22:00:00Z   (1294s)
+AFTER   records 1125   covered: 2 contiguous sub-ranges, none degenerate
+```
+
+429 phantom records in one hour tile. **A degenerate zero-length range in `covered` means a file
+is being read twice.**
+
+**The cleanup is four steps, and skipping the last one leaves it broken for a year.** The
+affected spans were old and closed, so their tiles were already published `immutable` — FINDINGS
+30 applies and rewriting S3 is not enough:
+
+```sh
+# 1. Every stem carrying both extensions. Empty output = healthy. Add to any post-backfill check.
+aws s3 ls s3://<bucket>/raw/ --recursive --profile <p> | awk '{print $4}' \
+  | grep -E "\.bin(\.gz)?$" | sed -E 's#\.bin\.gz$##; s#\.bin$##' | sort | uniq -d
+# 2. Prove equivalence before deleting either: sha256(.bin) == sha256(gunzip -c .bin.gz).
+# 3. Delete the .bin, keep .bin.gz -- the form that travels. Versioned bucket, so it is a
+#    delete marker, not a loss. Note the logger principal is denied delete; use an admin.
+# 4. Rebuild in ONE pass -- '{"rebuild":"<plan>"}' -- then invalidate /agg/*.
+```
+
+**A warning that a fix adds is an instruction someone will follow. FINDINGS 28 made the stranded
+files visible and implied gzipping them; nothing on that path checked whether the same span was
+already offsite under another name.**
+
+### 32. A credential's timestamp is evidence about a file, not about the credential
+
+The Google client secret was reported rotated. The local evidence disagreed:
+`cloud/.google-secret` unmodified since the previous afternoon, `SigenAuthPool` not updated since
+before the handoff was written, and the handoff itself still listing rotation as outstanding. A
+rotation that stops at Google and never reaches Cognito breaks every *fresh* sign-in while
+leaving everything else looking healthy — `allow` decisions in the gate log ride an existing
+cookie and never touch Google at all, so the logs cannot see it.
+
+Comparing `sha256` of the file against `describe-identity-provider`'s `client_secret` establishes
+that the file and Cognito **agree**. It does not establish that either is current: two copies of
+the same dead secret match perfectly.
+
+**Ask the issuer.** Google validates client credentials *before* the grant, so a deliberately
+invalid authorization code separates the two failures in one unauthenticated request:
+
+```sh
+curl -s -X POST https://oauth2.googleapis.com/token \
+  -d "client_id=$CID" -d "client_secret=$(cat cloud/.google-secret)" \
+  -d "grant_type=authorization_code" -d "code=deliberately-invalid-probe" \
+  -d "redirect_uri=https://<prefix>.auth.<region>.amazoncognito.com/oauth2/idpresponse"
+```
+
+`invalid_grant` ("Malformed auth code") means the id and secret were **accepted** and only the
+junk code refused — the credential is live, and this is the pass. `invalid_client` means Google
+rejects the secret, Cognito holds a dead credential, and fresh sign-in is already broken. It
+answered `invalid_grant`, so the rotation was genuine.
+
+The corroborating evidence agreed once it was read correctly: a cold sign-in by a
+**non-allowlisted** account — which had no Cognito session to ride and therefore had to complete
+the Google exchange — succeeded after Cognito's last update, and the callback Lambda shows 0
+errors across 24 h.
+
+**For anything whose validity lives in another system, verify against that system. A local mtime
+and a matching hash are consistent with both success and total failure — the same shape as
+FINDINGS 30, where the clock was evidence about the clock.**
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is
