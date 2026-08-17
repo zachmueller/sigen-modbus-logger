@@ -1146,9 +1146,21 @@ What worked, and is the right tool for a documents-only change, is replaying one
 incremental path, it is ~62 s, and `write_documents()` is FRESH on every event, so it republishes
 `meta.json` unconditionally. Simply waiting for the next hourly rotation would have done it too.
 
-Both numbers are worth keeping: the incremental path was measured at ~10 s on two days of archive
-and is 62 s on four. Whatever makes that grow is not the constant-time day rebuild the comment
-describes, and it is the number to watch — it is the one the steady state depends on.
+The incremental path, by contrast, is structurally bounded and stayed so: `process()` downloads
+only the touched local date and the two around it — three, because a UTC day overlaps up to three
+local dates — and `run_for()` writes only the hour spans the records fall in, their day spans, the
+span before the earliest touched one, and a month at the moment it completes. That bound does not
+move as the archive ages.
+
+It is worth being careful about what the numbers do and do not show. The comment beside the
+timeout said ~10 s on two days of archive; the measurement here is 62 s. That is not evidence of
+unbounded growth, and it is probably not growth at all: the raw per local date is 1.4 MB for
+2026-08-14, when the logger started mid-afternoon, against ~3.0 MB for each full day since, so a
+three-day window has roughly doubled in content while the earlier figure's provenance — Lambda or
+a developer's Mac, cold or with a warm `SummaryCache` — is not recorded. A single-threaded Python
+decode on one Lambda vCPU against an M-series laptop accounts for the rest without anything being
+wrong. The lesson is the missing provenance: a performance number in a comment needs to say where
+it was taken, or the next person cannot tell a regression from a different machine.
 
 **A background job's stated limit is a guess until something measures it, and the resource that
 runs out first is rarely the one the comment is watching. Verify the effect, not the exit code —
