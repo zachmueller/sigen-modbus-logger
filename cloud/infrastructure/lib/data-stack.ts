@@ -98,6 +98,14 @@ export class DataStack extends cdk.Stack {
 			// Measured at ~10 s for the incremental path on two days of archive, and it
 			// is constant-time: the day rebuild always reads one day however old the
 			// archive gets. 300 s is headroom for a backfill storm, not the steady state.
+			//
+			// Re-measured 2026-08-18 on four days: the incremental path is ~62 s, still
+			// comfortable. `{"rebuild": <hash>}` is NOT -- it reads the whole raw prefix and
+			// is now killed at this limit every time, having written tiles but not the
+			// documents. So the headroom this number was chosen for is already gone, and the
+			// limit that bites is time rather than the 512 MB /tmp its docstring watched.
+			// Raising it to the 900 s maximum buys roughly a year; replaying one S3 event is
+			// the cheap way to refresh meta.json meanwhile. See docs/FINDINGS.md 37.
 			timeout: cdk.Duration.seconds(300),
 			// Lambda scales CPU with memory and the work is single-threaded Python, so
 			// there is nothing to gain above roughly one vCPU.

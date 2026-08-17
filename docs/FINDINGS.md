@@ -1114,6 +1114,46 @@ browser downloaded the file: the cheap check was too weak. Here the expensive ch
 **A rendering check is only evidence if you know what the renderer does with the request. When an
 image and a DOM disagree, believe the DOM and go find a number.**
 
+### 37. The documented rebuild had already outgrown its timeout, and said 200
+
+Renaming two panels changes `PANELS`, which `ingest.py` copies into each plan's `meta.json`. No
+raw file arrives to trigger that, and `rebuild()`'s docstring names exactly this case: *"a
+tile-format change, where every tile has to be rewritten and no raw file is arriving to trigger
+it."* So `{"rebuild": "<planhash>"}` was the documented tool. It does not work any more.
+
+Measured on four days of archive: three invocations, each killed at the function's **300 s
+limit**, 1235 MB of 1769 MB used. `ingest.run()` writes tiles before documents, so every attempt
+rewrote tiles it did not need to change and none reached `write_documents()` — the one thing a
+presentation-only change actually needs. `meta.json` kept its old timestamp, which is how this
+was noticed at all.
+
+Three things conspired to make it look like a success:
+
+- **`aws lambda invoke` retries a read timeout.** The CLI's default read timeout is 60 s, well
+  under the function's 300 s, so it gave up and re-invoked — twice. Three rebuilds of one plan
+  ran concurrently, which this function has no reserved concurrency to prevent (`data-stack.ts`
+  explains why it cannot: a new account's total concurrency quota is 10, and reserving any of it
+  is rejected outright). Harmless here only because the tiles were byte-identical.
+- **The CLI reported the timeout and left the output file alone.** `--cli-binary-format ... out.json`
+  was never written, so `cat out.json` printed a **stale response from the previous day** —
+  `{"objects": 489}`, a genuine success, for a different invocation, 20 hours earlier. Confirmed
+  by its mtime. A response file is not a response.
+- **The docstring watched the wrong resource.** It bounds itself by `/tmp` at 512 MB and predicts
+  trouble "somewhere in the second year". Time ran out in the first week.
+
+What worked, and is the right tool for a documents-only change, is replaying one S3 event —
+`{"Records":[{"s3":{"object":{"key":"raw/plan=<hash>/<newest>.bin.gz"}}}]}`. That is the
+incremental path, it is ~62 s, and `write_documents()` is FRESH on every event, so it republishes
+`meta.json` unconditionally. Simply waiting for the next hourly rotation would have done it too.
+
+Both numbers are worth keeping: the incremental path was measured at ~10 s on two days of archive
+and is 62 s on four. Whatever makes that grow is not the constant-time day rebuild the comment
+describes, and it is the number to watch — it is the one the steady state depends on.
+
+**A background job's stated limit is a guess until something measures it, and the resource that
+runs out first is rarely the one the comment is watching. Verify the effect, not the exit code —
+and never from a file the failing command did not write.**
+
 ---
 
 ## Known limits

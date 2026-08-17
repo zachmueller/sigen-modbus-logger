@@ -254,6 +254,25 @@ def rebuild(plan):
     roughly 1.2 GB of compressed raw a year it stops fitting somewhere in the second year.
     When that day comes the answer is to raise ephemeral storage or rebuild month by
     month, not to make this quietly partial -- so it does not catch the failure.
+
+    **The TIMEOUT binds first, and already does.** Measured 2026-08-18 on four days of
+    archive: three attempts, each killed at the function's 300 s limit with 1235 MB of 1769 MB
+    used, none reaching write_documents() -- so it wrote tiles and never refreshed meta.json,
+    which is the one document a presentation-only change needs. The /tmp note above was
+    watching the wrong resource.
+
+    Until the limit is raised, a change that only alters meta.json (PANELS, ENERGY_TILES) is
+    better applied by REPLAYING one S3 event, which is the incremental path and takes about a
+    minute:
+
+        aws lambda invoke --function-name <IngestFunctionName> \\
+            --payload '{"Records":[{"s3":{"object":{"key":"raw/plan=<hash>/<newest>.bin.gz"}}}]}' \\
+            --cli-binary-format raw-in-base64-out --cli-read-timeout 420 /dev/stdout
+
+    Or simply wait: write_documents() is FRESH on every event, so the next rotation carries it.
+    Pass --cli-read-timeout either way. The default is 60 s, and when the CLI gives up it
+    RETRIES -- three concurrent rebuilds of the same plan, since this function has no reserved
+    concurrency (see data-stack.ts for why it cannot). See docs/FINDINGS.md 37.
     """
     data_dir = _download_plan(plan, want_dates=None)
     found = series.discover(data_dir)
