@@ -2574,7 +2574,7 @@ class TestFocusTravelsInTheFragment(unittest.TestCase):
         self.assertIn("slug(p.id)", body)
         self.assertIn("slug(p.title)", body)
         # And the ids are not written down anywhere in the page.
-        for panel_id in ("temps", "stringv", "health"):
+        for panel_id in ("temps", "panels-volts", "health"):
             self.assertNotIn(f"'{panel_id}'", code,
                              f"'{panel_id}' is serve.py's to name, not app.js's")
 

@@ -503,7 +503,7 @@ viewer is broken" from "that directory has no archive in it".
 | Energy this window | Differences of the device's own lifetime counters — the independent cross-check, not an integral of the power series. |
 | Power flow | Grid, load, battery and PV on one kW axis, with the sign conventions on the card. |
 | Battery SOC | Its own chart. Never a second y-axis on the power plot. |
-| PV strings | Per-string current, and voltage behind a toggle. `pv1..pv4` only: the other 32 documented channels return the −1 absent marker here. |
+| PV panels | Current per DC input, and voltage behind a toggle. `pv1..pv4` — the inverter's four inputs, each a group of panels — only: the other 32 documented channels return the −1 absent marker here. |
 | Grid quality | Frequency, phase A voltage and power factor, as separate small charts. |
 | Temperatures | PCS internal and average cell, both °C, so one axis is honest. |
 | Plant state | Running state, grid connection and EMS work mode as labelled bands; all six alarm words OR-ed over each bucket. |
@@ -599,10 +599,12 @@ From this server, what is left is:
   view is usually one panel, and until now that reason could only be written out in the note.
 
   A panel is named by its id or by its title, so `#focus=temps` and `#focus=temperatures`
-  are the same request, as are `#focus=stringv` and `#focus=pv-string-voltage`. Both come
-  from `PANELS` in `serve.py`, so a new chart there is focusable with no other change. A
-  name that matches nothing is ignored — a link outlives the deployment that made it, and a
-  stale name should still render the page.
+  are the same request, as are `#focus=panels-volts` and `#focus=pv-panels-voltage`. Both
+  come from `PANELS` in `serve.py`, so a new chart there is focusable with no other change.
+  A name that matches nothing is ignored — a link outlives the deployment that made it, and
+  a stale name should still render the page. Which is also why an **id** is worth leaving
+  alone once links exist: renaming one drops that panel from any saved `panels=` or `#focus=`
+  that names it. A frozen share is unaffected, since it carries its own copy of the list.
 - **Download CSV.** The bucketed numbers behind the view, matching the table view
   exactly; `&raw=1` gives per-record rows in `decode.py`'s shape.
 

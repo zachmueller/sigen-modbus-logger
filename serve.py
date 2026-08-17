@@ -79,6 +79,15 @@ LIVE_FIELDS = [
 # Which chart is made of which fields. Slots are categorical palette positions,
 # assigned to an ENTITY and never re-used for another one, so grid is the same
 # colour on every chart it appears on.
+#
+# **An `id` is a URL.** It appears in the page's hash as `panels=` and as `#focus=`, and it
+# reaches an /api/window query, so renaming one silently drops that panel from any saved link
+# that names it -- the id no longer matches a panel, and nothing is there to complain. Titles
+# are free to change; ids are the part someone may have sent to somebody.
+#
+# Shares are the exception, and deliberately: ingest.py copies this list into each plan's
+# meta.json, so a frozen share carries the ids and titles it was made with and keeps rendering
+# them. See FINDINGS 35 -- a share holds its own copy of both the data and the page.
 PANELS = [
     {
         "id": "power", "title": "Power flow", "unit": "kW", "kind": "lines",
@@ -99,12 +108,13 @@ PANELS = [
         "series": [{"key": "plant_ess_soc", "label": "SOC", "slot": 3}],
     },
     {
-        "id": "strings", "title": "PV string current", "unit": "A",
+        "id": "panels-amps", "title": "PV panels current", "unit": "A",
         "kind": "lines", "height": 190, "ramp": True,
-        "note": "pv1..pv4 only: the other 32 documented channels return the -1 "
+        "note": "pv1..pv4 are the inverter's four DC inputs, each a group of panels. "
+                "Those four only: the other 32 documented channels return the -1 "
                 "absent marker on this unit. Power needs V x I per sample, which "
                 "bucketed V and I cannot reconstruct -- so current, which is what "
-                "shows a shaded string.",
+                "shows a shaded group.",
         "series": [
             {"key": "inverter_pv1_current", "label": "pv1", "slot": 1},
             {"key": "inverter_pv2_current", "label": "pv2", "slot": 2},
@@ -113,12 +123,12 @@ PANELS = [
         ],
     },
     {
-        "id": "stringv", "title": "PV string voltage", "unit": "V",
+        "id": "panels-volts", "title": "PV panels voltage", "unit": "V",
         "kind": "lines", "height": 190, "ramp": True, "collapsed": True,
-        "note": "Strings differ in module count, so their voltages are not "
-                "comparable to each other -- compare each to its own settled Voc "
-                "(FINDINGS 10). Full voltage at zero current is the MPPT "
-                "self-check, not a fault.",
+        "note": "The four groups differ in how many panels are wired in series, so "
+                "their voltages are not comparable to each other -- compare each to "
+                "its own settled Voc (FINDINGS 10). Full voltage at zero current is "
+                "the MPPT self-check, not a fault.",
         "series": [
             {"key": "inverter_pv1_voltage", "label": "pv1", "slot": 1},
             {"key": "inverter_pv2_voltage", "label": "pv2", "slot": 2},
