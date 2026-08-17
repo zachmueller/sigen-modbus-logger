@@ -329,6 +329,40 @@ appearing in the output is the check that the hash is real. Without `--exclusive
 unchanged stacks report `(no changes)` and are skipped anyway, so it buys nothing: notably
 `SigenAuthPool` is *not* redeployed, and its `GoogleClientSecret` parameter is not needed.
 
+### Rebuilding every tile — not in Lambda
+
+```sh
+python3 cloud/rebuild_tiles.py --from-s3 --plan <planhash> --invalidate
+python3 cloud/rebuild_tiles.py --data-dir ~/sigen/data --invalidate    # from a local copy
+```
+
+Two jobs need this, both rare: a **backfill**, where one pass is safer than letting a burst of
+S3 events race each other over the same day tile, and a **tile-format change**, where every tile
+has to be rewritten and no raw file is arriving to trigger it.
+
+It used to be `{"rebuild": "<planhash>"}` on the ingest Lambda, which now refuses that payload
+and says so. A whole-archive rebuild costs time proportional to the archive — measured at ~88 s
+per archive-day — so no fixed timeout holds it, and it crossed 300 s in the archive's first week.
+Lambda's 900 s ceiling would have bought about six days. The failure mode is what decided it: an
+unbounded job under a deadline gets killed part-way, and `ingest.run()` writes documents only
+after every tile, so "part-way" means tiles rewritten and `meta.json` stale — worse than not
+running. See [FINDINGS 37](../docs/FINDINGS.md).
+
+The script imports the Lambda handler's own `_upload()` and `_rewrite_index()`, so the objects
+are identical to the ones the hourly path writes, including the deliberate refusal to upload
+`index.json` directly — a rebuild sees only the plans it was given, and an index built from those
+alone once dropped the recovered 1 Hz series. **Pass `--invalidate`:** a finished tile is
+published immutable, so CloudFront can serve the old bytes for a year (FINDINGS 30).
+
+A change that only alters `meta.json` — `PANELS`, `ENERGY_TILES` in `serve.py` — needs none of
+this. Replay one S3 event, or wait for the next rotation:
+
+```sh
+aws lambda invoke --function-name <IngestFunctionName> --cli-read-timeout 420 \
+    --payload '{"Records":[{"s3":{"object":{"key":"raw/plan=<hash>/<newest>.bin.gz"}}}]}' \
+    --cli-binary-format raw-in-base64-out /dev/stdout
+```
+
 ## Cost
 
 Well under **$1/month**. There is no Route53 hosted zone — DNS lives at the registrar
