@@ -7,8 +7,9 @@ part that has to keep running on a bare Python cannot quietly grow a dependency.
 
 Two optional additions do not hold to that, and are off by default: `sync.py`, which
 copies rotated archive files to your own S3 bucket and needs `boto3`; and `cloud/`,
-which deploys a hosted viewer and needs Node at deploy time only. Neither runs unless
-you configure it, and neither is needed to capture, decode or view locally.
+which deploys a hosted viewer — Node to deploy the stacks, `boto3` for the handful of
+maintenance scripts you run by hand. Neither runs unless you configure it, and neither
+is needed to capture, decode or view locally.
 
 **Nothing here writes to the inverter.** Holding registers are read with function
 code 3 — which is a read — and no write function code is ever issued. Registers
@@ -189,9 +190,9 @@ python3 config.py --render deploy/launchd.plist.template
 | `sync.py` | Copies rotated archive files to S3. The one module that needs `boto3`, imported lazily inside it. Off unless `sync_enabled`. |
 | `tiles.py` | The wire format both read paths produce, so the local viewer and the hosted one cannot disagree. Not a CLI. |
 | `ingest.py` | An archive directory to a directory of precomputed tiles. Knows nothing about S3, which is what makes it testable. Not a CLI. |
-| `cloud/` | The hosted viewer: CDK stacks, the ingest Lambda, and the backfill. Deploy-time only; see [cloud/README.md](cloud/README.md). |
+| `cloud/` | The hosted viewer: CDK stacks, the ingest and share Lambdas, and the maintenance scripts — a raw backfill, a tile rebuild, and one that gives older shares their own page. Deploy-time only; see [cloud/README.md](cloud/README.md). |
 | `series.py` | Archive index, bucket aggregation and health scan behind the viewer. Not a CLI. |
-| `web/` | The viewer's page: one HTML file, one stylesheet, two scripts. No framework, no CDN. |
+| `web/` | The viewer's page: one HTML file, one stylesheet, three scripts — the renderer, the charts, and the tile adapter. No framework, no CDN. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
 | `regmap.json` | The register map: 358 fields, 10 alarm appendices, 6 enums. Generated, not hand-written. |
 | `bin/status.sh` | Health check: logger and viewer daemon state, recent heartbeats, gap/degraded counts, archive size. No sudo. |
@@ -206,7 +207,8 @@ python3 config.py --render deploy/launchd.plist.template
 | `deploy/viewer.plist.template` | The viewer's LaunchDaemon definition. `ProcessType: Background`, so the logger wins any contention. |
 | `deploy/launchagent.plist.template` | LaunchAgent alternative, for a host that *does* auto-login. |
 | `tests/test_offline.py` | The whole capture/decode path against a fake device. No hardware, no network. |
-| `tests/test_web.py` | The viewer: index, aggregation, health, HTTP. Asserts it can never become a second Modbus client. |
+| `tests/test_web.py` | The viewer: index, aggregation, health, HTTP. Asserts it can never become a second Modbus client. Also the cloud contracts, at source level, since there is no JS harness. |
+| `docs/FINDINGS.md` | Every bug this project has found, what made each one quiet, and the rule it produced. Referenced by number from the code. |
 | `examples/` | A redacted excerpt of `dump.py --json` output. |
 
 The Python files sit flat at the repository root on purpose: Python puts the
@@ -522,6 +524,12 @@ cannot return anything new at any interval; `/api/csv` is not a route a tile sou
 all. `app.js` derives that from the source rather than being told (`POLLS`), so there is
 nothing for a deployment to remember. This viewer is the live one, and it is unchanged.
 
+Every panel's heading carries a link icon, which copies a URL opening the page on that panel,
+and a `−`/`+` to collapse or expand it; an expanded one also offers `Table`, the numbers behind
+the chart. Those `+`/`−` **buttons** are not the `+`/`−` **keys** above — the keys zoom the
+window, the buttons open one chart. Collapsing is not cosmetic: only expanded panels are
+requested, so a page showing four charts costs a quarter of one showing sixteen.
+
 ### Windows, buckets and stride
 
 The page asks for a *window*; how to build it is `series.py`'s business, and every
@@ -584,8 +592,11 @@ tooltips, the min–max and the provenance; a CSV loses the picture.
 
 This server's answer used to be a self-contained HTML file. It has been **retired** in
 favour of a shared URL from the hosted viewer, which is a better answer whenever the
-recipient is online: nothing to attach, nothing to bounce off a mailbox size limit,
-and it renders through the same `app.js` rather than a frozen copy of it.
+recipient is online: nothing to attach, and nothing to bounce off a mailbox size limit.
+
+It is still a frozen copy, which is the part of the export's design worth keeping: a share
+copies the tiles it needs *and* the page that draws them, so what someone opens next year is
+what was on screen the day it was sent. What the export could not be is a link.
 
 From this server, what is left is:
 
@@ -596,7 +607,7 @@ From this server, what is left is:
   everything else as the rest of the hash says. The link icon in a panel's heading copies
   such a link for you. It is accepted on every form of this page — this server, the hosted
   viewer, and a `/p/<id>` share, which is where it earns the most: the reason for sending a
-  view is usually one panel, and until now that reason could only be written out in the note.
+  view is usually one panel, and the alternative is describing which one in prose.
 
   A panel is named by its id or by its title, so `#focus=temps` and `#focus=temperatures`
   are the same request, as are `#focus=panels-volts` and `#focus=pv-panels-voltage`. Both
@@ -611,9 +622,17 @@ From this server, what is left is:
 The page itself is source-agnostic and that is what makes the hosted viewer possible
 without a second renderer: `web/app.js` reads every answer through one `getJSON()`
 seam, and a deployment that sets `window.SIGEN_SOURCE` before the script loads points
-that seam at precomputed tiles instead of at this server. A shared view is the same
+that seam at precomputed tiles instead of at this server. A shared view is that same
 page with a fixed window — `applyFrozenMode()` removes every control that would ask
 for another one, and labels the ages `when shared` rather than presenting them as now.
+
+**One renderer, and a share still gets a copy of it.** Those are not in tension, and the
+distinction cost a bug to learn. There is one `web/` in this repository and no second
+implementation to drift — but a *deployment* overwrites its files in place, so a share that
+pointed at them was frozen in its data and live in its code, drawn by whatever existed when
+it was opened. Each deploy therefore publishes an immutable copy of the whole bundle under a
+key naming its own contents, and a share copies that page in beside its tiles. Same code,
+pinned; see [Findings 35](docs/FINDINGS.md) and [cloud/README.md](cloud/README.md).
 
 ### The API
 
@@ -632,6 +651,13 @@ Which fields make up which chart lives in `PANELS` at the top of `serve.py`, so 
 new chart is a dict there, not new JavaScript. A test asserts every field named in
 it is actually covered by the block plan — otherwise a typo would render an empty
 chart that looks like a quiet night.
+
+This server reads `PANELS` on every request, so an edit shows up on reload. The hosted
+viewer does not: `ingest.py` copies the list into each plan's `meta.json` when it builds
+tiles, so a change reaches it on the next rotation — about an hour — or immediately if you
+replay one S3 event. It also means a frozen share keeps the panels, titles and ids it was
+made with, which is why renaming an `id` cannot break an existing share and can break a
+saved link. `cloud/README.md` has the commands.
 
 ### Exposure and privacy
 
@@ -913,6 +939,8 @@ updating.
 | Viewer shows a straight line where you expected a gap | It should not — report it. Lines break when the empty run exceeds the field's cadence; a joined line means the gap was shorter than that. |
 | Viewer values differ from `bin/latest.sh` | `latest.sh` prints the newest record; the page's tiles print the newest record that **carried data**, and label it `last known good`. They differ exactly during an outage. |
 | Page loads but every chart is empty | Check the window: panning back past the start of the archive is legal and shows nothing. Press **Now**. |
+| A saved link no longer opens the panel it names | Its `panels=` or `#focus=` names a panel `id` that has since been renamed. An unknown name is ignored rather than reported, so the page renders normally and one chart stays shut. Re-copy the link; ids are in `PANELS`. |
+| Hosted viewer still shows an old panel title after editing `PANELS` | Expected for up to an hour. `ingest.py` copies the list into `meta.json` when it builds tiles, so the change arrives with the next rotation — or immediately, by replaying one S3 event (`cloud/README.md`). The local viewer shows it on reload. |
 
 ---
 
