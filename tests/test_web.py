@@ -2769,6 +2769,38 @@ class TestAShareIsPinnedToTheViewerThatMadeIt(unittest.TestCase):
                       "points beside them")
         self.assertNotIn("s3:PutObject", site[0], "read-only into site/")
 
+    def test_the_share_url_resolves_to_that_share_s_own_page(self):
+        # A three-file agreement, and each half is quiet when wrong: the edge function names the
+        # key, the handler writes it, and the behaviour has to use the origin that can reach it.
+        # An origin with originPath /site would look for `site/share/<uid>/page.html` and 404
+        # every share link, which no test of either file alone would notice.
+        ts = self.read(self.STACK)
+        fn = re.search(r"'ShareRewrite', \{(.*?)\n\t\t\}\);", ts, re.S)
+        self.assertIsNotNone(fn, "the rewrite should still be one CloudFront Function")
+        rewrite = fn.group(1)
+        py = self.read(self.HANDLER)
+        page = re.search(r'^PAGE = "([^"]+)"', py, re.M)
+        self.assertIsNotNone(page, "the handler should name the page in one place")
+        self.assertIn("'/share/' + m[1] + '/" + page.group(1) + "'", rewrite,
+                      "the URL the edge resolves must be the key the handler writes")
+        self.assertNotIn("/share-view", rewrite,
+                         "the object every share had in common is what moved under them")
+        behaviour = re.search(r"'/p/\*': \{(.*?)\n\t\t\t\t\},", ts, re.S)
+        self.assertIsNotNone(behaviour, "the /p/* behaviour should still be here")
+        self.assertIn("origin: dataOrigin", behaviour.group(1),
+                      "siteOrigin prepends /site, which cannot reach share/")
+        # And the retired entry point is gone rather than left deployed and unreachable.
+        self.assertIn("const HTML_ENTRY_POINTS = ['view'] as const;", ts)
+
+    def test_a_url_that_is_not_a_share_id_is_answered_at_the_edge(self):
+        # Not with a distribution error response, for the reason below -- and not by serving a
+        # page that boots and then fails, which is what /p/<garbage> used to do.
+        ts = self.read(self.STACK)
+        fn = re.search(r"'ShareRewrite', \{(.*?)\n\t\t\}\);", ts, re.S)
+        self.assertIsNotNone(fn)
+        self.assertIn("statusCode: 404", fn.group(1),
+                      "the function should answer a malformed /p/ itself")
+
     def test_there_is_no_distribution_wide_error_page(self):
         # The obvious way to make a bad /p/<id> friendlier, and it must not be taken: CloudFront
         # error responses are distribution-wide, and web/tiles.js treats a 404 as "no tile was

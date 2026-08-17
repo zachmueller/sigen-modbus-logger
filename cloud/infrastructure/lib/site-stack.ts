@@ -11,14 +11,19 @@ const WEB = path.join(REPO_ROOT, 'web');
 
 /**
  * The HTML entry points buildSite() writes with NO file extension, because they answer at
- * /view and /p/<uid> and the URL is the contract.
+ * /view and the URL is the contract.
  *
  * Named once and shared, because the deployment has to know which objects need their
  * Content-Type declared -- see the two BucketDeployments below. A file added to buildSite()
  * without being added here would be uploaded as binary/octet-stream and would download
  * instead of rendering, which is a symptom nothing about it suggests.
+ *
+ * There used to be a second, `share-view`, serving every /p/<uid>. It is gone because a share
+ * now carries its own page: /p/<uid> serves `share/<uid>/page.html`, copied at share time out of
+ * the pinned bundle. Being absent from this list is also what lets the Site deployment prune the
+ * object it left behind.
  */
-const HTML_ENTRY_POINTS = ['view', 'share-view'] as const;
+const HTML_ENTRY_POINTS = ['view'] as const;
 
 /** Copied verbatim; their extensions tell S3 what they are. */
 const WEB_ASSETS = ['app.js', 'tiles.js', 'charts.js', 'style.css', 'favicon.svg'] as const;
@@ -76,7 +81,7 @@ function viewerVersion(): string {
  *
  * Two origins over one bucket, differing only in originPath, so no URL rewriting is needed
  * for the common cases: /view resolves to site/view, /agg/x to agg/x. Only /p/* needs a
- * rewrite, because one page has to answer for every share id, and that is a CloudFront
+ * rewrite, because a share id has to select that share's own page, and that is a CloudFront
  * Function rather than a Lambda@Edge -- it is a string operation, and those behaviours have
  * no gate to run anyway.
  */
@@ -196,20 +201,38 @@ export class SiteStack extends cdk.Stack {
 		const shareOrigin = cdk.aws_cloudfront_origins.FunctionUrlOrigin
 			.withOriginAccessControl(shareUrl);
 
-		// /p/<uid> -> one page for every share id. A CloudFront Function, not a
-		// Lambda@Edge: it is three lines of string work on a path, it runs before the
-		// cache, and it costs about a sixth as much per request.
+		// /p/<uid> -> that share's OWN page. A CloudFront Function, not a Lambda@Edge: it is
+		// string work on a path, it runs before the cache, and it costs about a sixth as much
+		// per request.
+		//
+		// It used to point every share id at one `/share-view` object, which is what made a share
+		// drift: that object loads the live /app.js. Each share now holds a copy of the page it
+		// was made with, so the id selects the renderer as well as the data. See FINDINGS 35.
 		const shareRewrite = new cdk.aws_cloudfront.Function(this, 'ShareRewrite', {
 			code: cdk.aws_cloudfront.FunctionCode.fromInline(`
 function handler(event) {
-  // Any /p/<anything> serves the share page. The id is read from the URL by the page
-  // itself, which then fetches its data from /share/<id>/ -- a separate, public origin
-  // path. Rewriting here rather than in the page means a share link has no query string
-  // and no fragment to lose.
-  event.request.uri = '/share-view';
-  return event.request;
+  // The share's own page, beside its own tiles. The page still reads the id out of
+  // location.pathname to find them -- which is why this rewrite has to leave the browser's
+  // URL alone, and why a share link needs no query string and has no fragment to lose.
+  var m = event.request.uri.match(/^\\/p\\/([A-Za-z0-9_-]{4,64})\\/?$/);
+  if (m) {
+    event.request.uri = '/share/' + m[1] + '/page.html';
+    return event.request;
+  }
+  // Anything else under /p/ is not a share id. Answered HERE rather than by a distribution
+  // error response: those are distribution-wide, and web/tiles.js reads a 404 as "no tile was
+  // published for that span", so mapping 404 to a document would turn a gap in the data into a
+  // hard failure across the whole viewer.
+  return {
+    statusCode: 404, statusDescription: 'Not Found',
+    headers: {
+      'content-type': { value: 'text/plain; charset=utf-8' },
+      'cache-control': { value: 'no-store' }
+    },
+    body: 'Not a share link. A share URL looks like /p/1a2b3c4d.'
+  };
 }`),
-			comment: 'Serve the share page for any /p/<uid>',
+			comment: 'Serve each share its own page: /p/<uid> -> /share/<uid>/page.html',
 		});
 
 		const immutable = cdk.aws_cloudfront.CachePolicy.CACHING_OPTIMIZED;
@@ -304,10 +327,15 @@ function handler(event) {
 					allowedMethods: cdk.aws_cloudfront.AllowedMethods.ALLOW_ALL,
 				},
 				'/p/*': {
-					origin: siteOrigin,
+					// dataOrigin, NOT siteOrigin: the rewrite above resolves to
+					// `share/<uid>/page.html`, and an origin with originPath /site would look
+					// for `site/share/<uid>/…`. The bucket policy already grants share/*.
+					origin: dataOrigin,
 					viewerProtocolPolicy:
 						cdk.aws_cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-					cachePolicy: respectOrigin,
+					// A share's page is written once and never rewritten, so it is cacheable on
+					// the same terms as its tiles.
+					cachePolicy: immutable,
 					functionAssociations: [{
 						function: shareRewrite,
 						eventType: cdk.aws_cloudfront.FunctionEventType.VIEWER_REQUEST,
@@ -465,9 +493,9 @@ function handler(event) {
 			// one prefix would race to remove each other's work.
 			prune: false,
 			distribution: dist,
-			// /p/<uid> is rewritten to /share-view on viewer-request, BEFORE the cache
-			// lookup, so /share-view is the cache key to invalidate.
-			distributionPaths: ['/view', '/share-view'],
+			// Only /view. A share's page is immutable and lives under /share/<uid>/, so there is
+			// no shared entry point behind /p/* left to invalidate.
+			distributionPaths: ['/view'],
 		});
 
 		// The pinned bundle, for a share to copy its page out of. Every object here is immutable
@@ -540,21 +568,25 @@ function buildSite(out: string, cfg: CloudConfig, version: string): boolean {
 	fs.writeFileSync(path.join(out, 'view'),
 		withSource(`window.SIGEN_SOURCE={kind:"tiles",base:"/agg/",share:"/api/share"};`));
 
-	// A frozen share. The id comes out of the path, so one object answers for all of them,
-	// and its data comes from /share/<id>/ -- public, and a copy, so re-aggregating history
-	// can never change what someone was sent.
+	// A frozen share. The id comes out of the path, so ONE page answers for all of them, and its
+	// data comes from /share/<id>/ -- public, and a copy, so re-aggregating history can never
+	// change what someone was sent.
+	//
+	// It is written ONLY into the pinned bundle below. There is deliberately no `share-view`
+	// beside `view` any more: that object was the one thing every share had in common, and
+	// therefore the one thing that moved under them. The share Lambda copies this page into each
+	// share as `page.html`, and /p/<uid> serves that copy.
 	const sharePage = withSource(
 		`(function(){var m=location.pathname.match(/^\\/p\\/([A-Za-z0-9_-]{4,64})/);`
 		+ `if(!m){document.title="Not a share link";return;}`
 		+ `window.SIGEN_SOURCE={kind:"tiles",base:"/share/"+m[1]+"/",frozen:true};})();`);
-	fs.writeFileSync(path.join(out, 'share-view'), sharePage);
 
-	// The same share page with every asset reference pinned, under a key named for the bundle's
-	// contents. The share Lambda copies THIS file into each share it creates, byte for byte, so
-	// what a share renders with is settled the moment it is made.
+	// Under a key named for the bundle's contents, with every asset reference pinned. The share
+	// Lambda copies THIS file byte for byte, so what a share renders with is settled the moment
+	// it is made.
 	//
-	// A `.html` extension deliberately, unlike the entry points beside it: nothing has to route
-	// to this name, so it can carry the extension that tells S3 what it is instead of needing a
+	// A `.html` extension deliberately, unlike the entry point beside it: nothing has to route to
+	// this name, so it can carry the extension that tells S3 what it is instead of needing a
 	// place in HTML_ENTRY_POINTS.
 	const pinned = path.join(out, 'v', version);
 	fs.mkdirSync(pinned, { recursive: true });
