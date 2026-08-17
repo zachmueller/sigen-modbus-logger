@@ -1088,6 +1088,32 @@ green build, a working `/view`, and every share sent before that day rendering b
 **"Immutable" is a claim about a whole page, and a page is code plus data. Check the claim against
 both halves — the half nobody thought of as content is the half that gets overwritten in place.**
 
+### 36. A headless screenshot of a scrolled page is blank, and the page is fine
+
+`#focus=<panel>` scrolls the focused card into view. Checking it the obvious way —
+`--headless=new --screenshot` at a viewport short enough to need scrolling — produced a
+**uniformly blank image** for every target except the first panel, whose offset happens to be
+near zero. The DOM dump from the same run was correct and byte-identical to the working case.
+
+The page was never wrong. `--screenshot` captures with `captureBeyondViewport`, which composes
+the clip from the scroll offset *and* then scrolls, so it lands at roughly `2 × scrollY`. For a
+1449 px scroll on a 2579 px document that is past the end, hence the blank. The tell was there
+and easy to misread: **no sticky header in the image**. A sticky `.topbar` is painted at the top
+of the viewport at every real scroll position, so an image without it is not a view of the page
+at any offset.
+
+What settled it in one run was measuring instead of looking — a temporary script in the page
+writing `window.scrollY`, `document.documentElement.scrollHeight`, the topbar's height and the
+card's `getBoundingClientRect().top` into `document.title`, which `--dump-dom` then reports.
+`cardTop=77` against a 69 px header is the assertion the screenshot could not make.
+
+This is the same lesson as FINDINGS 23 from the other direction. There, `curl` said 200 while a
+browser downloaded the file: the cheap check was too weak. Here the expensive check was
+*actively misleading*, and the cheap one was right.
+
+**A rendering check is only evidence if you know what the renderer does with the request. When an
+image and a DOM disagree, believe the DOM and go find a number.**
+
 ---
 
 ## Known limits
