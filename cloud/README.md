@@ -148,7 +148,7 @@ aws acm wait certificate-validated --certificate-arn <arn> --profile <profile> \
 
 ### The stacks
 
-There are **four**, and auth is two of them:
+There are **five**. Four form an ordered chain, and auth is two of them:
 
 ```sh
 npx cdk deploy SigenData     --profile <profile>   # bucket, ingest Lambda, S3 events
@@ -158,6 +158,14 @@ npx cdk deploy SigenAuthPool --profile <profile> \
 npx cdk deploy SigenAuthEdge --profile <profile>   # the read gate, with those ids baked in
 npx cdk deploy SigenSite     --profile <profile>   # CloudFront + behaviours
 ```
+
+The fifth, `SigenAudit`, is the CloudTrail trail and its log bucket. It is outside the
+sequence because it references nothing and nothing references it, so it can be deployed at
+any point — including before `SigenData`, which is arguably where it belongs, since a trail
+is most useful when it predates the thing it audits. Management events only: the hourly
+uploader's `PutObject` is a *data* event and does not appear, which is what keeps it
+effectively free. `audit-stack.ts` explains the cost model and the one limit worth knowing
+(a single-account trail cannot be tamper-proof against the account's own administrator).
 
 `SigenAuthEdge` and `SigenSite` **do not appear in `cdk ls`** until
 `cognito_user_pool_id` and `cognito_client_id` are in `cloud.json`. That is deliberate: a

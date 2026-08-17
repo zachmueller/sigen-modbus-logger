@@ -18,6 +18,9 @@
  *   4. cdk deploy SigenSite        CloudFront; prints the CNAME target
  *      -> point the subdomain at it
  *
+ * SigenAudit is outside that sequence on purpose: it references nothing and nothing
+ * references it, so it can go at any point.
+ *
  * Steps 2 and 3 are separate because a Lambda@Edge cannot have environment variables and
  * asset bundling happens before CloudFormation resolves tokens; auth-stack.ts explains it
  * at length. Step 2 needs the Google client secret:
@@ -28,6 +31,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { load } from '../lib/config';
 import { DataStack } from '../lib/data-stack';
+import { AuditStack } from '../lib/audit-stack';
 import { AuthPoolStack, AuthEdgeStack } from '../lib/auth-stack';
 import { SiteStack } from '../lib/site-stack';
 
@@ -44,6 +48,14 @@ const commonProps: cdk.StackProps = {
 new DataStack(app, 'SigenData', {
 	...commonProps, cfg,
 	description: 'Telemetry bucket, ingest Lambda and the capture host credential',
+});
+
+// Account-level audit, coupled to nothing. Deliberately not part of DataStack: a trail
+// does not belong to the data plane, and it should not be redeployed or rolled back
+// because the ingest Lambda changed.
+new AuditStack(app, 'SigenAudit', {
+	...commonProps, cfg,
+	description: 'CloudTrail management-event trail and its log bucket',
 });
 
 const pool = new AuthPoolStack(app, 'SigenAuthPool', {
