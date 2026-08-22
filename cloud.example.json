@@ -4,7 +4,7 @@
  "__aws": "Where it deploys. Everything is us-east-1: Lambda@Edge and ACM certificates must live there, so using one region throughout removes every cross-region stack reference. profile is a named ~/.aws profile -- credentials never sit in this tree.",
  "account_id": "000000000000",
  "region": "us-east-1",
- "profile": "sigen",
+ "profile": "solar",
 
  "__site": "The public face. domain must be a SUBDOMAIN, not an apex: it is pointed at CloudFront with a CNAME, which is illegal at a zone apex, and using a subdomain is what keeps the parent zone's own records -- MX especially -- untouched. You add that CNAME by hand at whatever registrar holds the parent.",
  "domain": "solar.example.com",
