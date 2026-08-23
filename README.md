@@ -1,15 +1,24 @@
 # Sigenergy SigenStor local telemetry
 
-Read-only Modbus TCP capture and decode for a Sigenergy SigenStor, over your own
-LAN. No vendor API, no vendor account. **Capture, decode and the local viewer are
-stdlib-only Python 3.9+ with nothing to `pip install`** — a test asserts it, so the
-part that has to keep running on a bare Python cannot quietly grow a dependency.
+Read-only Modbus TCP capture and decode for a Sigenergy SigenStor, over your own LAN. No
+vendor API, no vendor account. **Capture and decode are stdlib-only Python 3.9+ with nothing
+to `pip install`** — a test asserts it, so the part that has to keep running on a bare Python
+cannot quietly grow a dependency.
 
-Two optional additions do not hold to that, and are off by default: `sync.py`, which
-copies rotated archive files to your own S3 bucket and needs `boto3`; and `cloud/`,
-which deploys a hosted viewer — Node to deploy the stacks, `boto3` for the handful of
-maintenance scripts you run by hand. Neither runs unless you configure it, and neither
-is needed to capture, decode or view locally.
+The shape of a running installation: a **Raspberry Pi** on the LAN polls the inverter and
+uploads rotated archive files to your own S3 bucket, where a Lambda turns them into
+precomputed tiles and a **hosted viewer** plots them behind Google sign-in. The Pi runs two
+systemd units and serves no pages itself.
+
+Two parts do not hold to the stdlib rule. `sync.py`, the uploader, needs `boto3` — one
+`apt install`, and it is the only module that imports it. `cloud/` deploys the hosted
+viewer and needs Node for the CDK stacks. Capture and decode need neither, and
+`decode.py` will read an archive on any machine with a bare Python.
+
+There is **no local web server**. There was one, `serve.py`, and removing it is what
+[Findings 41](docs/FINDINGS.md) is about; the capability it cost is named in
+[Known limits](docs/FINDINGS.md#known-limits). For an unattended capture host the upload
+is the only path the data has, which makes `sync.py` load-bearing rather than optional.
 
 **Nothing here writes to the inverter.** Holding registers are read with function
 code 3 — which is a read — and no write function code is ever issued. Registers
@@ -33,8 +42,14 @@ Developed against, and tested on, exactly one unit:
 |---|---|
 | Model | SigenStor EC 10.0 SP AU — single phase, one battery pack |
 | Firmware | `V100R001C22SPC116` |
-| Host | macOS, `/usr/bin/python3` 3.9.6, running as a LaunchDaemon |
+| Host | Raspberry Pi 4, booting from USB, Raspberry Pi OS Lite (Bookworm), `/usr/bin/python3` 3.11, two systemd units |
 | Cadence | 0.5 Hz fast tier, indefinitely |
+
+Every latency measurement in [docs/FINDINGS.md](docs/FINDINGS.md) was taken on the previous
+host, a Mac Studio, and has not been re-taken on the Pi. The capture path is platform-neutral
+Python and needed no changes to move; what needed changing was the deployment around it, and
+the one genuinely new failure mode is that a Pi has no real-time clock
+([Findings 38](docs/FINDINGS.md)).
 
 It should work on any SigenStor reachable over Modbus TCP, but *nothing about
 three-phase, multiple inverters, AC/DC chargers or an EV charger has been
@@ -61,13 +76,16 @@ Worth reading once before pointing this at your own hardware.
   model, serial number and the address polled. Set `"manifest_identity": false`
   before sharing raw archives — decoding needs none of it. `dump.py --json`
   writes the serial in plain text too; `.gitignore` covers both by default.
-- **The viewer is a second exposure, not a second client.** `serve.py` reads the
-  archive on disk and never opens a Modbus connection, so it costs the inverter
-  nothing. But it serves plain HTTP with no authentication, bound to `0.0.0.0` by
-  default: anyone who can reach the host can read your telemetry. Its API withholds
-  the serial, firmware and inverter address unless `web_show_identity` is true. Bind
-  it to `127.0.0.1` and tunnel if your LAN is not trusted, and **never
-  port-forward it.**
+- **The capture host listens on nothing.** It used to run a local viewer on `0.0.0.0:8787`
+  with no authentication, which meant anyone who could reach the host could read your
+  telemetry. That is gone. The Pi opens one *outbound* connection to the inverter and one to
+  S3, and accepts nothing but SSH. **Never port-forward either the inverter or the host.**
+- **The telemetry leaves your LAN, and that is the design.** `sync.py` uploads to a bucket
+  you own, under a credential that can `PutObject` and nothing else — no `GetObject`, no
+  `ListBucket` — so a key lifted off the Pi cannot read the archive back or enumerate it.
+  What is published from there is gated by Google sign-in against an explicit allowlist; see
+  [cloud/README.md](cloud/README.md). Tiles withhold the serial, firmware and the inverter's
+  address, because none of them is needed to read a chart.
 - **Your inverter is grid-tied equipment.** Polling it is passive, but this
   software comes with no warranty of any kind (see [LICENSE](LICENSE)), and how
   your installer or utility feels about third-party clients is between you and
@@ -77,6 +95,8 @@ Worth reading once before pointing this at your own hardware.
 
 ## Quick start
 
+Anywhere with a Python and a route to the inverter — a laptop is fine to try it on:
+
 ```sh
 cp config.example.json config.json      # then set "host" to your inverter's IP
 python3 config.py --show                # confirm what resolved
@@ -84,9 +104,14 @@ python3 config.py --show                # confirm what resolved
 python3 dump.py                         # decode every documented register, once
 python3 log.py --seconds 60             # capture 60 s into ./data
 python3 decode.py data/*.manifest.json data/*.bin --last
-
-python3 serve.py                        # then open http://localhost:8787
+python3 decode.py data/*.manifest.json data/*.bin --check
 ```
+
+**Only one client should poll at a time**, so if a capture host is already running, stop its
+logger before pointing anything else at the inverter.
+
+To deploy it properly — a Pi that captures unattended and uploads — see
+[Deployment](#deployment). To read the data, see [The viewer](#the-viewer).
 
 Every script takes the host as an optional first positional argument, which
 overrides the config file:
@@ -133,13 +158,14 @@ then `~/.config/sigen/config.json`.
 | `inverter_unit` | `1` | Slave id of the first inverter. |
 | `install_dir` | this directory | Root for `data/` and `logs/`. |
 | `data_dir` | `<install_dir>/data` | Archive directory. |
-| `log_dir` | `<install_dir>/logs` | Daemon stdout/stderr. |
-| `python` | `/usr/bin/python3` | Interpreter written into the launchd plist. |
-| `launchd_label` | `local.sigen-logger` | Daemon label. Change it and boot out the old one first. |
-| `run_as_user` | — | Required by `install-daemon.sh`: the daemon runs as this user, not root. |
+| `log_dir` | `<install_dir>/logs` | Unit stdout/stderr, appended to by both units. |
+| `python` | `/usr/bin/python3` | Interpreter written into the unit files. |
+| `logger_unit` | `sigen-logger` | Logger unit name. Installed as `<name>.service`. Change it and disable the old one first. |
+| `sync_unit` | `sigen-sync` | Uploader unit name. Installed as `<name>.service` plus `<name>.timer`. Must differ from `logger_unit`. |
+| `run_as_user` | — | **Required.** The units run as this user, not root — an empty systemd `User=` is not an error, it just runs as root. |
 | `fast_period_s` | `2` | Fast-tier cadence. `2` = 0.5 Hz. **Changing it changes the plan hash.** |
 | `rotate_minutes` | `60` | Rotate and gzip the archive file this often. |
-| `keep_days` | `0` | Retention. See below. |
+| `keep_days` | `0` | Retention, and a way to lose data. See below. |
 | `degrade_after` | `5` | Dead ticks before dropping to a single-block probe. |
 | `degrade_probe_s` | `30` | While degraded, probe about this often instead of every tick. |
 | `recycle_s` | `3600` | Scheduled connection recycle. `0` disables. |
@@ -147,32 +173,40 @@ then `~/.config/sigen/config.json`.
 | `gap_log_quiet_s` | `60` | Collapse repeated `[gap]` lines to one per this interval. |
 | `bucket_s` | `300` | Heartbeat and soak-bucket width. |
 | `manifest_identity` | `true` | Record model/serial/host in manifests. |
-| `web_port` | `8787` | Viewer port. Above 1024, so the viewer needs no privilege. |
-| `web_bind` | `0.0.0.0` | Viewer bind address. `127.0.0.1` to require an SSH tunnel. |
-| `web_launchd_label` | `local.sigen-viewer` | Viewer daemon label. Must differ from `launchd_label`. |
-| `web_default_hours` | `6` | Default lookback when the page opens. |
-| `web_show_identity` | `false` | Let the viewer's API report serial, firmware and the inverter's address. |
 | `s3_bucket` | — | Bucket for the offsite copy. Unset means no uploading. |
 | `s3_region` | `us-east-1` | Bucket region. |
 | `s3_prefix` | `raw/` | Key prefix. Must end with `/`. |
 | `aws_profile` | — | Named `~/.aws` profile. Credentials never live in `config.json`. |
-| `sync_enabled` | `false` | Master switch for `sync.py`. Off until you mean it. |
-| `sync_launchd_label` | `local.sigen-sync` | Uploader daemon label. Must differ from the other two. |
+| `sync_enabled` | `false` | Master switch for `sync.py`. Off in the defaults; **true** in the shipped example, because on a capture host the upload is the only path the data has. |
 
-`keep_days` is retention, and it is narrower than it looks: on **rotation** only,
-any `*.bin.gz` older than N days is deleted. It never touches the open `.bin`,
-never touches manifests, and never runs between rotations — so pruning can leave
-you holding a manifest for a window whose data is gone. `0` keeps everything,
-which at ~2.2 MB/day gzipped is about 800 MB/year: for most people, leave it at
-`0`.
+### `keep_days` is a deletion policy
 
-The same config drives the shell scripts and the launchd plist, so nothing
-hardcodes a path in two places:
+It is narrower than it looks and sharper than it sounds. On **rotation** only, any
+`*.bin.gz` older than N days is deleted. It never touches the open `.bin`, never touches
+manifests, and never runs between rotations — so pruning can leave you holding a manifest
+for a window whose data is gone.
+
+The sharp part: **`*.bin.gz` is the exact form `sync.py` uploads.** An hour whose upload has
+not yet succeeded — a router rebooted, a credential expired, the timer disabled while someone
+was debugging — is deleted by the same mechanism that is supposed to be housekeeping, and on
+this deployment there is no second copy. So the number is an outage budget, not a tidiness
+setting: with hourly rotation and a five-minute timer, `7` gives a week to notice and fix a
+broken upload, and bounds the drive at roughly 15 MB of records plus a manifest per day.
+
+`config.py`'s default is `0` — keep everything, ~2.2 MB/day gzipped, about 800 MB/year —
+because someone whose archive is the only copy should not lose it by accepting a default.
+`config.example.json` sets `7`, beside `sync_enabled: true`. Those two belong together, and
+neither is safe without the other. See [Findings 40](docs/FINDINGS.md).
+
+### One config, every consumer
+
+The same file drives the shell scripts and the systemd units, so nothing hardcodes a path in
+two places:
 
 ```sh
 python3 config.py --show                              # resolved config as JSON
 python3 config.py --sh                                # SIGEN_*='...' for eval in sh
-python3 config.py --render deploy/launchd.plist.template
+python3 config.py --render deploy/systemd/sigen-logger.service.template
 ```
 
 ---
@@ -186,28 +220,29 @@ python3 config.py --render deploy/launchd.plist.template
 | `log.py` | The logger. Tiered raw capture, topology drift detection, soak harness. |
 | `decode.py` | Offline decode of the raw archive into CSV/JSONL/derived series. |
 | `dump.py` | One-shot full-map decode: what every documented register returns on this unit. |
-| `serve.py` | The local web viewer: an HTTP server that plots the archive. Never opens a Modbus connection. |
-| `sync.py` | Copies rotated archive files to S3. The one module that needs `boto3`, imported lazily inside it. Off unless `sync_enabled`. |
-| `tiles.py` | The wire format both read paths produce, so the local viewer and the hosted one cannot disagree. Not a CLI. |
+| `sync.py` | Copies rotated archive files to S3. The one module that needs `boto3`, imported lazily inside it. Off unless `sync_enabled` — and on a capture host it is the only path the data has. |
+| `panels.py` | The presentation contract: which fields make up which chart, and which are "live". Data only; imports nothing. Read by `ingest.py` and shipped to the page in `meta.json`. |
+| `tiles.py` | The wire format the page reads, so a live window and a frozen share cannot disagree. Not a CLI. |
+| `series.py` | Archive index, bucket aggregation and health scan. Not a CLI. |
 | `ingest.py` | An archive directory to a directory of precomputed tiles. Knows nothing about S3, which is what makes it testable. Not a CLI. |
 | `cloud/` | The hosted viewer: CDK stacks, the ingest and share Lambdas, and the maintenance scripts — a raw backfill, a tile rebuild, and one that gives older shares their own page. Deploy-time only; see [cloud/README.md](cloud/README.md). |
-| `series.py` | Archive index, bucket aggregation and health scan behind the viewer. Not a CLI. |
-| `web/` | The viewer's page: one HTML file, one stylesheet, three scripts — the renderer, the charts, and the tile adapter. No framework, no CDN. |
+| `web/` | The page: one HTML file, one stylesheet, three scripts — the renderer, the charts, and the tile adapter. Published by the site stack. No framework, no CDN. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
 | `regmap.json` | The register map: 358 fields, 10 alarm appendices, 6 enums. Generated, not hand-written. |
-| `bin/status.sh` | Health check: logger and viewer daemon state, recent heartbeats, gap/degraded counts, archive size. No sudo. |
+| `bin/status.sh` | Health check: clock sync, both units, recent heartbeats, gap/degraded counts, the uploader's timer, archive size, free space. No sudo. |
 | `bin/latest.sh` | Newest values, vertically. The "is it working right now?" view. No sudo. |
-| `bin/tunnel.sh` | Run on the *viewing* machine: SSH-forwards the viewer to `localhost`, for a laptop that cannot route to the LAN address. |
-| `deploy/install-launcher.sh` | Run on a viewing **Mac**: generates a Spotlight-launchable `.app` that opens the tunnel and the page in one keystroke. |
-| `deploy/install-daemon.sh`, `uninstall-daemon.sh` | LaunchDaemon install/removal for the logger. Needs sudo. |
-| `deploy/install-viewer.sh`, `uninstall-viewer.sh` | The same for the viewer. Separate daemon, so restarting it cannot interrupt capture. |
-| `deploy/install-sync.sh`, `uninstall-sync.sh` | The same for the uploader. A third daemon, for the same reason. Checks boto3 and the credential *as the user the daemon will run as*. |
-| `deploy/sync.plist.template` | The uploader's LaunchDaemon. `StartInterval`, not `KeepAlive`: it is a job that finishes. |
-| `deploy/launchd.plist.template` | LaunchDaemon definition, rendered from config at install time. |
-| `deploy/viewer.plist.template` | The viewer's LaunchDaemon definition. `ProcessType: Background`, so the logger wins any contention. |
-| `deploy/launchagent.plist.template` | LaunchAgent alternative, for a host that *does* auto-login. |
-| `tests/test_offline.py` | The whole capture/decode path against a fake device. No hardware, no network. |
-| `tests/test_web.py` | The viewer: index, aggregation, health, HTTP. Asserts it can never become a second Modbus client. Also the cloud contracts, at source level, since there is no JS harness. |
+| `bin/leak-check.sh` | Run before every push: does anything installation-specific appear in a tracked file, now or in history? |
+| `deploy/systemd/*.template` | The two units and the uploader's timer, rendered from config at install time. |
+| `deploy/systemd/install-logger.sh`, `uninstall-logger.sh` | Unit install/removal for the logger. Verifies the rendered unit *before* installing it. Needs sudo. |
+| `deploy/systemd/install-sync.sh`, `uninstall-sync.sh` | The same for the uploader's service and timer. Checks boto3 and the credential *as the user the unit will run as*. |
+| `deploy/systemd/_lib.sh` | The render → verify → install → enable → prove-it sequence both installers share. |
+| `deploy/pi/bootstrap.sh` | Runs **on the Pi**: packages, timezone, the clock, flash-wear settings, the watchdog, logrotate, the units. The one description of a configured host. |
+| `deploy/pi/provision.sh` | Runs **on your workstation**: rsyncs the code, pushes `config.json` and one AWS profile over SSH, then runs `bootstrap.sh`. Idempotent; re-running is how you deploy a change. |
+| `deploy/pi/sanitize.sh` | Runs **on the Pi** before capturing a golden image: removes both secrets, the archive, the SSH host keys and the machine id, then zero-fills free space. |
+| `deploy/pi/capture-image.sh` | Runs **on macOS**: reads a sanitized drive to a compressed `.img.xz`. The one script here that can destroy something, so it refuses anything that is not external and makes you type the disk id twice. |
+| `deploy/pi/logrotate.sigen` | Rotation for the two log files. `copytruncate`, because systemd holds them open. |
+| `tests/test_offline.py` | The whole capture/decode path against a fake device. No hardware, no network. Also the config loader and the unit templates. |
+| `tests/test_web.py` | The read side: aggregation, health, tiles, ingest, the uploader's ledger. Asserts none of it can become a second Modbus client. Also the cloud and page contracts, at source level, since there is no JS harness. |
 | `docs/FINDINGS.md` | Every bug this project has found, what made each one quiet, and the rule it produced. Referenced by number from the code. |
 | `examples/` | A redacted excerpt of `dump.py --json` output. |
 
@@ -304,8 +339,9 @@ Designed to run indefinitely:
   record and are *not* counted as dead ticks — otherwise five seconds of ordinary
   operation would trip degraded mode.
 - **Schedule rebase** — if the loop falls more than `max_lag_s` behind, it rebases
-  and logs `[gap]` instead of replaying every missed tick. Without this, a one-hour
-  machine sleep would fire ~3600 back-to-back requests at the device.
+  and logs `[gap]` instead of replaying every missed tick. Without this, an hour of the
+  process not running — a machine asleep, a host suspended, a long stall — would fire ~3600
+  back-to-back requests at the device the moment it resumed.
 - **Degraded probe** — after `degrade_after` ticks with no data it drops to a
   single block *and* stops probing every tick, retrying only about every
   `degrade_probe_s` until the device answers. Logs `[degraded]` then `[recovered]`.
@@ -471,31 +507,26 @@ No AC charger exists on the reference install; only units **1** (inverter) and
 
 ---
 
-## `serve.py` — the local web viewer
+## The viewer
 
-```
-serve.py [--port N] [--bind ADDR] [--data-dir DIR] [--check] [--verbose]
-```
+There is no viewer on the capture host. The page is served by CloudFront out of the bucket the
+Pi uploads to, behind Google sign-in against an explicit allowlist, and it plots **precomputed
+tiles** rather than decoding an archive on demand. Deploying it is
+[cloud/README.md](cloud/README.md)'s subject; what follows is how to read it.
 
-A single page that plots what the house and the inverter have been doing, decoded
-on demand from the archive already on disk. Defaults to the last
-`web_default_hours` and scrolls back over the whole series.
+The trade, stated once: the page is up to an hour behind — a tile appears when the logger
+rotates — and it can only chart a field that a tile carries. In exchange it needs no server,
+survives the capture host being off, and costs the inverter nothing. For anything outside
+that, `decode.py` reads the raw archive at the full 2 s cadence over all 358 documented
+registers.
 
-**It never touches the inverter.** It imports the decode half of the toolchain and
-nothing else; `lib.Modbus` is never constructed, and `tests/test_web.py` asserts
-that with an AST scan rather than a grep, so the docstring saying so cannot be what
-satisfies the test. That matters because the device should have exactly one client
-— the logger — and concurrent-client behaviour is unmeasured.
-
-```sh
-python3 serve.py                    # config.json's port and bind address
-python3 serve.py --check            # what it can see, without serving. Debug a deploy.
-python3 serve.py --data-dir data/1hz-20260814   # view a superseded series
-```
-
-`--check` prints the plan hash, the archive extent, how many fields are plottable,
-and how long the default window takes to build — the quickest way to tell "the
-viewer is broken" from "that directory has no archive in it".
+> **There used to be a local viewer**, `serve.py`, on `0.0.0.0:8787`. It was removed with the
+> move to a Pi: it was the host's only listening port and its only unauthenticated exposure,
+> and the hosted page had made it redundant for everything except a close look at an odd
+> register. What that cost is in [Known limits](docs/FINDINGS.md#known-limits); why the
+> removal needed a refactor first is [Findings 41](docs/FINDINGS.md). `web/app.js` still
+> carries its inert `server` branch, gated and unreachable, because the page is pinned by
+> every existing share's bundle hash and trimming it is a change worth making on its own.
 
 ### What is on the page
 
@@ -514,15 +545,20 @@ viewer is broken" from "that directory has no archive in it".
 
 Arrow keys move through history, `+`/`−` zoom, `n` jumps to now. Focus a chart and
 the arrows move its crosshair instead. The window is in the URL, so a view can be
-bookmarked or sent to anyone who can reach the viewer.
+bookmarked or sent to anyone who can sign in.
 
-**Two of these controls exist only here.** The *Updates* group — `Live (10 s)` and `Reload` —
-and `Download CSV` are marked `data-server-only`, and the hosted viewer hides them. It reads
-precomputed tiles that are published when the logger rotates, roughly hourly, and
-`web/tiles.js` caches every object it fetches for the life of the page, so polling there
-cannot return anything new at any interval; `/api/csv` is not a route a tile source has at
-all. `app.js` derives that from the source rather than being told (`POLLS`), so there is
-nothing for a deployment to remember. This viewer is the live one, and it is unchanged.
+**The page is up to an hour behind, and says so.** Tiles are published when the logger
+rotates, and `web/tiles.js` caches every object it fetches for the life of the page — so
+nothing in the page can ask for newer data, and a browser reload is genuinely the only thing
+that works. The hint in the filter row says so. `Live (10 s)`, `Reload` and `Download CSV`
+are hidden (`data-server-only`): they belonged to the local server, and `app.js` derives that
+from the source rather than being told, so there is nothing for a deployment to remember. See
+[Findings 34](docs/FINDINGS.md).
+
+**If the page looks stale, two different things can cause it** and the page cannot tell them
+apart: the logger stopped, or the *uploader* stopped. `record_ts` only advances on rotation,
+so both produce one symptom, and the warning names both rather than picking one
+([Findings 29](docs/FINDINGS.md)). `bin/status.sh` on the Pi is what distinguishes them.
 
 Every panel's heading carries a link icon, which copies a URL opening the page on that panel,
 and a `−`/`+` to collapse or expand it; an expanded one also offers `Table`, the numbers behind
@@ -532,8 +568,9 @@ requested, so a page showing four charts costs a quarter of one showing sixteen.
 
 ### Windows, buckets and stride
 
-The page asks for a *window*; how to build it is `series.py`'s business, and every
-choice it makes is reported back and shown in the filter row.
+The page asks for a *window*, and `web/tiles.js` composes it from precomputed tiles. How
+those were built is `series.py`'s business — `ingest.py` calls it — and every choice it made
+travels in the tile and is shown in the filter row.
 
 - **Bucket width** comes from a fixed ladder (…30 s, 60 s, 120 s, 300 s…) targeting
   ~900 points, so 6 h → 30 s, 24 h → 120 s, 7 d → 900 s. A ladder rather than
@@ -552,22 +589,18 @@ choice it makes is reported back and shown in the filter row.
   change, so its summary is final. The open `.bin` is **extended, not re-read** — it
   grows every couple of seconds, so its summary carries the byte offset it reached
   and resumes from there. Records are append-only, which is what makes that sound.
-- If a window needs more cold decoding than the warm budget (3 s), the server
-  returns what it has, says `pending_files`, finishes the rest on a background
-  thread, and the page labels itself partial and re-asks. Files are read
-  newest-first, so a partial answer is the recent end of the window.
-- **Decoding is serialised** across every request thread and the warm thread. The
-  server is threaded so a slow window cannot block the page's assets, but decoding
-  is CPU-bound and the logger has a 2 s tick to hit on the same host.
+- **Which fields a tile carries depends on its width**, and this is the limit worth knowing:
+  an hour tile holds the 32 fields the panels, energy tiles and live strip need; from 120 s up
+  a tile spans a day and carries 240. So **the field picker only opens on a window wider than
+  about 15 hours.** `meta.picker_min_bucket_s` and `meta.target_buckets` carry the numbers, so
+  the page states the real limit rather than offering a field that would come back empty. For
+  any of the 358 documented registers at the full 2 s cadence, the tool is `decode.py` against
+  the raw archive.
 
-Measured on the reference host (26 files, 4 MB, 0.5 Hz, 34 fields):
-
-| | |
-|---|---|
-| Live poll, 6 h window, steady | **0.15 s** (0.70 s before the open file was read incrementally) |
-| `/api/latest` | 0.03 s |
-| First 24 h view, everything cold | 3.1 s for 5 of 26 files, rest warmed in the background |
-| 24 h view once warm | 0.24 s |
+The cache, the warm budget and the newest-first read order all still apply — they are
+`series.py`'s, and they now run inside the ingest Lambda rather than in front of a browser.
+What they bought when they did run in front of a browser (a 6 h window in 0.15 s over 26
+files) is no longer a number anyone waits on: a tile is built once and served from a CDN.
 
 ### Reading a gap correctly
 
@@ -590,19 +623,21 @@ up to 64 samples per bucket.
 Something looks wrong and the installer needs to see it. A screenshot loses the
 tooltips, the min–max and the provenance; a CSV loses the picture.
 
-This server's answer used to be a self-contained HTML file. It has been **retired** in
-favour of a shared URL from the hosted viewer, which is a better answer whenever the
-recipient is online: nothing to attach, and nothing to bounce off a mailbox size limit.
+The answer used to be a self-contained HTML file, written by the local server. It has been
+**retired** in favour of a shared URL, which is a better answer whenever the recipient is
+online: nothing to attach, and nothing to bounce off a mailbox size limit.
 
 It is still a frozen copy, which is the part of the export's design worth keeping: a share
 copies the tiles it needs *and* the page that draws them, so what someone opens next year is
 what was on screen the day it was sent. What the export could not be is a link.
 
-From this server, what is left is:
+The pieces:
 
-- **The URL.** The window, the expanded panels and the custom fields are all in the
-  page's hash, so a view is a link for anyone who can reach the viewer — over the LAN,
-  or through `bin/tunnel.sh`.
+- **A share.** `Save this view` copies the tiles it needs *and* the page that draws them to a
+  `/p/<id>` prefix that needs no account. That is the one thing you can send to an installer.
+  See [cloud/README.md](cloud/README.md).
+- **The URL.** The window, the expanded panels and the custom fields are all in the page's
+  hash, so a view is a link for anyone who can sign in.
 - **A link to one panel.** `#focus=<panel>` opens that panel and scrolls to it, leaving
   everything else as the rest of the hash says. The link icon in a panel's heading copies
   such a link for you. It is accepted on every form of this page — this server, the hosted
@@ -611,20 +646,22 @@ From this server, what is left is:
 
   A panel is named by its id or by its title, so `#focus=temps` and `#focus=temperatures`
   are the same request, as are `#focus=panels-volts` and `#focus=pv-panels-voltage`. Both
-  come from `PANELS` in `serve.py`, so a new chart there is focusable with no other change.
+  come from `PANELS` in `panels.py`, so a new chart there is focusable with no other change.
   A name that matches nothing is ignored — a link outlives the deployment that made it, and
   a stale name should still render the page. Which is also why an **id** is worth leaving
   alone once links exist: renaming one drops that panel from any saved `panels=` or `#focus=`
   that names it. A frozen share is unaffected, since it carries its own copy of the list.
-- **Download CSV.** The bucketed numbers behind the view, matching the table view
-  exactly; `&raw=1` gives per-record rows in `decode.py`'s shape.
 
-The page itself is source-agnostic and that is what makes the hosted viewer possible
-without a second renderer: `web/app.js` reads every answer through one `getJSON()`
-seam, and a deployment that sets `window.SIGEN_SOURCE` before the script loads points
-that seam at precomputed tiles instead of at this server. A shared view is that same
-page with a fixed window — `applyFrozenMode()` removes every control that would ask
-for another one, and labels the ages `when shared` rather than presenting them as now.
+There is no CSV download. It was a route on the local server, and the link is hidden wherever
+nothing answers it. For numbers rather than a picture, `decode.py` on the archive is the
+better tool anyway — it gives per-record rows, which the bucketed download never could.
+
+The page is source-agnostic, and that is what makes a frozen share the same code as a live
+window rather than a second renderer: `web/app.js` reads every answer through one `getJSON()`
+seam, and each entry point sets `window.SIGEN_SOURCE` before the script loads to point that
+seam at the right tiles. A shared view is that same page with a fixed window —
+`applyFrozenMode()` removes every control that would ask for another one, and labels the ages
+`when shared` rather than presenting them as now.
 
 **One renderer, and a share still gets a copy of it.** Those are not in tension, and the
 distinction cost a bug to learn. There is one `web/` in this repository and no second
@@ -634,131 +671,31 @@ it was opened. Each deploy therefore publishes an immutable copy of the whole bu
 key naming its own contents, and a share copies that page in beside its tiles. Same code,
 pinned; see [Findings 35](docs/FINDINGS.md) and [cloud/README.md](cloud/README.md).
 
-### The API
+### The three answers
 
-Plain JSON, same-origin, no CORS header — so a hostile page on your LAN cannot read
-your archive through your browser.
+`web/app.js` reaches the outside world through exactly one seam, `getJSON()`, and asks for
+only three things. `web/tiles.js` composes all three out of static objects — there is no
+server to route them.
 
-| Endpoint | Returns |
+| Answer | Carries |
 |---|---|
-| `/api/meta` | Plan hash, archive extent, block plan, the panel definitions, and the field catalogue with units, cadences, enum labels and duplicate markers. |
+| `/api/meta` | Plan hash, archive extent, block plan, the panel definitions, and the field catalogue with units, cadences, enum labels and duplicate markers. Plus the tile geometry the page needs in order to state its own limits. |
 | `/api/window?hours=6&end=…&panels=…&fields=…` | The bucket grid, per-field min/mean/max, health, window energy, bucket width, stride, timezone change points. |
 | `/api/latest` | Newest good sample, with data-age and record-age reported separately. |
-| `/api/csv?…` | The window as CSV; `&raw=1` for per-record rows in `decode.py`'s shape. |
-| `/api/stats` | Cache hit counts and warm-thread state. |
 
-Which fields make up which chart lives in `PANELS` at the top of `serve.py`, so a
-new chart is a dict there, not new JavaScript. A test asserts every field named in
-it is actually covered by the block plan — otherwise a typo would render an empty
-chart that looks like a quiet night.
+A test pins that set: adding a fourth fails until something can compose it, and a route
+nothing answers has to be provably gated or the suite refuses it.
 
-This server reads `PANELS` on every request, so an edit shows up on reload. The hosted
-viewer does not: `ingest.py` copies the list into each plan's `meta.json` when it builds
-tiles, so a change reaches it on the next rotation — about an hour — or immediately if you
-replay one S3 event. It also means a frozen share keeps the panels, titles and ids it was
-made with, which is why renaming an `id` cannot break an existing share and can break a
-saved link. `cloud/README.md` has the commands.
+Which fields make up which chart lives in `PANELS` in [`panels.py`](panels.py), so a new chart
+is a dict there, not new JavaScript. A test asserts every field it names is actually covered
+by the block plan — otherwise a typo would render an empty chart that looks like a quiet
+night.
 
-### Exposure and privacy
-
-A wildcard `web_bind` listens on **both IPv4 and IPv6** — one `AF_INET6` socket with
-`IPV6_V6ONLY` cleared. That is not a detail: macOS prefers IPv6 for a `.local` name,
-so a v4-only listener refuses the browser's first attempt while `curl` silently falls
-back and appears to prove the server fine ([Findings 12](docs/FINDINGS.md)). The
-startup banner states which families the socket accepts. An explicit address is
-honoured as given: `127.0.0.1` is v4-only, `::1` is v6-only.
-
-`web_bind` defaults to `0.0.0.0`, so **anyone who can reach the host on `web_port`
-can read your telemetry**. That is usually what you want on a home LAN and is why
-the API withholds the unit's serial, firmware and the inverter's address unless
-`web_show_identity` is true — a manifest identifies an installation, and none of it
-is needed to read a chart.
-
-There is no authentication and no TLS. Do not port-forward it, for the same reason
-you do not port-forward the inverter.
-
-### When the browser cannot reach it: `bin/tunnel.sh`
-
-A **managed laptop** — corporate VPN, content filter, MDM proxy policy — can refuse
-RFC1918 destinations outright. The browser reports `ERR_ADDRESS_UNREACHABLE` for both
-the `.local` name *and* the raw IP, while `curl` on the same machine, `ssh` to the
-same host, and any other device on the LAN all work. Nothing reaches the server, so
-its log stays empty and it looks dead.
-
-Run this **on the viewing machine** and the browser only ever talks to `127.0.0.1`:
-
-```sh
-bin/tunnel.sh youruser@yourhost.local          # then open http://localhost:8787/
-bin/tunnel.sh youruser@yourhost.local 8787 9000   # if 8787 is taken locally
-```
-
-It needs no sudo, changes nothing on the capture host, and leaves `web_bind` as it
-is — other devices keep using the LAN address. For a stricter setup, set
-`"web_bind": "127.0.0.1"` so the tunnel is the *only* way in.
-
-### One keystroke on a Mac: `deploy/install-launcher.sh`
-
-Typing an `ssh` command every time is friction that stops you looking at the data.
-This generates **two** small apps in `~/Applications`, both of which Spotlight
-indexes:
-
-```sh
-deploy/install-launcher.sh youruser@yourhost.local           # Sigen Viewer + Sigen Viewer Stop
-deploy/install-launcher.sh youruser@yourhost.local 8787 9000 "Solar"
-```
-
-| Cmd-Space, then | Does |
-|---|---|
-| `sigen` | Opens the tunnel if needed, then the page. |
-| `sigen stop` | Closes the tunnel. |
-
-**Opening** is idempotent, and the reuse check is over an SSH **control socket**
-(`ssh -O check`) rather than "is anything listening on 8787" — something else on
-that port is not a thing to hand a browser. So:
-
-- our tunnel already up → just opens the page (a second launch is instant);
-- a tunnel *you* started with `bin/tunnel.sh` → reused, identified by asking
-  `/api/stats` whether the thing on the port really is the viewer;
-- port held by something that is not the viewer → says so, and suggests a rebuild
-  on another port;
-- nothing there → `ssh -M -S … -f -N -L …`, waits for the forward, opens the page.
-  Cold start to page in under a second on the reference setup.
-
-**Closing** is explicit: `sigen stop` does `ssh -O exit` on our own tunnel, or falls
-back to matching the forward on the command line for one started by hand, and
-notifies either way. From a terminal, `pkill -f sigen-viewer-8787` does the same.
-The tunnel also ends by itself when the network drops (`ServerAliveInterval 30 × 3`).
-
-**Or close it from the page.** A `Close tunnel` chip appears in the filter row
-whenever the viewer is reached over `localhost` — i.e. only when there is a tunnel to
-close. It cannot ask the server to do it (the server is on the capture host and
-cannot touch your Mac), so it hands off to `sigen-stop://`, a URL scheme the Stop app
-registers. The first click raises the browser's one-time *"Open Sigen Viewer Stop?"*
-prompt; allow it. The page then stops polling, says what it is showing is the last
-window it fetched, and tells you how to reopen. If nothing handles the scheme it says *that*
-instead and resumes polling — it re-checks for up to 16 s rather than assuming, so
-answering the prompt slowly is not reported as a failure.
-
-> Only the closer registers a scheme. Any page you visit can trigger a registered
-> one, and "close a localhost forward to my own machine" is harmless to hand out,
-> whereas "open an SSH connection to my home machine and pop a browser tab" is not.
-> Reopening stays a Spotlight keystroke.
-
-> **There is no idle auto-close, and that is a deliberate retreat.** One was built
-> and measured: launchd owns a Spotlight-launched app as a job and tears the job
-> down when the app exits, killing a watcher process the app spawned within a second
-> or two — even with `setsid()` in its own session. It survived only when the
-> executable was run from a terminal. `ControlPersist` is no help either: with a
-> `-N` master its idle timer never starts. Doing it properly means a LaunchAgent on
-> the viewing Mac, which is more footprint than a launcher deserves. See
-> [Findings 14](docs/FINDINGS.md).
-
-Both apps are `LSUIElement`, so they take no Dock slot and steal no focus, and both
-log to `~/Library/Logs/sigen-viewer.log`. `BatchMode=yes` is set on the SSH call: a
-GUI app has no terminal, so it fails visibly in a dialog rather than hanging on a
-hidden password prompt. They are generated rather than committed — the host, user
-and ports belong to your installation. Uninstall with
-`rm -rf ~/Applications/"Sigen Viewer.app" ~/Applications/"Sigen Viewer Stop.app"`.
+`ingest.py` copies that list into each plan's `meta.json` when it builds tiles, so an edit
+reaches the page on the next rotation — about an hour — or immediately if you replay one S3
+event. It also means a frozen share keeps the panels, titles and ids it was made with, which
+is why renaming an `id` cannot break an existing share and *can* break a saved link.
+[cloud/README.md](cloud/README.md) has the commands.
 
 ---
 
@@ -804,84 +741,176 @@ Retention never prunes it: `keep_days` only touches `*.bin.gz`.
 
 ## Deployment
 
-Runs as a **system LaunchDaemon** on macOS, chosen over a LaunchAgent because the
-target host has no auto-login and no persistent console session — a user agent
-would not return after an unattended reboot. It still runs as an ordinary user;
-nothing here needs privilege.
+A **Raspberry Pi 4 booting from a USB drive**, running two systemd units as an ordinary user.
+Nothing here needs privilege, and the host listens on nothing but SSH.
 
 ```
-<install_dir>/          code (rsync'd or cloned)
-<install_dir>/config.json   local config — never rsync this over
-<install_dir>/data/     archive
-<install_dir>/logs/     sigen.log, sigen.err
+<install_dir>/               code (rsync'd by provision.sh)
+<install_dir>/config.json    local config — pushed separately, never rsync'd over
+<install_dir>/data/          archive: the open .bin, rotated .bin.gz, manifests, .uploaded.json
+<install_dir>/logs/          sigen.log, sigen.err, sync.log, sync.err
+~/.aws/credentials           one profile, PutObject only — pushed separately
 ```
 
-Set `install_dir`, `run_as_user`, `launchd_label` and `python` in the target
-host's own `config.json`, then:
+### The two units
+
+| Unit | What it is | Why it is its own unit |
+|---|---|---|
+| `sigen-logger.service` | `log.py --seconds 0`, `Restart=always`, `Nice=-5` | The latency-sensitive one. It must win contention and nothing may be able to restart it as a side effect. |
+| `sigen-sync.timer` → `sigen-sync.service` | `sync.py --once`, `Type=oneshot`, every 5 minutes | A job that finishes, not a daemon. Separate so restarting the uploader cannot interrupt capture; it reads rotated files and writes only its own ledger. |
+
+Four details in those units are load-bearing:
+
+- **`Wants=`/`After=systemd-time-wait-sync.service` on the logger.** A Pi has no real-time
+  clock. Until NTP answers, the clock holds whatever `fake-hwclock` last wrote — and the
+  archive is keyed on that clock in the filename stamp `decode.py` sorts by, in its
+  backwards-step check, and in the ingest Lambda's test for whether a tile span is closed. A
+  record filed under the wrong hour can be baked into a tile promised `immutable` for a year.
+  This is the most important line in the file; see [Findings 38](docs/FINDINGS.md).
+- **`ConditionPathExists=<install_dir>/config.json` on both.** A host with no config comes up
+  quiet instead of crash-looping every 30 s on "no inverter host configured". That is what
+  makes a freshly written image safe to boot before it has been given a credential.
+- **`StandardOutput=append:` to files under `log_dir`**, not the journal, so the paths
+  `bin/status.sh` greps and every `tail -f` below keep meaning what they say.
+- **`Nice=-5`.** systemd applies it as root before dropping to `User=`, so an unprivileged
+  user gets a negative nice it could not set for itself. This is what `ProcessType: Interactive`
+  was on the Mac.
+
+### Provisioning a Pi
+
+From a stock **Raspberry Pi OS Lite (64-bit)** install with SSH enabled and your key
+authorised — Raspberry Pi Imager's customisation does all of that when it writes the drive.
+Use **Ethernet**: p95 latency is a measured property of this system and wifi power save adds
+spikes to it, and it keeps a passphrase out of any image you later capture.
+
+> **USB boot on a Pi 4** needs a bootloader with mass-storage support. The stock
+> `BOOT_ORDER=0xf41` is SD-then-USB, so with **no SD card inserted** it boots the thumb drive
+> with no change at all. Check with `rpi-eeprom-config`; if the Pi shipped with an old EEPROM,
+> update it once from an SD card first.
+
+Set `host`, `run_as_user`, `install_dir`, `s3_bucket`, `aws_profile` and `sync_enabled` in
+your local `config.json`, then, **from your workstation**:
 
 ```sh
-sudo deploy/install-daemon.sh      # renders the plist, installs root:wheel 644, bootstraps
-sudo deploy/uninstall-daemon.sh    # boots out and removes; leaves the archive
+deploy/pi/provision.sh pi@sigen-pi.local
 ```
 
-The viewer is a **second, separate daemon**, so restarting it — which you will do
-whenever you change the page — cannot interrupt capture, and a crash in it cannot
-take the logger down:
+That rsyncs the code (excluding `data/`, `logs/`, `config.json` and `cloud/`), pushes the two
+secrets over SSH, runs `deploy/pi/bootstrap.sh` on the Pi, restarts the logger and prints
+`bin/status.sh`. It is **idempotent** — re-running it is how you deploy a change.
+
+The two secrets travel separately from the code, and never in an image: `config.json`, and
+**one** `~/.aws` profile — the one `aws_profile` names, not the whole file, because your
+workstation's `~/.aws` also holds a credential that can create and delete infrastructure. The
+Pi has no business with it. Give the Pi its **own access key** on the same PutObject-only IAM
+user (two are allowed), so either can be revoked without touching the other.
+
+`bootstrap.sh` is the one description of a configured host — packages, timezone, the clock,
+journald to RAM, `noatime`, no swapfile, the hardware watchdog, logrotate, then the units. The
+golden image is captured from a host it has been run on, so there is no second list to keep in
+step. It needs a reboot at the end for `noatime` and the watchdog.
+
+`timedatectl`'s timezone must match `capture_tz` in `cloud.json`: the ingest Lambda runs with
+`TZ` set to that and `series.tz_runs()` reads `localtime()`, so a mismatch labels every axis
+in the wrong zone while the data itself stays correct.
+
+Installing or removing one unit at a time, if you would rather not run the whole thing:
 
 ```sh
-sudo deploy/install-viewer.sh      # needs web_launchd_label and web_port in config.json
-sudo deploy/uninstall-viewer.sh
+sudo deploy/systemd/install-logger.sh     # renders, verifies, installs root:root 644, enables
+sudo deploy/systemd/install-sync.sh       # checks boto3 and the credential AS run_as_user
+sudo deploy/systemd/uninstall-logger.sh   # disables and removes; leaves the archive
+sudo deploy/systemd/uninstall-sync.sh
 ```
 
-It runs `ProcessType: Background` and `os.nice(5)`s itself, so the logger — which is
-`Interactive` and latency-sensitive — wins any contention for CPU. `web_port` must
-be above 1024; the viewer runs as `run_as_user`, not root.
+Each renders its unit and runs `systemd-analyze verify` on it **before** installing — a
+verify against a file already in `/etc/systemd/system` is reporting on something live, which
+is too late to be a question.
 
-The plist sets `KeepAlive` to restart on crash, `ThrottleInterval: 30` so a crash
-loop can't hot-spin, `ProcessType: Interactive` so macOS doesn't throttle a
-latency-sensitive polling loop, and `python3 -u` so the heartbeat isn't buffered
-away.
+boto3 comes from **apt**, not pip: Debian refuses `pip install --user` with
+`error: externally-managed-environment` (PEP 668), so `sudo apt install python3-boto3` is the
+answer and `python` stays `/usr/bin/python3`. `bootstrap.sh` installs it; see
+[Findings 39](docs/FINDINGS.md).
 
-Updating the code:
+### Updating the code
 
 ```sh
-rsync -av --exclude __pycache__ --exclude data --exclude logs --exclude config.json \
-      ./ youruser@yourhost.local:~/sigen/
-ssh youruser@yourhost.local 'kill -TERM $(pgrep -f sigen/log.py)'
+deploy/pi/provision.sh pi@sigen-pi.local
 ```
 
-`kill -TERM` as the owning user needs no sudo: the logger shuts down gracefully
-and `KeepAlive` respawns it with the new code within ~30 s. Verify with
-`launchctl print system/<label> | grep -E "state|runs|last exit"` — a graceful
-restart shows `last exit code = 0` and an incremented `runs`.
+`systemctl restart` sends SIGTERM, which `log.py` handles: it closes the archive and joins
+outstanding gzip threads rather than truncating the open `.bin`. Verify with
+`systemctl show -p NRestarts,ExecMainStatus sigen-logger` — a graceful restart shows
+`ExecMainStatus=0`.
 
-**If the change touches the block plan or `fast_period_s`**, segregate the existing
-series first, because the plan fingerprint changes and old files must keep the
-manifest that describes them:
+**If the change touches the block plan or `fast_period_s`**, segregate the existing series
+first, because the plan fingerprint changes and old files must keep the manifest that
+describes them:
 
 ```sh
-ssh youruser@yourhost.local 'cd ~/sigen/data && mkdir -p prev-$(date +%Y%m%d) \
+ssh pi@sigen-pi.local 'cd ~/sigen/data && mkdir -p prev-$(date +%Y%m%d) \
   && mv sigen-*T*.bin* sigen-*.manifest.json prev-$(date +%Y%m%d)/'
 ```
 
-Then rsync, restart, and confirm the new files carry the new hash.
+Then provision, and confirm the new files carry the new hash.
 
-Two host settings worth checking: `pmset sleep 0` so the machine stays up, and
-`sudo pmset -a autorestart 1` so a power cut doesn't stop capture until someone
-presses the button.
+### A bootable image, so the drive is rebuildable
+
+A thumb drive is the component most likely to fail, and reinstalling from scratch is an
+afternoon. So: provision one Pi properly, strip it back, and capture its drive.
+
+```sh
+ssh pi@sigen-pi.local 'sudo ~/sigen/deploy/pi/sanitize.sh'   # both secrets, archive, host keys, machine-id
+ssh pi@sigen-pi.local 'sudo shutdown -h now'
+# move the drive to your Mac
+deploy/pi/capture-image.sh                                   # lists candidate disks
+deploy/pi/capture-image.sh disk4 sigen-pi-20260824.img.xz
+```
+
+`sanitize.sh` zero-fills free space at the end, which is what makes the image compress to
+roughly its *used* size rather than the drive's. It also leaves a one-shot unit that
+regenerates the SSH host keys, gated on `ConditionPathExists=!`, so it is a no-op in every
+image made from that one.
+
+**The constraint, stated plainly:** the image describes a whole drive, so it can only be
+written to a drive **at least as large** as the one it came from. Nominal capacities lie — two
+"32 GB" drives from different makers differ by megabytes — so keep a matched pair. Shrinking
+the partition would need `resize2fs` and a loop device, neither of which macOS has; if it
+becomes a problem, run `pishrink` in a privileged Linux container rather than teaching macOS
+about ext4.
+
+A written clone boots with both units **installed, enabled, and not running** — their start
+condition has nothing to find yet, and they hold no credential. One command finishes it:
+
+```sh
+deploy/pi/provision.sh --config-only pi@sigen-pi.local
+```
+
+`capture-image.sh` only ever *reads* the drive; there is no `of=` pointing at a disk anywhere
+in it. But it takes a raw device identifier from a human, so it refuses anything that is not
+an external, non-virtual, non-root disk, prints what it is about to read, and makes you type
+the identifier a second time.
 
 ### Monitoring
 
 ```sh
+bin/status.sh                          # clock, both units, heartbeats, timer, archive, free space
 bin/latest.sh                          # newest record, vertical
-bin/status.sh                          # both daemons, heartbeats, archive size
+python3 sync.py --status               # uploaded, pending, stranded, when it last ran
 tail -f <log_dir>/sigen.log
-tail -f <log_dir>/viewer.log           # the viewer logs errors and page loads only
-python3 serve.py --check               # what the viewer sees in the archive
+tail -f <log_dir>/sync.log
 ```
 
-Log lines worth grepping: `[gap]` (schedule rebase after a stall), `[degraded]`
-(device unreachable, probing), `[recovered]`, and the heartbeat.
+`bin/status.sh` reports the clock **first**, above everything the clock dates, and every
+section states an absence rather than printing an empty heading — an inactive unit whose
+start condition simply did not hold is not a failure, and it says which.
+
+Log lines worth grepping: `[gap]` (schedule rebase after a stall), `[degraded]` (device
+unreachable, probing), `[recovered]`, and the heartbeat.
+
+**The real monitor is the hosted page.** With no local viewer, "is it working?" is answered by
+`agg/latest.json`'s `record_ts` advancing — which covers the logger and the uploader together.
+`bin/status.sh` is what tells you which of the two stopped when it does not.
 
 ---
 
@@ -913,11 +942,19 @@ updating.
 | `exception 2` on one specific block | The span ends mid-field, or exceeds ~124 registers. |
 | Values look absurd but read cleanly | Suspect a dtype error in the map. Sanity-check against physical bounds. |
 | Timestamps 12 h out | Decoded with `localtime` instead of `gmtime`. See device quirk 4. |
-| Heartbeat stops but daemon shows `running` | Check for `[degraded]` — device unreachable. |
+| Heartbeat stops but the unit shows `active (running)` | Check for `[degraded]` — device unreachable. |
 | `latest.sh` says no complete records | Archive just rotated; the new file has fewer than one full record. |
 | `no manifest for plan <hash>` | The newest archive was written under a plan whose manifest is missing — usually a manifest moved without its data. |
-| Daemon won't load | Plist must be `root:wheel` mode 644 in `/Library/LaunchDaemons`. `install-daemon.sh` does this. |
-| Repeated `runs` increments with nonzero exit | Real crash. Check `logs/sigen.err`. |
+| Unit won't load | `systemd-analyze verify /etc/systemd/system/sigen-logger.service`. The installer verifies before installing, so this usually means the file was hand-edited. |
+| Unit is `inactive` right after install | Check `ConditionResult`. If it is `no`, the start condition did not hold: `config.json` is not at `install_dir`. `bin/status.sh` says so explicitly. |
+| Unit fails with `Failed to set up mount namespacing` | `data_dir` or `log_dir` does not exist. `ProtectSystem=strict` names them in `ReadWritePaths` and systemd cannot bind-mount a missing path. Re-run the installer, which creates them. |
+| `NRestarts` climbing with nonzero `ExecMainStatus` | Real crash. Check `logs/sigen.err`. |
+| Archive stamped in the past; `decode.py --check` reports backwards clock steps | The logger started before NTP answered. `timedatectl` should say `System clock synchronized: yes`; `systemctl is-enabled systemd-time-wait-sync` should say `enabled`. See [Findings 38](docs/FINDINGS.md). |
+| `boto3 is not installed` from `install-sync.sh`, and `pip install --user` fails | `error: externally-managed-environment` is PEP 668. Use `sudo apt install python3-boto3`. |
+| Uploader never runs | The **timer** is what gets enabled, not the service. `systemctl list-timers sigen-sync.timer`. Enabling the service alone runs it once per boot and never again. |
+| `sync.py --status` shows a growing `pending` count | Uploads are failing. Check `logs/sync.err` and the credential. **Act on this**: `keep_days` deletes `.bin.gz` on rotation whether or not it was uploaded, so the pending backlog has a deadline. |
+| `sync.py --status` reports files `stranded` | Un-rotated `.bin` files rotation has moved past — a logger killed mid-hour leaves one, and nothing gzips it afterwards. Never counted as pending. Check they reached S3 another way before gzipping one by hand: a stem carrying both `.bin` and `.bin.gz` is a silent double-decode. |
+| Drive filling up | `keep_days` is `0` or too high for the medium. `bin/status.sh` reports `df`. |
 | `plan-hash mismatch -- refusing to decode` | Files and manifest come from different block plans. Decode each series with the manifest stored beside it. |
 | `device clock ... REAL GAPS [...]` | Samples genuinely missing. Check for `[degraded]` around that time. |
 | `device clock ... N jitter (balanced, no loss)` | Benign. A read lands wherever it falls relative to the device's internal second tick, so at a 2 s cadence ±1 s steps are expected and arrive in compensating pairs. |
@@ -928,19 +965,16 @@ updating.
 | Flood of `[gap]` lines, `retries` climbing | The device is unreachable. Confirm with `ping` / `nc -z host 502`. Expected during installer work or a power-down; capture resumes by itself. |
 | `[degraded]` with no `[recovered]` | Still unreachable. Empty records (mask 0) continue to mark the outage in the archive. |
 | Heartbeat silent but records accumulating | Only possible if `bucket_s` and `fast_period_s` interact badly. Emission is on bucket transition. |
-| Viewer says "The viewer has nothing to show" | `data_dir` holds no `*-<planhash>.bin` **and** matching `*.manifest.json` pair. It does not recurse — point `--data-dir` at the subdirectory to view a moved series. |
-| Viewer crash-loops, `viewer.err` says `cannot bind` | Something already holds `web_port` — usually an older viewer under a previous `web_launchd_label`. `pgrep -f serve.py`, and boot out the old label. |
-| Browser says **connection refused**, but `curl` to the same URL works | An IPv4-only listener, refusing the IPv6 address mDNS advertises for a `.local` name. A wildcard bind is dual-stack now; the startup banner says `socket accepts IPv4 and IPv6`. If it says `IPv4`, that is the bug — see [Findings 12](docs/FINDINGS.md). |
-| Browser says **`ERR_ADDRESS_UNREACHABLE`** for the `.local` name | The browser picked an IPv6 address from mDNS that this client cannot route to. Use the raw IPv4 address — the startup banner prints it. |
-| `ERR_ADDRESS_UNREACHABLE` for the **raw IP too** | The client has no route to that network at all: a VPN or content filter capturing RFC1918, or a different subnet. Not a server problem — the viewer's log will show no request. Use `bin/tunnel.sh`. |
-| Viewer log shows **no requests at all** from the machine you are on | The connection is not arriving. Check in this order: raw IP instead of the name, then `bin/tunnel.sh`. The server is fine if another device or `curl` on the host works. |
-| Chart shows "partial: N file(s) still being read" | A cold window bigger than the 8 s warm budget. The rest is being summarised in the background; the page re-asks on its own. Only happens once per file. |
-| `sampled 1 record in N` chip appears | Expected above ~10 min buckets: at most 64 records per bucket are decoded. Zoom in for exact min/max. |
-| Viewer shows a straight line where you expected a gap | It should not — report it. Lines break when the empty run exceeds the field's cadence; a joined line means the gap was shorter than that. |
-| Viewer values differ from `bin/latest.sh` | `latest.sh` prints the newest record; the page's tiles print the newest record that **carried data**, and label it `last known good`. They differ exactly during an outage. |
+| The page's newest data is up to an hour old | Expected. Tiles appear when the logger rotates. Nothing in the page can ask for newer — reload the browser. |
+| The page says the logger **or the uploader** may have stopped | It cannot tell which: `record_ts` only advances on rotation, so both look the same from there. `bin/status.sh` on the Pi distinguishes them. |
+| `sampled 1 record in N` chip appears | Expected above ~10 min buckets: at most 64 records per bucket were decoded when the tile was built. Zoom in for exact min/max. |
+| The field picker is greyed out, or a field comes back empty | The window is narrower than ~15 h, so it resolves to hour tiles, which carry 32 fields rather than 240. Widen the window; the page states the threshold. For any register at the full cadence, use `decode.py`. |
+| A window reaching back past a cadence change shows the older side as a gap | `web/tiles.js` reads one plan. The tiles exist under the previous hash; "no data" there means "not in this plan". `decode.py` reads across it. |
+| The page shows a straight line where you expected a gap | It should not — report it. Lines break when the empty run exceeds the field's cadence; a joined line means the gap was shorter than that. |
+| The page's values differ from `bin/latest.sh` | `latest.sh` prints the newest record; the page's tiles print the newest record that **carried data**, and label it `last known good`. They differ exactly during an outage. |
 | Page loads but every chart is empty | Check the window: panning back past the start of the archive is legal and shows nothing. Press **Now**. |
 | A saved link no longer opens the panel it names | Its `panels=` or `#focus=` names a panel `id` that has since been renamed. An unknown name is ignored rather than reported, so the page renders normally and one chart stays shut. Re-copy the link; ids are in `PANELS`. |
-| Hosted viewer still shows an old panel title after editing `PANELS` | Expected for up to an hour. `ingest.py` copies the list into `meta.json` when it builds tiles, so the change arrives with the next rotation — or immediately, by replaying one S3 event (`cloud/README.md`). The local viewer shows it on reload. |
+| The page still shows an old panel title after editing `PANELS` | Expected for up to an hour. `ingest.py` copies the list into `meta.json` when it builds tiles, so the change arrives with the next rotation — or immediately, by replaying one S3 event (`cloud/README.md`). |
 
 ---
 
