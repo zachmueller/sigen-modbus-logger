@@ -1,0 +1,35 @@
+# When the uploader runs, rendered by deploy/systemd/install-sync.sh via
+# `config.py --render`. This is the unit you enable; it activates @SYNC_UNIT@.service.
+#
+# Five minutes is far more often than the hourly rotation it is waiting for, and the point
+# of the short interval is not freshness but recovery: an upload that failed while the
+# network was down is retried soon after it returns, without waiting for the next rotation.
+
+[Unit]
+Description=Run the Sigenergy offsite copy every 5 minutes
+Documentation=https://github.com/zachmu/sigen-modbus-logger
+
+[Timer]
+Unit=@SYNC_UNIT@.service
+
+# Not immediately at boot: the logger's clock gate has to clear and the network has to be up
+# before an upload is worth attempting. This is also what recovers a backlog -- the archive a
+# powered-off host left behind is uploaded a minute after it comes back, with no wait for the
+# next rotation.
+#
+# There is deliberately no Persistent=true. It reads like it belongs on a recovery timer and
+# does nothing at all here: systemd only honours it for OnCalendar= timers, and a monotonic
+# timer has no missed wall-clock elapse to make up. OnBootSec is the whole of the recovery.
+OnBootSec=60
+# Measured from the END of the last run, not from a fixed wall-clock grid, so a slow
+# upload of a large backlog cannot overlap the next one.
+OnUnitActiveSec=300
+
+# Small, because everything else on this timer is deliberately unsynchronised: the logger
+# has a two-second tick to hit and an upload starting on the same jiffy as a poll is a
+# contention this can simply avoid.
+AccuracySec=30
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

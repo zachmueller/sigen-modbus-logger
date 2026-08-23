@@ -3,7 +3,7 @@
 Configuration for the Sigenergy toolchain. Stdlib only, Python 3.9+.
 
 Everything installation-specific lives in config.json, which is NOT committed --
-inverter address, unit ids, install paths, launchd label, cadence. Copy
+inverter address, unit ids, install paths, systemd unit names, cadence. Copy
 config.example.json to config.json and edit. Nothing here is secret in the
 cryptographic sense, but a LAN address, a username and a device serial are
 nobody else's business.
@@ -22,9 +22,9 @@ Serving both Python and sh from one file is the point of the extra modes:
 
     config.py --show                 resolved config as JSON
     config.py --sh                   SIGEN_*='...' assignments, for eval in sh
-    config.py --render FILE          substitute @LABEL@ etc. in a plist template
+    config.py --render FILE          substitute @LOGGER_UNIT@ etc. in a unit template
 
-so bin/status.sh and deploy/install-daemon.sh never hardcode a path either.
+so bin/status.sh and deploy/systemd/install-logger.sh never hardcode a path either.
 """
 import json
 import os
@@ -51,15 +51,24 @@ DEFAULTS = {
     "data_dir": None,
     "log_dir": None,
 
-    # --- deployment (macOS launchd) ---------------------------------------
+    # --- deployment (systemd) ---------------------------------------------
+    # The unit names are the labels of record: they name the files installed under
+    # /etc/systemd/system, and they are what `systemctl` is given. Two units, one
+    # per daemon, because restarting the uploader must not be able to interrupt
+    # capture -- see deploy/systemd/.
     "python": "/usr/bin/python3",
-    "launchd_label": "local.sigen-logger",
-    "run_as_user": None,       # required only by deploy/install-daemon.sh
+    "logger_unit": "sigen-logger",
+    "sync_unit": "sigen-sync",
+    "run_as_user": None,       # required by deploy/systemd/install-logger.sh
 
     # --- capture tuning ---------------------------------------------------
     "fast_period_s": 2,        # 2 = 0.5 Hz. Retunes all fast blocks together.
     "rotate_minutes": 60,
-    "keep_days": 0,            # 0 = keep every archive; see README
+    # 0 = keep every archive. Anything else deletes .bin.gz on rotation -- which is
+    # the exact form sync.py uploads, so a non-zero value is only safe once uploads
+    # are known to be working. Default stays 0 because losing an hour is worse than
+    # filling a disk; the Pi's own config.json sets 7. See README, and FINDINGS 40.
+    "keep_days": 0,
     "degrade_after": 5,
     "degrade_probe_s": 30,
     "recycle_s": 3600,         # 0 disables the scheduled connection recycle
@@ -73,8 +82,6 @@ DEFAULTS = {
     # telemetry, hence web_show_identity.
     "web_port": 8787,
     "web_bind": "0.0.0.0",     # "127.0.0.1" to require an SSH tunnel
-    "web_launchd_label": "local.sigen-viewer",
-    "sync_launchd_label": "local.sigen-sync",
     "web_default_hours": 6,
     "web_show_identity": False,
 
@@ -104,11 +111,11 @@ PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 
 # Keys exported to sh by --sh, as SIGEN_<UPPER>.
 SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
-           "launchd_label", "run_as_user", "fast_period_s",
-           "web_port", "web_bind", "web_launchd_label",
-           "sync_launchd_label", "s3_bucket", "s3_prefix", "aws_profile",
-           # Exported so deploy/install-sync.sh can refuse to install a daemon that will
-           # only ever decline to upload: sync.py exits on a false sync_enabled, so an
+           "logger_unit", "sync_unit", "run_as_user", "fast_period_s",
+           "web_port", "web_bind",
+           "s3_bucket", "s3_prefix", "aws_profile",
+           # Exported so deploy/systemd/install-sync.sh can refuse to install a unit that
+           # will only ever decline to upload: sync.py exits on a false sync_enabled, so an
            # installer blind to it succeeds and then fails every five minutes into a log
            # nobody is watching yet. s3_region for symmetry -- a wrong region is a
            # confusing failure at runtime and a cheap check here.
@@ -220,6 +227,20 @@ def load(require_host=True, overrides=None):
                           "use something above 1024 so the viewer needs no root")
     if cfg["web_default_hours"] < 1:
         raise ConfigError("web_default_hours must be >= 1")
+    # Two units, and they may not be one. Checked here rather than in the installers
+    # because both of them would have to check it, and a second uploader scanning the
+    # same archive -- or a unit file overwritten by the other daemon's -- is the kind
+    # of collision that only shows up as a puzzle later.
+    if cfg["logger_unit"] == cfg["sync_unit"]:
+        raise ConfigError(f"logger_unit and sync_unit are both {cfg['logger_unit']!r}; "
+                          "they name two unit files and must differ")
+    for key in ("logger_unit", "sync_unit"):
+        # systemd derives the unit filename from this, so a name with a slash or a
+        # suffix would install somewhere nobody looks. Refuse it here, where the
+        # message can say why, rather than in `systemd-analyze verify`.
+        if "/" in cfg[key] or cfg[key].endswith((".service", ".timer")):
+            raise ConfigError(f"{key} {cfg[key]!r} must be a bare unit name with no "
+                              "path and no .service/.timer suffix")
     if cfg["s3_prefix"] and not cfg["s3_prefix"].endswith("/"):
         # Otherwise every key would be "rawplan=..." -- a silently wrong prefix rather
         # than an error, and the ingest Lambda would never see the files.
@@ -238,22 +259,21 @@ def emit_sh(cfg):
 
 
 def render(cfg, template):
-    """Substitute @PLACEHOLDER@ tokens in a launchd plist template.
+    """Substitute @PLACEHOLDER@ tokens in a systemd unit template.
 
     Done here rather than with sed so that paths containing slashes -- i.e. all
     of them -- need no escaping.
     """
     with open(template) as fh:
         text = fh.read()
-    # An empty <string></string> for UserName loads but runs the daemon as root,
-    # which is exactly what the LaunchDaemon is meant to avoid. Fail loudly.
+    # An empty `User=` is not an error to systemd: the unit loads and runs as root,
+    # which is exactly what these units are meant to avoid. Fail loudly.
     if "@USER@" in text and not cfg["run_as_user"]:
         raise ConfigError(f'{os.path.basename(template)} needs run_as_user. Add '
                           '"run_as_user": "<your login>" to config.json.')
     subs = {
-        "@LABEL@": cfg["launchd_label"],
-        "@WEB_LABEL@": cfg["web_launchd_label"],
-        "@SYNC_LABEL@": cfg["sync_launchd_label"],
+        "@LOGGER_UNIT@": cfg["logger_unit"],
+        "@SYNC_UNIT@": cfg["sync_unit"],
         "@PYTHON@": cfg["python"],
         "@INSTALL_DIR@": cfg["install_dir"],
         "@DATA_DIR@": cfg["data_dir"],

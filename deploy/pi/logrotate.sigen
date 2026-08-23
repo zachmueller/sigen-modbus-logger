@@ -1,0 +1,25 @@
+# Rotation for the logger's and uploader's log files. Installed to /etc/logrotate.d/sigen by
+# deploy/pi/bootstrap.sh, which substitutes @LOG_DIR@ and @USER@ from config.json.
+#
+# copytruncate, not create: systemd holds these files open with StandardOutput=append, so a
+# renamed file would leave both units writing to an inode nobody can find, and the heartbeat
+# would appear to stop while capture carried on perfectly. That failure looks exactly like
+# the one bin/status.sh exists to catch, which is the reason it is worth a comment.
+#
+# The sizes are small -- the heartbeat is one line per five minutes, about 100 KB a day -- so
+# this is about the drive lasting, not about disk space.
+
+@LOG_DIR@/sigen.log
+@LOG_DIR@/sigen.err
+@LOG_DIR@/sync.log
+@LOG_DIR@/sync.err {
+	weekly
+	rotate 4
+	compress
+	delaycompress
+	missingok
+	notifempty
+	copytruncate
+	su @USER@ @USER@
+	create 644 @USER@ @USER@
+}

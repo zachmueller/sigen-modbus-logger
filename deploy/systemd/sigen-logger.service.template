@@ -1,0 +1,75 @@
+# The logger, rendered by deploy/systemd/install-logger.sh via `config.py --render`.
+# Do not install this file directly: the placeholders below are filled from config.json.
+#
+# A system unit rather than a user one, because the capture host has no login session:
+# a --user unit would need lingering enabled and would still be one more thing that can
+# be absent after an unattended reboot. It runs as an ordinary user all the same --
+# nothing here needs privilege.
+
+[Unit]
+Description=Sigenergy SigenStor Modbus logger
+Documentation=https://github.com/zachmu/sigen-modbus-logger
+
+# THE CLOCK IS A HARD DEPENDENCY, and this line is the most important one in the file.
+# A Pi has no battery-backed RTC: at boot, fake-hwclock restores the last time it saw,
+# so until NTP answers the clock can be minutes or hours in the past. The archive is
+# keyed on that clock in three places that all fail quietly -- the filename stamp that
+# decode.py sorts by, its backwards-clock-step check, and the ingest Lambda's test for
+# whether a tile's span is closed (a record filed under the wrong hour can be baked into
+# a tile promised immutable for a year). Waiting is cheap; being wrong is not.
+# See docs/FINDINGS.md 38.
+Wants=network-online.target systemd-time-wait-sync.service
+After=network-online.target systemd-time-wait-sync.service
+
+# So an unprovisioned host -- a freshly written image, before any credential reaches it
+# -- comes up quiet instead of crash-looping every RestartSec on "no inverter host
+# configured". systemd logs one skipped-condition line and stops there.
+ConditionPathExists=@INSTALL_DIR@/config.json
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@INSTALL_DIR@
+# -u or stdout buffering hides the 5-minute heartbeat entirely.
+ExecStart=@PYTHON@ -u @INSTALL_DIR@/log.py --seconds 0 --out @DATA_DIR@
+
+Restart=always
+# So a crash loop cannot hot-spin. The launchd plist called this ThrottleInterval.
+RestartSec=30
+
+# The latency-sensitive process on this host, and the only one that must win contention.
+# systemd applies this as root before dropping to User=, so an unprivileged user gets a
+# negative nice it could not set for itself.
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+# Graceful shutdown: log.py closes the archive and joins outstanding gzip threads on
+# SIGTERM. Killing it instead truncates the open .bin.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Appended to files rather than handed to the journal, so the log paths bin/status.sh
+# greps for the heartbeat, and every `tail -f` in the README, keep meaning what they say.
+StandardOutput=append:@LOG_DIR@/sigen.log
+StandardError=append:@LOG_DIR@/sigen.err
+
+# It reads config.json and regmap.json, writes the archive, and opens one outbound TCP
+# connection. Nothing else, so nothing else is permitted.
+NoNewPrivileges=yes
+PrivateTmp=yes
+# strict makes the whole hierarchy read-only, home included, so ProtectHome would add
+# nothing here except one more namespacing interaction to unpick if this ever fails to start.
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# AF_UNIX is in the list not because this opens one but because glibc's resolver and
+# nss can, and a unit that dies inside getaddrinfo() reports nothing useful about why.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# ProtectSystem=strict makes everything read-only; these two are the exceptions, and
+# they must already exist or systemd fails to set up the mount namespace. The installer
+# creates them.
+ReadWritePaths=@DATA_DIR@ @LOG_DIR@
+
+[Install]
+WantedBy=multi-user.target

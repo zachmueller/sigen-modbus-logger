@@ -12,20 +12,17 @@
  "data_dir": null,
  "log_dir": null,
 
+ "__deployment": "systemd. The unit names below are the labels of record: they name the files under /etc/systemd/system and they are what systemctl is given. They must differ from each other. run_as_user is required -- an empty systemd User= is not an error, it just runs the unit as root, which is what these units exist to avoid. See deploy/systemd/ and deploy/pi/.",
  "python": "/usr/bin/python3",
- "launchd_label": "local.sigen-logger",
+ "logger_unit": "sigen-logger",
+ "sync_unit": "sigen-sync",
  "run_as_user": "youruser",
-
- "__viewer": "serve.py, the local web viewer. It only reads the archive on disk -- it never opens a Modbus client. web_bind 0.0.0.0 means anyone on your LAN can read your telemetry; use 127.0.0.1 and an SSH tunnel if you would rather they could not.",
- "web_port": 8787,
- "web_bind": "0.0.0.0",
- "web_launchd_label": "local.sigen-viewer",
- "web_default_hours": 6,
- "web_show_identity": false,
 
  "fast_period_s": 2,
  "rotate_minutes": 60,
- "keep_days": 0,
+
+ "__retention": "keep_days deletes *.bin.gz on rotation -- which is the exact form sync.py uploads, so an hour pruned before its upload succeeded is gone for good. 7 is right for a Pi on a thumb drive WITH uploads working: it bounds the drive at about 15 MB of records and leaves a week of margin against a network outage. Set it to 0, keeping everything, if the archive on this host is the only copy. config.py's default is 0 for exactly that reason. See FINDINGS 40.",
+ "keep_days": 7,
 
  "degrade_after": 5,
  "degrade_probe_s": 30,
@@ -36,11 +33,10 @@
 
  "manifest_identity": true,
 
- "__offsite": "sync.py, the offsite copy. The one part that needs a dependency (boto3) and a network credential, and it is OFF by default -- an archive is nobody's business until its owner says so. Credentials come from a named ~/.aws profile, NEVER from this file. The uploader sends rotated .bin.gz and manifests only, never the open .bin, so the current hour reaches S3 on the next rotation.",
- "s3_bucket": null,
+ "__offsite": "sync.py, the offsite copy. It is the only path the data has -- there is no local viewer -- so on this deployment it is not optional and sync_enabled must be true. It needs boto3, which on a Pi comes from `sudo apt install python3-boto3` and NOT from pip (Debian refuses pip install --user with 'externally-managed-environment'). Credentials come from a named ~/.aws profile, NEVER from this file; deploy/pi/provision.sh pushes just that one profile over SSH. The uploader sends rotated .bin.gz and manifests only, never the open .bin, so the current hour reaches S3 on the next rotation.",
+ "s3_bucket": "your-telemetry-bucket",
  "s3_region": "us-east-1",
  "s3_prefix": "raw/",
- "aws_profile": null,
- "sync_enabled": false,
- "sync_launchd_label": "local.sigen-sync"
+ "aws_profile": "sigen-logger",
+ "sync_enabled": true
 }

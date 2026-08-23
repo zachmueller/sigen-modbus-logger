@@ -522,7 +522,12 @@ class TestConfig(unittest.TestCase):
         os.environ["SIGEN_CONFIG"] = config.EXAMPLE
         cfg = config.load()
         self.assertTrue(cfg["host"])
-        self.assertEqual(cfg["launchd_label"], "local.sigen-logger")
+        self.assertEqual(cfg["logger_unit"], "sigen-logger")
+        # The example describes the deployment this repository actually runs: a capture host
+        # with no viewer, whose only path to the data is the upload. An example that left
+        # sync off would be an example of something nobody runs.
+        self.assertTrue(cfg["sync_enabled"])
+        self.assertTrue(cfg["s3_bucket"])
 
     def test_sh_output_is_evaluable_assignments(self):
         self.write({"host": "h", "install_dir": "/opt/sigen with space"})
@@ -531,7 +536,7 @@ class TestConfig(unittest.TestCase):
         self.assertIn("'/opt/sigen with space'", out)   # quoted, so eval is safe
 
     def test_sh_exports_the_keys_install_sync_refuses_to_install_without(self):
-        # deploy/install-sync.sh can only refuse what --sh tells it, and it used to be
+        # deploy/systemd/install-sync.sh can only refuse what --sh tells it, and it used to be
         # blind to sync_enabled: the install then SUCCEEDED and the daemon declined to
         # upload every five minutes into a log nobody was watching. sync_enabled reaches sh
         # as the literal "True", because emit_sh prints booleans through str() -- so the
@@ -544,28 +549,78 @@ class TestConfig(unittest.TestCase):
         self.assertIn("SIGEN_S3_REGION=", out,
                       "a wrong region is a confusing runtime failure and a cheap check")
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(here, "deploy", "install-sync.sh")) as fh:
+        with open(os.path.join(here, "deploy", "systemd", "install-sync.sh")) as fh:
             sh = fh.read()
         self.assertIn('"$SIGEN_SYNC_ENABLED" = "True"', sh,
                       "the installer must compare against the literal emit_sh prints")
+
+    def test_sh_exports_the_unit_names_the_scripts_run_on(self):
+        # Every install, uninstall and status script names its unit as
+        # "${SIGEN_LOGGER_UNIT}.service" or "${SIGEN_SYNC_UNIT}.[service|timer]". A key --sh
+        # stops exporting becomes an empty expansion, which is `systemctl enable .service` --
+        # an error, but one that names nothing about where it came from.
+        self.write({"host": "h"})
+        out = ArchiveFixture.capture_stdout(config.emit_sh, config.load())
+        self.assertIn("SIGEN_LOGGER_UNIT=sigen-logger", out)
+        self.assertIn("SIGEN_SYNC_UNIT=sigen-sync", out)
+
+    def test_two_units_may_not_be_one(self):
+        # They name two files under /etc/systemd/system. One name means the second install
+        # overwrites the first, and the logger quietly becomes an uploader.
+        self.write({"host": "h", "logger_unit": "same", "sync_unit": "same"})
+        with self.assertRaises(SystemExit) as cm:
+            config.load()
+        self.assertIn("must differ", str(cm.exception))
+
+    def test_a_unit_name_may_not_carry_a_path_or_a_suffix(self):
+        # systemd derives the filename from this, so either would install somewhere nobody
+        # looks -- or, for a path, somewhere it should not be able to write at all.
+        for bad in ("sigen-logger.service", "../../etc/passwd"):
+            self.write({"host": "h", "logger_unit": bad})
+            with self.assertRaises(SystemExit) as cm:
+                config.load()
+            self.assertIn("bare unit name", str(cm.exception))
 
     def test_render_substitutes_every_token(self):
         self.write({"host": "h", "install_dir": "/opt/sigen",
                     "run_as_user": "someone"})
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        text = config.render(config.load(),
-                             os.path.join(here, "deploy/launchd.plist.template"))
-        self.assertNotIn("@", text.replace("@LABEL@", ""))
-        self.assertIn("<string>someone</string>", text)
+        text = config.render(
+            config.load(),
+            os.path.join(here, "deploy/systemd/sigen-logger.service.template"))
+        self.assertNotIn("@", text)
+        self.assertIn("User=someone", text)
         self.assertIn("/opt/sigen/log.py", text)
+        # The clock gate, asserted rather than merely commented. A Pi has no RTC, and a unit
+        # that starts before NTP answers writes an archive stamped from whenever fake-hwclock
+        # last wrote -- see docs/FINDINGS.md 38. It is one line, and deleting it would break
+        # nothing that any other test can see.
+        self.assertIn("systemd-time-wait-sync.service", text)
+        # And the condition that keeps an unprovisioned image from crash-looping.
+        self.assertIn("ConditionPathExists=/opt/sigen/config.json", text)
 
-    def test_render_refuses_a_daemon_plist_with_no_user(self):
-        # An empty <string></string> for UserName loads, and runs as root.
+    def test_render_substitutes_every_token_in_every_template(self):
+        # One template with a leftover @TOKEN@ is a unit that fails to start with a message
+        # about a file called "@DATA_DIR@". render() already refuses a token it knows about;
+        # this is the check that every template only uses tokens it knows about.
+        self.write({"host": "h", "install_dir": "/opt/sigen", "run_as_user": "someone"})
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        d = os.path.join(here, "deploy", "systemd")
+        templates = sorted(f for f in os.listdir(d) if f.endswith(".template"))
+        self.assertEqual(len(templates), 3, "a template was added or removed")
+        for name in templates:
+            text = config.render(config.load(), os.path.join(d, name))
+            self.assertNotIn("@", text, f"{name} has an unsubstituted token")
+
+    def test_render_refuses_a_unit_with_no_user(self):
+        # An empty `User=` is not an error to systemd: the unit loads and runs as root, which
+        # is exactly what these units exist to avoid.
         self.write({"host": "h"})
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with self.assertRaises(SystemExit) as cm:
-            config.render(config.load(),
-                          os.path.join(here, "deploy/launchd.plist.template"))
+            config.render(
+                config.load(),
+                os.path.join(here, "deploy/systemd/sigen-logger.service.template"))
         self.assertIn("run_as_user", str(cm.exception))
 
 
