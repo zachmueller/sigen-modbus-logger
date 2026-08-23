@@ -4,15 +4,17 @@
 # Run this ON YOUR WORKSTATION, not on the Pi:
 #
 #   deploy/pi/provision.sh pi@sigen-pi.local                  # code + secrets + bootstrap
-#   deploy/pi/provision.sh --config-only pi@sigen-pi.local    # just the two secrets
-#   deploy/pi/provision.sh --code-only   pi@sigen-pi.local    # just the code, then restart
+#   deploy/pi/provision.sh --config-only pi@sigen-pi.local    # the two secrets, then restart
+#   deploy/pi/provision.sh --code-only   pi@sigen-pi.local    # the code + bootstrap, then restart
 #
 # Idempotent. Re-running is how you deploy a change: it rsyncs, re-runs bootstrap.sh, and
-# restarts the logger, which shuts down gracefully and comes back with the new code.
+# restarts the units, which shut down gracefully and come back with the new code.
 #
-# --config-only is the step that finishes a freshly written golden image. The image carries
-# the code, the units and the host tuning but neither secret, so a clone boots with both
-# units skipped on their start condition and needs exactly this to come alive.
+# --config-only is the step that finishes a freshly written golden image, and it deliberately
+# does NOT run bootstrap.sh: the image already carries the code, the units and the host
+# tuning: everything except the two secrets. A clone therefore boots with both units skipped
+# on their start condition, and handing it a config.json plus a restart is the whole of what
+# it needs.
 #
 # WHAT COUNTS AS A SECRET HERE, and why they travel over SSH rather than in the image:
 #   config.json         the inverter's LAN address, the bucket, the username
@@ -125,14 +127,24 @@ PY
 fi
 
 # ----------------------------------------------------------------- the host
-echo
-echo "=== bootstrap on $TARGET"
-ssh -t "$TARGET" "sudo sh '$REMOTE_DIR/deploy/pi/bootstrap.sh'"
+# Only when the code moved. bootstrap.sh installs packages and rewrites host settings, which
+# is the right thing after an rsync and the wrong thing for --config-only: on a freshly
+# written image the units are ALREADY installed and enabled, and all they are waiting for is
+# the config.json that has just arrived. An apt update over a domestic link to discover that
+# nothing changed is a minute nobody needs to spend.
+if [ "$CODE" = 1 ]; then
+  echo
+  echo "=== bootstrap on $TARGET"
+  ssh -t "$TARGET" "sudo sh '$REMOTE_DIR/deploy/pi/bootstrap.sh'"
+fi
 
 echo
-echo "=== restart the logger with the new code"
-# SIGTERM: log.py closes the archive and joins its gzip threads rather than truncating.
+echo "=== (re)start the units"
+# restart, not start, and it covers both cases: a clone whose units have never run, and a
+# running host whose config.json just changed. SIGTERM is what log.py handles -- it closes
+# the archive and joins its gzip threads rather than truncating the open .bin.
 ssh "$TARGET" "sudo systemctl restart ${SIGEN_LOGGER_UNIT}.service || true"
+ssh "$TARGET" "sudo systemctl restart ${SIGEN_SYNC_UNIT}.timer || true"
 
 echo
 echo "=== state"
