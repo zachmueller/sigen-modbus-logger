@@ -4,8 +4,10 @@ Why the code is the way it is. Measurements, device quirks, and the analysis
 mistakes that produced confident wrong conclusions before being caught.
 
 All measurements are from one SigenStor EC 10.0 SP AU (single phase, one battery
-pack, firmware `V100R001C22SPC116`) polled over a home LAN from a Mac. Treat the
-numbers as one data point and the *methods* as the transferable part.
+pack, firmware `V100R001C22SPC116`) polled over a home LAN. The latency numbers below were
+measured from a Mac Studio, which was the capture host until the job moved to a Raspberry Pi 4
+(FINDINGS 38); they have not been re-measured on the Pi. Treat the numbers as one data point
+and the *methods* as the transferable part.
 
 ---
 
@@ -507,7 +509,7 @@ field.** A 2% error on a plausible number is invisible to inspection.
    `handler.py` plus `PACKAGE.txt` — so editing `series.py` gave "no changes" and left old
    code running. `assetHashType: OUTPUT` hashes what actually ships. Silently deploying
    stale code is the worst failure a deploy tool has.
-3. **The package list was incomplete**, missing `config.py`, which `serve.py` imports.
+3. **The package list was incomplete**, missing `config.py`, which `serve.py` imported.
    Symptom: `No module named 'config'` in CloudWatch after a clean deploy. Now `PACKAGE.txt`
    with a test that recomputes the transitive import closure of every handler. Usefully,
    `log.py` is *excluded* — the only module that constructs `lib.Modbus` — so the ingest and
@@ -800,7 +802,7 @@ from minutes earlier the whole time. What had stopped, or rather had never start
 On a `tiles` source `record_ts` is the newest record that reached the bucket, and that only
 advances on rotation-plus-upload. A stopped logger and a stopped uploader are therefore the
 **same symptom**, and the page has nothing to tell them apart with. It now names both there,
-and still names the logger alone on `serve.py`, which reads the archive directly and where the
+and still named the logger alone on `serve.py`, which read the archive directly and where the
 inference is available.
 
 **This is FINDINGS 7's distinction one hop further out.** That one separated "the logger
@@ -1032,7 +1034,7 @@ to `/agg/api/csv?…`, a key that does not exist, so it downloaded a 404. All th
 flag anyone has to remember in `site-stack.ts`.
 
 `cloud/README.md` had said it all along: *"No live view. Tiles appear when the logger rotates, so
-the hosted page is up to an hour behind and says so. `serve.py` on the LAN is the live one."* The
+the hosted page is up to an hour behind and says so."* The
 page had been contradicting the design document for as long as both existed, and the contradiction
 was the default state of a checkbox.
 
@@ -1195,6 +1197,145 @@ grows with the data, the fix is not a bigger deadline — it is somewhere withou
 
 ---
 
+### 38. A Pi has no clock, so the archive can be stamped before the data it holds
+
+The capture host moved from a Mac to a Raspberry Pi 4. A Mac has a battery-backed real-time
+clock; a Pi has none. At boot, before `systemd-timesyncd` reaches an NTP server, the clock holds
+whatever `fake-hwclock` last wrote to disk — which after an unclean shutdown or a long power cut
+can be minutes or hours in the past.
+
+That is a correctness problem, not a cosmetic one, because **the archive is keyed on the host
+clock in three places and every one of them fails quietly**:
+
+1. **The filename.** `sigen-YYYYMMDDTHHMMSS-<hash>.bin`. `decode.py` sorts by the stamp in the
+   name, not by argv order, precisely so a `*.bin *.bin.gz` glob decodes chronologically. A file
+   stamped in the past sorts *before* files already written, so the series it produces steps
+   backwards through data that arrived in order.
+2. **`decode.py --check`.** Its backwards-clock-step detector fires — correctly — and the report
+   is indistinguishable from the one a corrupted archive or a mixed-plan decode produces. The
+   troubleshooting table already sends you looking for mixed series.
+3. **The ingest Lambda, which is the expensive one.** A tile is written once from a *complete*
+   span and then served `immutable` for a year (FINDINGS 30). "Complete" is decided by comparing
+   the clock against the archive's newest record. A record attributed to the wrong hour can
+   therefore close a span that is not closed, or be baked into a tile that the CDN will keep
+   for a year and that S3 alone cannot fix.
+
+None of that is detectable after the fact from the archive itself: a plausible timestamp is
+indistinguishable from a correct one.
+
+**The fix is one line in the unit, and it is a dependency rather than a retry:**
+
+```ini
+Wants=network-online.target systemd-time-wait-sync.service
+After=network-online.target systemd-time-wait-sync.service
+```
+
+`systemd-time-wait-sync` blocks until the clock is actually synchronised, so the logger does not
+start with a wrong one instead of starting and being wrong. `deploy/systemd/install-logger.sh`
+enables it, because the ordering is worthless if the thing being waited for is never scheduled,
+and `deploy/pi/bootstrap.sh` enables `systemd-timesyncd` itself. `bin/status.sh` reports
+`timedatectl`'s synchronised state first, above everything the clock dates.
+
+**A host property the previous host happened to provide is not a property of the system. Moving a
+latency- and timestamp-sensitive job to cheaper hardware means auditing what the old hardware was
+silently supplying — and a wrong clock is the failure mode that corrupts data while every
+component reports success.**
+
+---
+
+### 39. Debian refuses `pip install --user`, so the one dependency comes from apt
+
+`deploy/install-sync.sh` checked that boto3 was importable as the user the daemon would run as —
+a good check, borrowed intact — and told you how to fix it:
+
+```
+python3 -m pip install --user boto3
+```
+
+On Raspberry Pi OS (Debian Bookworm) that command fails:
+
+```
+error: externally-managed-environment
+```
+
+PEP 668: the system Python is managed by apt, and pip refuses to write into it. The advice is not
+merely unhelpful, it is a dead end that invites the two worst ways out — `--break-system-packages`
+on the host that must keep running, or a venv, which then has to be threaded through the unit's
+`ExecStart` and the installer's check and `config.py`'s `python` key.
+
+`sudo apt install python3-boto3` is the answer, and it is a *better* answer than the Mac had: the
+package is maintained with the OS, upgraded by `unattended-upgrades`, and needs no venv, so
+`python` stays `/usr/bin/python3` and the repository's "nothing to install" claim survives intact
+for everything except the one module that was always the exception.
+
+**A remedy printed in an error message is part of the interface, and it is platform-specific even
+when the check around it is not. Porting the check is not porting the advice.**
+
+---
+
+### 40. `keep_days` deletes the exact file that carries the data offsite
+
+On the Mac, `keep_days` was `0` — keep everything — because 800 MB a year is nothing on a desktop.
+On a Pi booting from a USB thumb drive, with no local viewer and no reason to hold history on the
+device, bounding the archive is obviously right. It is also a way to lose data, and the mechanism
+is worth stating precisely because nothing warns you.
+
+`keep_days` prunes **on rotation only**, and it deletes `*.bin.gz`. That is the *exact* form
+`sync.py` uploads: the open `.bin` never travels, log.py gzips it on rotation, and the `.bin.gz`
+is what goes to S3. So an hour whose upload has not yet succeeded — a router rebooted, a
+credential expired, the timer disabled while someone debugged something — is deleted by the same
+mechanism that is supposed to be housekeeping. There is no second copy: the whole point of this
+deployment is that the archive on the Pi is a spool, not a destination.
+
+The margin, not the tidiness, is what sets the number. With hourly rotation and a five-minute
+upload timer, `7` leaves a week for a network outage to be noticed and fixed, and bounds the
+drive at roughly 15 MB of records plus one manifest per day. `config.py`'s default stays `0`,
+deliberately: someone whose archive is the only copy should not lose it by accepting a default,
+and it is `config.example.json` — which describes *this* deployment — that sets 7 beside
+`sync_enabled: true`. The two belong together, and neither is safe without the other.
+
+**A retention policy is a deletion policy, and it has to be reasoned about against the slowest
+thing that still needs the file — not against the disk. Setting it on a host where the data has
+one copy and one way out means the retention window IS the outage budget.**
+
+---
+
+### 41. The catalogue outlived the server that owned it
+
+`ingest.py` imported `PANELS`, `ENERGY_TILES` and `LIVE_FIELDS` from `serve.py`, and its header
+said why: *"The presentation contract comes from serve.py, deliberately."* That was a real
+decision and the right one — one list, so the local page and the hosted page could not disagree
+about which fields make up which chart.
+
+It was also load-bearing in a direction nobody had chosen. When the local viewer was removed, an
+HTTP server would have had to stay in the tree, and in the Lambda package, for one import of
+static data. The dependency had been described as being on *the viewer*, when what ingest actually
+needed was *the list*.
+
+`panels.py` is that list and imports nothing. The move was verified by comparing both modules'
+objects for equality — including `panel_keys()` across five different `ids` arguments — while
+`serve.py` was still importable, rather than by reading the diff.
+
+Two things made the removal safe, and both were already there:
+
+- **`TestIngestPackage` recomputes the transitive import closure** of the Lambda handlers and
+  asserts `PACKAGE.txt` matches exactly. Swapping `serve.py` for `panels.py` either matches or
+  fails the suite. That test exists because a hand-maintained list once omitted `config.py` and
+  the only symptom was `No module named 'config'` in a CloudWatch log after a clean deploy.
+- **`ViewerFixture` never constructed a `serve.Viewer`.** It builds archives and exercises
+  `series.py` directly, so the aggregation coverage the cloud actually rests on — buckets,
+  health, energy, tiles, ingest, cache — carried over untouched. Had the fixture been written
+  against the HTTP layer for convenience, deleting the server would have deleted the tests that
+  prove the tile builder correct.
+
+**When a module imports data from another module, the dependency is on the data — so put the data
+somewhere it can be depended on. A test that derives a fact rather than restating it keeps
+working through a refactor that invalidates every restatement. And a fixture built against the
+layer you are testing, rather than the layer that happens to expose it, is what lets that layer
+be deleted.**
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is
@@ -1220,8 +1361,23 @@ grows with the data, the fix is not a bigger deadline — it is somewhere withou
   the independent cross-check.
 - **Three-phase, multiple inverters and chargers are untouched.** Those register
   groups are swept and reported, and this unit refuses most of them.
-- **Reboot survival is configured but unobserved.** The LaunchDaemon is correct for
-  it — root:wheel 644, not in the disabled list — but no reboot has been tested.
+- **Reboot survival is configured but unobserved.** The unit is `WantedBy=multi-user.target`
+  and enabled, and a Pi powers back up by itself when mains returns — which is strictly better
+  than the Mac's `pmset autorestart`. But no reboot has been tested, and the thing to watch on
+  the first one is not whether it starts: it is whether `systemd-time-wait-sync` held it until
+  the clock was right (FINDINGS 38).
+- **Capture latency has not been measured on the Pi.** Every number in this file comes from a
+  Mac Studio. A Pi 4 is a slower machine on a 100/1000 Mbit NIC, and the logger's budget is a
+  2000 ms tick against a ~30 ms request, so there is a lot of headroom — but "a lot of headroom"
+  is an argument, not a measurement. Run `decode.py --latency 10` over a day of Pi-captured
+  archive and compare against the 70–133 ms medians above before believing the port was free.
+- **Thumb-drive wear is bounded by argument, not by observation.** The open `.bin` is flushed
+  every record, which is ~28 MB a day, ~10 GB a year. `bootstrap.sh` removes the avoidable
+  writers — journal to RAM, no swapfile, `noatime`, logrotate — and `keep_days` bounds the
+  archive. Nothing has measured what the drive actually absorbs, and a cheap drive with poor
+  wear levelling is the component most likely to fail first. `bin/status.sh` reports `df` for
+  that reason. If it becomes a problem, `data_dir` is one config key and a USB SSD needs no
+  code change.
 - **The hosted viewer cannot pick up a new batch without a browser reload.** `web/tiles.js`
   caches every object it fetches for the life of the page and has no invalidation, so nothing
   in the page can ask for a newer tile — which is why `Reload` is hidden there rather than
@@ -1235,17 +1391,23 @@ grows with the data, the fix is not a bigger deadline — it is somewhere withou
   invisible.** `web/tiles.js` reads `index.current` and nothing else, so a window that
   reaches back past a `plan=` boundary draws the older side as a gap even though the tiles
   exist under the previous hash. A share is faithful to that — it copies what was on
-  screen — but "no data" there means "not in this plan", not "the logger was off". The
-  local viewer has the same seam and answers it differently: `serve.py` groups by plan
-  hash itself.
-- **The viewer is unproven past a few days of archive.** Its per-file summary cache
-  is in memory only, so a restart re-warms lazily, and nothing has been measured
-  against a month or a year of files. If deep history gets slow, the fix is an
-  on-disk summary cache — rotated files are immutable, so one is safe to keep — not
-  a coarser bucket ladder.
-- **The viewer's effect on capture latency has not been measured.** It is
-  `ProcessType: Background`, nices itself, and serialises decoding on one thread,
-  but "the logger is unaffected" is a design argument, not an observation. Watch
-  `decode.py --latency` across a period of heavy browsing before believing it.
+  screen — but "no data" there means "not in this plan", not "the logger was off". This used
+  to be softened by the local viewer, which groups by plan hash itself and could show the
+  older series; with that removed, the raw archive and `decode.py` are the only way to read
+  across a plan boundary.
+- **Removing the local viewer cost one capability, and this is it.** An hour tile carries 32
+  fields and a day tile 240, so the hosted page can only chart a register that is in one of
+  those sets, at a bucket width of 30 s at best. Any of the 358 documented fields at the full
+  2 s cadence now means `decode.py --fields ... ` against the raw archive — on the Pi, or
+  against a copy pulled from S3. Nothing is lost from the *data*; the fast path to looking at
+  an odd register is what went.
+- **There is no on-device history.** `keep_days` is 7 on the Pi and the archive is a spool.
+  Everything older lives in S3 and in the tiles built from it, so a bucket-level mistake has
+  no local copy to fall back on after a week. The bucket is versioned, which is the mitigation.
+- **Dead code remains in `web/app.js`.** The `server` source branch, the live-poll path, the
+  CSV link and the `sigen-stop://` tunnel chip all belonged to the local viewer. They are
+  gated and unreachable rather than removed, because the page is pinned by every existing
+  share's bundle hash and trimming it is a change worth making on its own. `TestPageContract`
+  asserts they stay gated, and names the two dead routes explicitly.
 - The smart-load span `30124..30199` is deliberately uncaptured, and `30163+124` is
   rejected by the device, so folding it in would need a 4th request.
