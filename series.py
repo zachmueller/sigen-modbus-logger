@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Windowed aggregation over a raw archive, for the local viewer. Stdlib only.
+Windowed aggregation over a raw archive. Stdlib only.
 
-Not a CLI. Imported by serve.py, which is run from this directory so a plain
+Not a CLI. Imported by ingest.py, which is run from this directory so a plain
 `import series` resolves. Offline by construction: this module imports the decode
 half of the toolchain and never constructs lib.Modbus -- the device already has
 exactly one client (log.py), and tests/ asserts that this file cannot become a
@@ -28,8 +28,9 @@ Conventions worth knowing before changing anything here:
     and re-polling land on cache entries that already exist.
   - Files are grouped by the plan hash in their filename and each group is
     decoded with its own manifest. decode.check_plan_hash() is deliberately not
-    used: it exits the process, which is not something a server may do. Grouping
-    makes a mixed-plan decode impossible instead of fatal.
+    used: it exits the process, which is not something a long-running caller may do
+    -- and in the ingest Lambda it would fail the whole invocation rather than the one
+    plan. Grouping makes a mixed-plan decode impossible instead of fatal.
 """
 import json
 import os

@@ -48,8 +48,8 @@ import boto3
 # It has to be done HERE rather than as a Lambda environment variable, because `TZ` is
 # reserved: CloudFormation rejects a function whose config sets it. So the zone arrives
 # under a name of our own and is applied with tzset(), which re-reads TZ from the
-# process environment. Before the first localtime() call, and before `import ingest`
-# pulls in serve.py, so nothing has cached an offset. The Python runtime ships tzdata.
+# process environment. Before the first localtime() call, and before `import ingest` pulls
+# in series.py, so nothing has cached an offset. The Python runtime ships tzdata.
 os.environ["TZ"] = os.environ.get("CAPTURE_TZ", "UTC")
 time.tzset()
 

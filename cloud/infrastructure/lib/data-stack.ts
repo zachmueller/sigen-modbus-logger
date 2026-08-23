@@ -82,9 +82,9 @@ export class DataStack extends cdk.Stack {
 		// `import series` resolves with no package and no PYTHONPATH.
 		//
 		// The list is read from PACKAGE.txt rather than written here, because a
-		// hand-maintained copy was already wrong once -- it omitted config.py, which
-		// serve.py imports, and the only symptom was "No module named 'config'" in a
-		// CloudWatch log after deploy. tests/test_web.py recomputes the import closure and
+		// hand-maintained copy was already wrong once -- it omitted config.py, which was
+		// reached through an import two modules deep, and the only symptom was "No module
+		// named 'config'" in a CloudWatch log after deploy. tests/test_web.py recomputes the import closure and
 		// asserts that file is exactly right, so the failure now happens in the suite.
 		// The bundling, the PACKAGE.txt list and the OUTPUT asset hash all live in
 		// archive-bundle.ts, because the share Lambda in site-stack.ts needs exactly the

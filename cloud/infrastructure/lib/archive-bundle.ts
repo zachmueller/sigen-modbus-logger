@@ -11,8 +11,9 @@ import * as path from 'path';
  * closure beside their handler.
  *
  * The list lives in cloud/lambda/ingest/PACKAGE.txt, not here, because a hand-maintained
- * copy was already wrong once -- it omitted config.py, which serve.py imports, and the only
- * symptom was "No module named 'config'" in a CloudWatch log after a clean deploy.
+ * copy was already wrong once -- it omitted config.py, which was reached through an import two
+ * modules deep, and the only symptom was "No module named 'config'" in a CloudWatch log after a
+ * clean deploy.
  * tests/test_web.py recomputes the transitive closure of both handlers and asserts the file
  * matches, so adding an import that reaches a new module fails the suite rather than the
  * Lambda.

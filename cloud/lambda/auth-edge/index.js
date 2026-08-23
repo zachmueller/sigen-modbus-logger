@@ -241,8 +241,7 @@ function forbidden(email) {
 // domain is enough to tell which of a handful of allowlisted people hit a gate.
 //
 // Allows are logged only for page requests, not for every /agg/* tile the page then
-// fetches -- same reasoning as serve.py's `noisy` filter. "Did this person get in?" is
-// answered by one line; a line per tile would bury it.
+// fetches. "Did this person get in?" is answered by one line; a line per tile would bury it.
 //
 // REFUSALS on those same paths are not filtered, and that is deliberate even though it means a
 // burst: an id token expiring under an open page refuses every tile in flight, so perhaps a

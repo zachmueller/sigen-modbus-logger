@@ -4,19 +4,24 @@ The wire format the page reads, and the precomputed tiles that carry it. Stdlib 
 
 Not a CLI. Imported by two callers that must not disagree:
 
-  - serve.py, which answers a window live by decoding the archive on the LAN;
-  - cloud/lambda/ingest, which precomputes the same columns per tile so the hosted
-    viewer needs no server at read time.
+  - cloud/lambda/ingest, which precomputes the columns per tile so the hosted viewer
+    needs no server at read time;
+  - cloud/lambda/share, which copies a span of those tiles into a frozen share.
 
-**Why one module rather than two implementations.** web/app.js reads one shape. If the
-live path and the precomputed path build it differently -- a different rounding, a
-different rule for when a field is "empty" -- then the hosted page and the local page
-disagree about the same archive, and the disagreement is quiet: both render, both look
-plausible, and only a careful side-by-side would show it. So the column shaping lives
-here once and tests/ asserts the two callers produce identical output for the same span.
+**Why one module rather than two implementations.** web/app.js reads one shape, and it
+reads it from two places: whole tiles for a live window, and a share's pinned copy of the
+same tiles. If those were built differently -- a different rounding, a different rule for
+when a field is "empty" -- then a share and the page it was made from would disagree about
+the same archive, and the disagreement is quiet: both render, both look plausible, and only
+a careful side-by-side would show it. So the column shaping lives here once.
+
+There used to be a third caller, serve.py, which answered a window live by decoding the
+archive on the LAN. That is what "must not disagree" originally meant, and the guarantee
+outlived it: the local viewer is gone, and one wire format is still the thing that keeps a
+frozen share honest against the page that made it.
 
 A word on the word "tile", which this repository unfortunately uses for two things. In
-web/ and in serve.PANELS a *tile* is a stat card on the page (`ENERGY_TILES`, `.tile`).
+web/ and in panels.PANELS a *tile* is a stat card on the page (`ENERGY_TILES`, `.tile`).
 Here a *tile* is a precomputed chunk of aggregated series -- one UTC hour, day or month
 at one bucket width, the map-tile sense. This module only ever means the second.
 
@@ -145,10 +150,10 @@ def counters(win, keys):
     than the window's -- measured at five extra minutes of energy on a six-hour window,
     a silent 2% overstatement that looked plausible on screen. Per-bucket arrays let the
     reader clip to the bucket the window actually begins in, which is exactly what
-    series.energy() does on the live path.
+    series.energy() does when it aggregates the archive directly.
 
     Not a mean, min or max: those are meaningless for a lifetime counter, and a counter is
-    never drawn as a line anyway -- serve.PANELS shows it as one number. So this carries
+    never drawn as a line anyway -- panels.ENERGY_TILES shows it as one number. So this carries
     two arrays rather than the usual three, and no unit or cadence.
 
     `reset` is only what happened WITHIN this tile. A counter stepping back across a tile

@@ -1,35 +1,41 @@
 /*
   The viewer's application layer: state, fetching, and turning /api/window into
-  the panels serve.py described in /api/meta.
+  the panels meta.json describes.
 
-  Which charts exist, and which fields make them up, is NOT decided here -- it
-  comes from the server's PANELS list, so a new chart is a dict in serve.py rather
-  than new JavaScript.
+  Which charts exist, and which fields make them up, is NOT decided here -- it comes
+  from the PANELS list ingest.py copies into meta.json, so a new chart is a dict in
+  panels.py rather than new JavaScript.
 
   Three behaviours worth knowing:
 
     - Where the answers come from is a detail, deliberately. Everything goes through
-      getJSON(), so this same file renders serve.py's live archive and a hosted
-      deployment's precomputed tiles. There is one renderer, and a shared view looks
-      like the screen it was taken from because it IS that code -- see SRC below.
+      getJSON(), so this same file renders a live window and a frozen share's pinned
+      copy of one. There is one renderer, and a shared view looks like the screen it
+      was taken from because it IS that code -- see SRC below.
     - Only expanded panels are requested. Collapsing a panel stops fetching its
       fields, which is why a page showing four charts costs a quarter of one
       showing sixteen.
     - Every number on screen says where it came from: the bucket width and the
       record stride are chips in the filter row, the tooltip reports how many
-      records went into the point, and a partial answer (the server ran out of
-      its warm budget) is labelled rather than shown as if it were complete.
+      records went into the point, and a partial answer (the tile builder ran out
+      of its warm budget) is labelled rather than shown as if it were complete.
+
+  There used to be a second source: serve.py, a local HTTP server on the capture host
+  that decoded the archive on demand. It is gone, and the seam that existed for it is
+  what a share now travels through. Several comments below still describe the `server`
+  branch, because the code for it is still here and inert -- see applyServerOnlyMode().
 */
 'use strict';
 
 const C = Charts;
 const $ = (id) => document.getElementById(id);
 
-// Where the answers come from. This page is deployed two ways and must not fork:
-// serve.py serves it with no SIGEN_SOURCE at all, so it defaults to fetching from
-// that server; a hosted deployment sets the global in an inline <script> before this
-// file loads, pointing at precomputed tiles that compose into the same three JSON
-// answers. Everything below goes through getJSON() and nothing calls fetch()
+// Where the answers come from. Every entry point sets the global in an inline <script>
+// before this file loads, pointing at precomputed tiles that compose into the three JSON
+// answers. The `server` default below is what a page with no SIGEN_SOURCE falls back to;
+// nothing serves it that way any more, since the local server it described was removed,
+// and site-stack.ts injects a source for every entry point it writes.
+// Everything below goes through getJSON() and nothing calls fetch()
 // directly, which is what keeps one renderer rather than two.
 //
 //   {kind: 'server'}                        this server, live
@@ -46,13 +52,14 @@ const FROZEN = !!SRC.frozen;
 // Whether a poll can return anything new, which is a property of the SOURCE and so is
 // derived rather than configured -- there is nothing for site-stack.ts to remember.
 //
-// serve.py decodes the archive on demand, so asking again a second later can genuinely
-// show a newer record. A tile source cannot: tiles are published when the logger
+// A server that decoded the archive on demand could show a newer record when asked again
+// a second later. A tile source cannot: tiles are published when the logger
 // rotates, roughly hourly, and web/tiles.js caches every object it fetches for the life
 // of the page -- so a poll re-renders bytes it already holds, and an hour boundary makes
 // it fetch one tile that is normally not published yet and cache that ABSENCE. "Live
-// (10 s)" was therefore a checkbox that could only ever redraw the same data; the local
-// viewer is the live one, which is what cloud/README.md always said. See FINDINGS 34.
+// (10 s)" was therefore a checkbox that could only ever redraw the same data. See
+// FINDINGS 34. The local viewer WAS the live one, and it has since been removed -- so
+// POLLS is now false everywhere, and everything it gates is inert.
 //
 // This is also what hides [data-server-only]: /api/csv is likewise not a route a tile
 // source has.
@@ -65,9 +72,14 @@ const PRESETS = [
   { label: 'All', hours: null },
 ];
 
-// Reached through an SSH tunnel? Then a "Close tunnel" button makes sense, and it
-// has to act locally: the server is on the capture host and cannot touch this
-// machine's ssh process, so the button hands off to the Stop app's URL scheme.
+// Reached through an SSH tunnel? Then a "Close tunnel" button makes sense, and it has to
+// act locally: the server is on the capture host and cannot touch this machine's ssh
+// process, so the button hands off to the Stop app's URL scheme.
+//
+// Vestigial. The tunnel led to the local viewer and the launcher that opened it was
+// generated by a script; both are gone. Reaching a CDN over localhost is not a thing that
+// happens, so this is false in practice -- kept only because trimming the page is its own
+// change. See tests/test_web.py TestPageContract.VESTIGIAL.
 const TUNNELED = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(location.hostname);
 
 const state = {
@@ -179,7 +191,7 @@ function hashHas(k) {
 // The names, derived from the panel list rather than restated here. Two per panel, because the
 // two audiences differ: `panels=` already carries ids, so an id is what a copied hash contains,
 // while a title is what someone hand-editing a URL would write -- `#focus=temperatures` for a
-// panel whose id is `temps`. A new dict in serve.py's PANELS is focusable with no change to
+// panel whose id is `temps`. A new dict in panels.PANELS is focusable with no change to
 // this file.
 let _focusTargets = null;
 function focusTargets() {
@@ -234,9 +246,9 @@ function writeHash() {
   history.replaceState(null, '', '#' + q.toString());
 }
 
-// The one seam every answer comes through. `url` is always one of the three API
-// routes, with serve.py's query string; a tile source parses that query and composes
-// the same object out of static objects instead of asking a server for it.
+// The one seam every answer comes through. `url` is always one of the three API routes,
+// with the query string they were originally defined with; the tile source parses that
+// query and composes the same object out of static objects.
 async function getJSON(url) {
   if (SRC.kind === 'tiles') return Tiles.getJSON(SRC, url);
   const r = await fetch((SRC.base || '') + url, { cache: 'no-store' });
@@ -356,8 +368,9 @@ function applyFrozenMode() {
 
 // ------------------------------------------------ reading a source with no server behind it
 
-// Every control that needs serve.py to answer it: the poll, and the CSV route. Removed rather
-// than left in place doing nothing, the same choice applyFrozenMode() makes and for the same
+// Every control that needed a server to answer it: the poll, and the CSV route. Nothing
+// answers either now, so this runs on every entry point. Removed from the page rather than
+// left in place doing nothing, the same choice applyFrozenMode() makes and for the same
 // reason -- a control that silently fails reads as a broken viewer.
 //
 // Called from boot() before anything is fetched, because POLLS is a fact about SRC and needs no
@@ -874,7 +887,7 @@ function renderLiveTiles() {
         'The newest record was read, but none of its fields decoded' +
         (l.missing && l.missing.length ? ' (' + l.missing.length + ' unresolved)' : '') +
         '. The charts below are unaffected. Reload; if it persists, run ' +
-        'python3 serve.py --check on the capture host.' }),
+        'bin/latest.sh on the capture host.' }),
     ]));
     return;
   }

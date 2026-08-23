@@ -535,9 +535,10 @@ function handler(event) {
  * content-addressed copy of the whole bundle for shares to pin themselves to.
  *
  * They differ by a single inline script that sets window.SIGEN_SOURCE before app.js loads.
- * That is the entire difference between the local viewer, the hosted viewer and a frozen
- * share -- there is no second copy of the page, and web/index.html stays the file serve.py
- * serves, so the two cannot drift.
+ * That is the entire difference between the hosted viewer and a frozen share -- there is no
+ * second copy of the page, so the two cannot drift. (There was a third: a local server that
+ * served web/index.html with no source set at all. It has been removed, and the `server`
+ * branch in app.js is now unreachable.)
  *
  * **Why a second, pinned copy exists.** A share copies its tiles rather than pointing at them,
  * so that re-aggregating history cannot change what someone was sent -- the share handler says
@@ -562,9 +563,9 @@ function buildSite(out: string, cfg: CloudConfig, version: string): boolean {
 		fs.copyFileSync(path.join(WEB, f), path.join(out, f));
 	}
 
-	// The gated viewer. Its data comes from /agg/, which the gate also covers, and `share`
-	// is what turns on the "Save this view" card -- only here. serve.py's local page has no
-	// share endpoint, and a frozen share cannot re-share itself.
+	// The gated viewer. Its data comes from /agg/, which the gate also covers, and `share` is
+	// what turns on the "Save this view" card -- only here, because a frozen share cannot
+	// re-share itself.
 	fs.writeFileSync(path.join(out, 'view'),
 		withSource(`window.SIGEN_SOURCE={kind:"tiles",base:"/agg/",share:"/api/share"};`));
 

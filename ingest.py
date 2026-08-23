@@ -7,11 +7,16 @@ and writes a directory of tiles, which is what makes it testable with no network
 credentials -- cloud/lambda/ingest/handler.py is the thin part that syncs S3 to /tmp,
 calls this, and syncs back.
 
-**The presentation contract comes from serve.py, deliberately.** PANELS, ENERGY_TILES
-and LIVE_FIELDS are imported rather than restated, so the hosted page draws the charts
-the local viewer draws. A second copy of that list is exactly the drift this whole
-arrangement is built to avoid, and it would show up as a hosted page quietly missing a
-panel the local one has.
+**The presentation contract comes from panels.py, deliberately.** PANELS, ENERGY_TILES and
+LIVE_FIELDS are imported rather than restated, so the page and the tiles behind it cannot
+disagree about which fields make up which chart. A second copy of that list is exactly the
+drift this whole arrangement is built to avoid, and it would show up as a page quietly
+missing a panel its tiles carry the data for.
+
+That contract used to come from serve.py, the local viewer, which imported it as the thing
+that drew the charts. The viewer is gone -- the hosted page is the only page now -- so the
+catalogue lives in a module of its own rather than inside an HTTP server kept alive for one
+import. Nothing about the list changed in the move; a test asserts identity, not equality.
 
 Which tiles exist, and why the spans are what they are:
 
@@ -44,9 +49,10 @@ Which tiles exist, and why the spans are what they are:
     told people to widen to 30 h when 15 would do.) So the 24 h, 3 d, 7 d and longer
     views can chart any captured register; 15 m, 1 h and the default 6 h cannot, and
     meta's `picker_min_bucket_s` and `target_buckets` are what let the page state the
-    real limit instead of offering a field that would come back absent. The local viewer
-    still has the whole catalogue at the full 2 s cadence; that is the tool for a narrow
-    look at an odd register.
+    real limit instead of offering a field that would come back absent. For a narrow look
+    at an odd register the tool is decode.py against the raw archive, at the full 2 s
+    cadence -- which is what the local viewer used to be for, and is the one capability
+    removing it actually cost.
   - **An incomplete month has no month tile.** It is served from that month's day tiles
     instead. Complete months are therefore immutable-on-first-write, and no ingest run
     ever re-reads a month of raw. The alternative -- rebuilding month tiles hourly --
@@ -59,8 +65,8 @@ import json
 import os
 import time
 
+import panels
 import series
-import serve
 import tiles
 
 # Only these are ever written outside a tile directory.
@@ -141,7 +147,7 @@ def path_for(plan_hash, bucket_s, start, kind):
 
 def counter_keys():
     """The lifetime counters. Endpoints in every tile, never a line."""
-    return [t["key"] for t in serve.ENERGY_TILES]
+    return [t["key"] for t in panels.ENERGY_TILES]
 
 
 def fine_keys(s):
@@ -149,7 +155,7 @@ def fine_keys(s):
     strip need, minus the counters, restricted to what this plan actually captured."""
     covered = {c["key"] for c in series.catalog(s)}
     counters = set(counter_keys())
-    wanted = serve.panel_keys() + list(serve.LIVE_FIELDS)
+    wanted = panels.panel_keys() + list(panels.LIVE_FIELDS)
     return [k for k in dict.fromkeys(wanted) if k in covered and k not in counters]
 
 
@@ -321,8 +327,8 @@ def build_all(s, out_dir, cache=None, now=None, kinds=None):
 def build_meta(s, capture_tz_now=None):
     """What /api/meta answers, as a static document.
 
-    Identity is reduced to the model, exactly as serve.meta() reduces it when
-    web_show_identity is false. This file is served to four people over the internet;
+    Identity is reduced to the model: this file is served to a handful of people over
+    the internet, and
     the serial and the inverter's LAN address are not part of reading a chart, and
     tests/ asserts they never appear here.
     """
@@ -341,8 +347,8 @@ def build_meta(s, capture_tz_now=None):
         "manifest": os.path.basename(s.manifest_path),
         "fast_period_s": s.fast_period_s,
         "device": kept,
-        "panels": serve.PANELS,
-        "energy_tiles": serve.ENERGY_TILES,
+        "panels": panels.PANELS,
+        "energy_tiles": panels.ENERGY_TILES,
         "default_hours": 6,
         "blocks": [{"label": b["label"], "addr": b["addr"], "count": b["count"],
                     "period_s": b["period_s"]} for b in manifest["blocks"]],
@@ -402,7 +408,7 @@ def latest(s):
     document carries the timestamps and `stall_after_s`, and the reader decides at render
     time. An age is only meaningful relative to when it is read.
     """
-    out = series.latest(s, serve.LIVE_FIELDS)
+    out = series.latest(s, panels.LIVE_FIELDS)
     cat = {c["key"]: c for c in series.catalog(s)}
     labels, alarms = {}, {}
     for key, v in list(out.get("values", {}).items()):

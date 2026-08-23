@@ -76,19 +76,16 @@ DEFAULTS = {
     "gap_log_quiet_s": 60,
     "bucket_s": 300,
 
-    # --- the local viewer (serve.py) --------------------------------------
-    # The viewer reads the archive on disk and never opens a Modbus client, so
-    # exposing it costs the inverter nothing. What it does expose is your
-    # telemetry, hence web_show_identity.
-    "web_port": 8787,
-    "web_bind": "0.0.0.0",     # "127.0.0.1" to require an SSH tunnel
-    "web_default_hours": 6,
-    "web_show_identity": False,
-
     # --- offsite copy (sync.py) -------------------------------------------
-    # The one part of this toolchain that needs a dependency (boto3) and a network
-    # credential. Off by default: an archive is nobody's business until its owner
-    # says so. Credentials come from a named ~/.aws profile, never from here.
+    # The only path the data has off this host, since there is no local viewer: the
+    # archive here is a spool, not a destination. It needs a dependency (boto3, from
+    # apt on Debian -- see FINDINGS 39) and a network credential.
+    #
+    # Still off by default, because an archive is nobody's business until its owner
+    # says so, and because a default that uploads would be a surprising one. The Pi's
+    # own config.json sets it true; config.example.json shows that.
+    #
+    # Credentials come from a named ~/.aws profile, never from here.
     "s3_bucket": None,
     "s3_region": "us-east-1",
     "s3_prefix": "raw/",
@@ -103,16 +100,14 @@ DEFAULTS = {
 
 INT_KEYS = ("port", "plant_unit", "inverter_unit", "fast_period_s",
             "rotate_minutes", "keep_days", "degrade_after", "degrade_probe_s",
-            "recycle_s", "max_lag_s", "gap_log_quiet_s", "bucket_s",
-            "web_port", "web_default_hours")
+            "recycle_s", "max_lag_s", "gap_log_quiet_s", "bucket_s")
 FLOAT_KEYS = ("timeout_s",)
-BOOL_KEYS = ("manifest_identity", "web_show_identity", "sync_enabled")
+BOOL_KEYS = ("manifest_identity", "sync_enabled")
 PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 
 # Keys exported to sh by --sh, as SIGEN_<UPPER>.
 SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
            "logger_unit", "sync_unit", "run_as_user", "fast_period_s",
-           "web_port", "web_bind",
            "s3_bucket", "s3_prefix", "aws_profile",
            # Exported so deploy/systemd/install-sync.sh can refuse to install a unit that
            # will only ever decline to upload: sync.py exits on a false sync_enabled, so an
@@ -129,9 +124,9 @@ class ConfigError(SystemExit):
 def _home():
     """The invoking user's home, not root's.
 
-    deploy/install-daemon.sh runs under sudo, where os.path.expanduser("~")
-    resolves to /var/root -- so a config saying "~/sigen" would silently install
-    a daemon pointing at a directory that does not exist.
+    deploy/systemd/install-logger.sh runs under sudo, where os.path.expanduser("~")
+    resolves to root's home -- so a config saying "~/sigen" would silently install
+    a unit pointing at a directory that does not exist.
     """
     who = os.environ.get("SUDO_USER")
     if who:
@@ -222,11 +217,6 @@ def load(require_host=True, overrides=None):
                           "per second)")
     if cfg["degrade_after"] < 1:
         raise ConfigError("degrade_after must be >= 1")
-    if not 1 <= cfg["web_port"] <= 65535:
-        raise ConfigError(f"web_port {cfg['web_port']} is not a TCP port; "
-                          "use something above 1024 so the viewer needs no root")
-    if cfg["web_default_hours"] < 1:
-        raise ConfigError("web_default_hours must be >= 1")
     # Two units, and they may not be one. Checked here rather than in the installers
     # because both of them would have to check it, and a second uploader scanning the
     # same archive -- or a unit file overwritten by the other daemon's -- is the kind

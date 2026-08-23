@@ -1,10 +1,14 @@
 /*
-  Composing serve.py's three answers out of precomputed static tiles.
+  Composing the viewer's three answers out of precomputed static tiles.
 
-  web/app.js reaches the outside world through one seam, getJSON(). On the capture host
-  that seam is a fetch to serve.py, which decodes the archive live. Here it is this file,
-  which fetches gzipped tiles from a CDN and assembles the SAME objects. That is the whole
-  arrangement: one renderer, two sources, and nothing in app.js that knows the difference.
+  web/app.js reaches the outside world through one seam, getJSON(). This file is what sits
+  behind it: it fetches gzipped tiles from a CDN and assembles the objects app.js expects.
+  That is the whole arrangement -- one renderer, and nothing in app.js that knows where its
+  answers came from.
+
+  The three answers are shaped the way they are because a local HTTP server, serve.py,
+  answered them first by decoding the archive live. It has been removed; the shape stayed,
+  because a frozen share reads through this same file against a pinned copy of the tiles.
 
   What makes the assembly possible rather than approximate: series.py keys every bucket on
   ABSOLUTE epoch (ts // bucket_s), and the tile spans are UTC-aligned, so a bucket has one

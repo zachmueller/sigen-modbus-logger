@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Offline tests for the viewer: series.py and serve.py. NO HARDWARE, NO NETWORK.
+Offline tests for the read side: series.py, tiles.py and ingest.py. NO HARDWARE, NO NETWORK.
 
     python3 -m unittest discover -s tests -v
 
@@ -44,7 +44,7 @@ import lib             # noqa: E402
 import log             # noqa: E402
 import series          # noqa: E402
 import ingest          # noqa: E402
-import serve           # noqa: E402
+import panels          # noqa: E402
 import sync            # noqa: E402
 import tiles           # noqa: E402
 from test_offline import ArchiveFixture, base_cfg   # noqa: E402
@@ -139,7 +139,7 @@ class TestViewerIsReadOnly(unittest.TestCase):
     # assertions below rather than by whichever the author remembered. tiles.py is here
     # because it also runs in the ingest Lambda, where a Modbus client would be pointed
     # at a LAN address it cannot reach -- but the guarantee is the same one either way.
-    MODULES = ("series.py", "serve.py", "tiles.py")
+    MODULES = ("series.py", "tiles.py", "ingest.py", "panels.py")
 
     def used_names(self, name):
         with open(os.path.join(HERE, name)) as fh:
@@ -161,8 +161,8 @@ class TestViewerIsReadOnly(unittest.TestCase):
             self.assertNotIn("recv_exact", used)
 
     def test_viewer_modules_do_not_import_the_transport(self):
-        # lib is imported for decode primitives; importing socket in serve.py is
-        # only gethostname. What must never appear is a read of the device.
+        # lib is imported for decode primitives only. What must never appear is a read
+        # of the device.
         for name in self.MODULES:
             used = self.used_names(name)
             self.assertNotIn("sweep", used)        # dump.sweep polls every register
@@ -187,7 +187,7 @@ class TestDependenciesStayContained(unittest.TestCase):
 
     # Everything that must run on a bare Python: capture, decode, and the local viewer.
     STDLIB_ONLY = ("config.py", "lib.py", "log.py", "decode.py", "dump.py", "series.py",
-                   "serve.py", "tiles.py", "ingest.py", "regmap_gen.py")
+                   "panels.py", "tiles.py", "ingest.py", "regmap_gen.py")
 
     def tree_of(self, name):
         with open(os.path.join(HERE, name)) as fh:
@@ -556,10 +556,14 @@ class TestEnergy(ViewerFixture):
 class TestTiles(ViewerFixture):
     """Precomputed tiles must say exactly what a live window says.
 
-    The hosted viewer reads static tiles; serve.py decodes on demand. Both feed the
-    SAME web/app.js, so if the two paths disagree about one archive, both pages render,
-    both look plausible, and only a careful side-by-side would ever show it. That is
-    what these assert, and it is the invariant the whole hosted design rests on.
+    The page reads static tiles; series.window() aggregates the archive directly. Tiles are
+    built from the second and read as the first, so if the two paths disagree about one
+    archive, both render, both look plausible, and only a careful side-by-side would ever
+    show it. That is what these assert, and it is the invariant the whole design rests on.
+
+    This used to be a comparison between two live callers -- serve.py on the LAN and the
+    hosted tiles. The local viewer is gone and the assertion is unchanged, because what it
+    was really pinning was tiles.columns() against the aggregation it is derived from.
 
     Tile spans here are 300 s at 30 s buckets rather than the real hour/day/month, so
     the arithmetic is exercised without generating an hour of records. The arithmetic
@@ -641,7 +645,7 @@ class TestTiles(ViewerFixture):
         cat = self.catalog_of(s)
         a, b = self.tile(s, cat, 0), self.tile(s, cat, 1)
 
-        # What serve.py would answer for the same span, through the same shaper.
+        # What a direct aggregation of the same span gives, through the same shaper.
         whole = series.window(s, self.base, self.base + 2 * self.span, [self.SOC, self.KWH],
                               bucket_s=self.bucket, cache=series.SummaryCache(),
                               warm_budget_s=0, end_exclusive=True)
@@ -787,7 +791,7 @@ class TestTiles(ViewerFixture):
         #
         # Note it is NOT what the unit's 32 unpopulated PV channels do: those return the
         # -1 absent marker, which decodes to a legal -0.01 reading, so they ship as a flat
-        # line. serve.PANELS excludes them by name rather than relying on this.
+        # line. panels.PANELS excludes them by name rather than relying on this.
         absent = "inverter_rated_active_power"      # in inv_battery, block index 3
         keep = [i for i in range(len(self.tiers)) if i != 3]
         mask = sum(1 << i for i in keep)
@@ -973,10 +977,13 @@ class TestSync(ViewerFixture):
 class TestIngestPackage(unittest.TestCase):
     """What ships to the Python Lambdas, derived rather than trusted.
 
-    This exists because the hand-written list was wrong: it omitted config.py, which
-    serve.py imports, and the only symptom was `No module named 'config'` in a CloudWatch
-    log after a successful deploy. A packaging mistake should fail here, in a second,
-    rather than in a cloud log minutes later.
+    This exists because the hand-written list was wrong: it omitted config.py, which was
+    reached through an import two modules deep, and the only symptom was `No module named
+    'config'` in a CloudWatch log after a successful deploy. A packaging mistake should fail
+    here, in a second, rather than in a cloud log minutes later.
+
+    It earned its keep again when serve.py was removed and panels.py took its place in the
+    package: the closure is recomputed here, so the swap either matches or fails.
 
     TWO handlers ship this list now -- ingest and share -- because both import the tile
     geometry rather than restating it, so the closure is computed over both.
@@ -1272,9 +1279,9 @@ class TestSharePostIsSigned(unittest.TestCase):
         self.assertIn("raw", body,
                       "a CloudFront error page is not JSON at all, and still has to be "
                       "quotable rather than discarded")
-        # getJSON() may still use statusText: it talks to serve.py over HTTP/1.1, where the
-        # reason phrase exists. Over HTTP/2, which the distribution serves, it is always ''
-        # -- so on this path it can only pad a message that already says nothing.
+        # getJSON() may still use statusText -- it is not this path, and trimming app.js is
+        # a separate change. Over HTTP/2, which the distribution serves, the reason phrase is
+        # always '', so on THIS path it could only pad a message that already says nothing.
         code = "\n".join(re.sub(r"//.*$", "", line) for line in js.split("\n"))
         share = re.search(r"async function createShare\(\)[\s\S]*?\nfunction showShareLink",
                           code)
@@ -1624,11 +1631,14 @@ class TestTheHostedViewerDoesNotPoll(unittest.TestCase):
     life of the page.
 
     `cloud/README.md` has always said so: *"No live view. Tiles appear when the logger
-    rotates… serve.py on the LAN is the live one."* The page was contradicting it with a box
-    that was checked by default. See FINDINGS 34.
+    rotates."* The page was contradicting it with a box that was checked by default. See
+    FINDINGS 34.
 
-    The functionality is kept, not deleted: serve.py decodes on demand and polling it is
-    exactly right. Which is what the last test here is for.
+    When this was written the functionality was scoped rather than deleted, because serve.py
+    on the LAN decoded on demand and polling it was exactly right. The local viewer is gone
+    now, so there is no source left that POLLS is ever true for -- the checkbox and the
+    Reload and CSV controls are vestigial markup, hidden on every entry point that exists.
+    These tests are what keep them hidden until someone trims them.
     """
 
     APP = os.path.join(HERE, "web", "app.js")
@@ -1685,8 +1695,8 @@ class TestTheHostedViewerDoesNotPoll(unittest.TestCase):
         csv = re.search(r'<a class="chip link" id="csv"[^>]*>', html)
         self.assertIsNotNone(csv)
         self.assertIn("data-server-only", csv.group(0),
-                      "/api/csv is one of serve.py's routes; on the hosted viewer this link "
-                      "resolved to /agg/api/csv, which downloads a 404")
+                      "/api/csv was one of the local viewer's routes and nothing answers it "
+                      "now; unhidden, this link resolves to /agg/api/csv and downloads a 404")
         self.assertRegex(self.code(self.APP), r"querySelectorAll\('\[data-server-only\]'\)",
                          "and app.js has to act on the attribute")
         self.assertRegex(self.code(self.APP), r"if \(POLLS\) \$\('csv'\)\.href",
@@ -1726,21 +1736,26 @@ class TestTheHostedViewerDoesNotPoll(unittest.TestCase):
         self.assertNotRegex(code, r"\$\('hint'\)\.textContent \+=",
                             "appending to textContent flattens the <kbd> children")
 
-    def test_the_local_viewer_still_polls(self):
-        # The functionality is scoped, not removed. serve.py decodes the archive on demand, so
-        # a poll there returns a genuinely newer record -- and this is the assertion that fails
-        # if a later change turns "disabled on the cloud page" into "deleted".
-        html = self.read(self.PAGE)
-        box = re.search(r'<input type="checkbox" id="live"[^>]*>', html)
-        self.assertIsNotNone(box, "the checkbox stays in the page serve.py serves")
-        self.assertIn("checked", box.group(0),
-                      "and stays checked: for a server source, live is the right default")
+    def test_the_page_does_not_name_its_own_source(self):
+        # This was test_the_local_viewer_still_polls, and it asserted that the polling markup
+        # stayed in the page because serve.py was a source that could honour it. That source is
+        # gone. What survives is the half that was never about the viewer:
+        #
         # The header comment MENTIONS window.SIGEN_SOURCE, which is how a reader learns the
-        # arrangement; what must not be here is an assignment. site-stack.ts injects one for
-        # each hosted entry point, and serve.py serves this file with none -- which is what
-        # makes POLLS true on the capture host without anything having to say so.
+        # arrangement; what must not be here is an ASSIGNMENT. site-stack.ts injects one per
+        # hosted entry point, and the bundle hash is computed over this file -- so a source
+        # named here would be baked into every share and could not be changed by a deploy.
+        html = self.read(self.PAGE)
         self.assertNotRegex(html, r"window\.SIGEN_SOURCE\s*=",
                             "the page must not name a source itself")
+        # And the polling markup is still here, unremoved and inert. Asserted so that the
+        # vestigial set stays a known quantity rather than a thing someone half-tidies: with
+        # no server source POLLS is never true, so this input is hidden on every entry point.
+        box = re.search(r'<input type="checkbox" id="live"[^>]*>', html)
+        self.assertIsNotNone(box,
+                             "the live checkbox has been removed -- good, but then the "
+                             "[data-server-only] tests above are describing markup that is "
+                             "no longer there and should go with it")
         code = self.code(self.APP)
         self.assertRegex(code, r"live: POLLS,", "and the initial state follows the source")
         self.assertIn("setInterval(() => refresh(true), 10000)", code,
@@ -2114,8 +2129,8 @@ class TestIngest(ViewerFixture):
         # A restated PANELS list is exactly the drift this arrangement exists to avoid: it
         # would show up as a hosted page quietly missing a panel the local one has.
         s = self.seed(hours=1)
-        self.assertIs(ingest.build_meta(s)["panels"], serve.PANELS)
-        self.assertIs(ingest.build_meta(s)["energy_tiles"], serve.ENERGY_TILES)
+        self.assertIs(ingest.build_meta(s)["panels"], panels.PANELS)
+        self.assertIs(ingest.build_meta(s)["energy_tiles"], panels.ENERGY_TILES)
 
 
 # --------------------------------------------------------------------- latest
@@ -2217,15 +2232,15 @@ class TestPanelContract(unittest.TestCase):
         self.covered = set(decode.covered_fields(self.manifest, self.bundle))
 
     def test_every_panel_field_is_covered_by_the_default_block_plan(self):
-        for key in serve.panel_keys():
+        for key in panels.panel_keys():
             self.assertIn(key, self.covered, f"panel field {key} is never captured")
 
     def test_every_live_field_is_covered(self):
-        for key in serve.LIVE_FIELDS:
+        for key in panels.LIVE_FIELDS:
             self.assertIn(key, self.covered, f"live tile field {key} is never captured")
 
     def test_panels_do_not_plot_a_register_twice_under_two_names(self):
-        for key in serve.panel_keys():
+        for key in panels.panel_keys():
             self.assertNotIn(key, series.DUPLICATE_OF,
                              f"{key} is the same register as "
                              f"{series.DUPLICATE_OF.get(key)}")
@@ -2233,231 +2248,31 @@ class TestPanelContract(unittest.TestCase):
     def test_panel_slots_stay_inside_the_categorical_theme(self):
         # A ninth series would need a generated hue, which is indistinguishable
         # under colour-vision deficiency. Cap it here instead.
-        for p in serve.PANELS:
+        for p in panels.PANELS:
             for s in p.get("series", []):
                 self.assertLessEqual(s.get("slot", 1), 4)
             self.assertLessEqual(len(p.get("series", [])), 4, p["id"])
 
     def test_energy_tiles_are_lifetime_counters(self):
-        for t in serve.ENERGY_TILES:
+        for t in panels.ENERGY_TILES:
             self.assertIn("accumulated", t["key"])
 
 
-# ----------------------------------------------------------------------- HTTP
+# --------------------------------------------------------------- the page contract
 
-class HTTPFixture(ViewerFixture):
-    """A viewer serving the fixture archive on a loopback port. No test methods:
-    subclassing a TestCase that has them runs them again per subclass."""
+class TestPageContract(unittest.TestCase):
+    """What the page asks for, and whether the tile source can answer it.
 
-    def start(self, **over):
-        cfg = dict(config.DEFAULTS)
-        cfg.update({"host": None, "data_dir": self.tmp, "web_default_hours": 6})
-        cfg.update(over)
-        viewer = serve.Viewer(cfg, self.tmp)
-        # The handler logs requests to stdout, which is the viewer's log file in
-        # production and noise in a test run.
-        real_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        self.addCleanup(lambda: setattr(sys, "stdout", real_stdout))
-        self.httpd = serve.Server(("127.0.0.1", 0), viewer)
-        self.port = self.httpd.server_address[1]
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.thread.start()
-        self.addCleanup(self.stop)
-        return viewer
+    web/app.js reaches the outside world through exactly one seam -- getJSON() -- so the set
+    of routes it names IS the contract. It is quiet when wrong: a renamed route gives a page
+    that boots and then shows nothing.
 
-    def stop(self):
-        self.httpd.shutdown()
-        self.httpd.server_close()
-        self.thread.join(timeout=5)
-
-    def fetch(self, path):
-        """(status, headers, body)."""
-        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
-        try:
-            # putrequest, not request(): the raw path must reach the server
-            # unnormalised so a traversal attempt is actually tested.
-            conn.putrequest("GET", path, skip_accept_encoding=True)
-            conn.endheaders()
-            r = conn.getresponse()
-            return r.status, dict(r.getheaders()), r.read()
-        finally:
-            conn.close()
-
-    def get(self, path):
-        status, headers, body = self.fetch(path)
-        return status, headers.get("Content-Type"), body
-
-    def json(self, path):
-        status, ctype, body = self.get(path)
-        self.assertEqual(status, 200, body[:400])
-        self.assertIn("application/json", ctype)
-        return json.loads(body)
-
-    def seed(self, n=200):
-        now = time.time()
-        # FakeModbus returns each register as its own address, so a state register
-        # would decode to a nonsense code. Set the ones the page names.
-        self.set_raw("plant_running_state", 1)          # RUNNING
-        self.set_raw("plant_on_off_grid_status", 0)     # ongrid
-        self.set_raw("plant_ems_work_mode", 0)
-        for key in ("plant_general_alarm1", "plant_general_alarm2",
-                    "plant_general_alarm3", "plant_general_alarm4",
-                    "plant_general_alarm6", "plant_general_alarm7"):
-            self.set_raw(key, 0)
-        self.write_records("20260814T090000",
-                           self.data_records(now - n * 2, n, step=2))
-        return now
-
-
-class TestHTTP(HTTPFixture):
-    def test_the_page_and_its_assets_are_served(self):
-        self.seed()
-        self.start()
-        for path, ctype in [("/", "text/html"), ("/app.js", "text/javascript"),
-                            ("/charts.js", "text/javascript"),
-                            ("/style.css", "text/css"), ("/favicon.svg", "image/svg")]:
-            status, got, body = self.get(path)
-            self.assertEqual(status, 200, path)
-            self.assertIn(ctype, got, path)
-            self.assertTrue(body)
-
-    def test_meta_describes_the_series_panels_and_catalog(self):
-        self.seed()
-        self.start()
-        m = self.json("/api/meta")
-        self.assertTrue(m["ok"])
-        self.assertEqual(m["plan_hash"], "08c047b8")
-        self.assertGreater(len(m["catalog"]), 200)
-        self.assertTrue(any(p["id"] == "power" for p in m["panels"]))
-        self.assertEqual(m["default_hours"], 6)
-        self.assertIn("first_ts", m["extent"])
-
-    def test_identity_is_withheld_unless_asked_for(self):
-        # A manifest identifies an installation, and this page is on the LAN.
-        self.seed()
-        self.start()
-        m = self.json("/api/meta")
-        self.assertNotIn("serial", m["device"])
-        self.assertNotIn("host", m)
-        self.assertIn("withheld", m["device"])
-        self.stop()
-        self.start(web_show_identity=True)
-        m = self.json("/api/meta")
-        self.assertEqual(m["device"]["serial"], "TESTSERIAL")
-        self.assertEqual(m["host"], "203.0.113.1")
-
-    def test_window_returns_a_grid_series_and_health(self):
-        self.seed()
-        self.start()
-        w = self.json("/api/window?hours=1")
-        self.assertTrue(w["ok"])
-        self.assertIn("plant_ess_soc", w["series"])
-        self.assertEqual(len(w["t"]), len(w["series"]["plant_ess_soc"]["mean"]))
-        self.assertEqual(len(w["t"]), len(w["health"]["records"]))
-        self.assertGreater(w["records"], 0)
-        self.assertIn(w["bucket_s"], series.BUCKET_LADDER)
-        self.assertEqual(w["stride"], 1)
-
-    def test_window_scopes_to_the_panels_asked_for(self):
-        self.seed()
-        self.start()
-        few = self.json("/api/window?hours=1&panels=soc")
-        self.assertIn("plant_ess_soc", few["series"])
-        self.assertNotIn("inverter_pv1_current", few["series"])
-
-    def test_a_lifetime_counter_ships_as_a_total_not_a_line(self):
-        self.seed()
-        self.start()
-        w = self.json("/api/window?hours=1&panels=energy")
-        col = w["series"]["plant_accumulated_grid_import_energy"]
-        self.assertTrue(col.get("tile_only"))
-        self.assertNotIn("mean", col)
-        self.assertIn("plant_accumulated_grid_import_energy", w["energy"])
-
-    def test_an_unknown_field_is_reported_not_fatal(self):
-        self.seed()
-        self.start()
-        w = self.json("/api/window?hours=1&panels=soc&fields=not_a_field,plant_ess_soh")
-        self.assertEqual(w["unknown_fields"], ["not_a_field"])
-        self.assertIn("plant_ess_soh", w["series"])
-
-    def test_bad_parameters_are_a_400_with_a_readable_reason(self):
-        self.seed()
-        self.start()
-        status, _, body = self.get("/api/window?hours=abc")
-        self.assertEqual(status, 400)
-        self.assertIn("not a number", json.loads(body)["error"])
-
-    def test_latest_reports_values_labels_and_freshness(self):
-        self.seed()
-        self.start()
-        l = self.json("/api/latest")
-        self.assertTrue(l["ok"])
-        self.assertIn("plant_ess_soc", l["values"])
-        self.assertEqual(l["labels"]["plant_running_state"], "RUNNING")
-        self.assertTrue(l["device_answering"])
-
-    def test_csv_matches_the_window_and_raw_matches_decode_py(self):
-        self.seed()
-        self.start()
-        status, ctype, body = self.get("/api/csv?hours=1&panels=soc")
-        self.assertEqual(status, 200)
-        self.assertIn("text/csv", ctype)
-        lines = body.decode().strip().splitlines()
-        self.assertTrue(lines[0].startswith("# sigen viewer"))
-        self.assertIn("plant_ess_soc_mean", lines[1])
-        status, _, raw = self.get("/api/csv?hours=1&raw=1&fields=plant_ess_soc")
-        self.assertEqual(status, 200)
-        self.assertEqual(raw.decode().splitlines()[0],
-                         "host_time,latency_ms,plant_ess_soc")
-
-    def test_path_traversal_and_unknown_paths_are_refused(self):
-        self.seed()
-        self.start()
-        for path in ("/../config.json", "/../../etc/passwd", "/config.json",
-                     "/web/app.js", "/api/nope", "/%2e%2e/config.json"):
-            status, _, _ = self.get(path)
-            self.assertEqual(status, 404, path)
-
-    def test_an_empty_data_dir_explains_itself_rather_than_erroring(self):
-        self.start()
-        m = self.json("/api/meta")
-        self.assertFalse(m["ok"])
-        self.assertIn("manifest", m["reason"])
-        status, _, body = self.get("/api/window?hours=6")
-        self.assertEqual(status, 503)
-
-    def test_a_torn_final_record_still_serves_a_window(self):
-        now = self.seed()
-        path = os.path.join(self.tmp, "sigen-20260814T090000-08c047b8.bin")
-        with open(path, "ab") as fh:
-            fh.write(b"\x01\x02\x03")        # a record torn by a hard kill
-        self.start()
-        w = self.json("/api/window?hours=1")
-        self.assertGreater(w["records"], 0)
-
-    def test_check_mode_reports_without_serving(self):
-        self.seed()
-        cfg = dict(config.DEFAULTS)
-        cfg.update({"host": None, "data_dir": self.tmp})
-        viewer = serve.Viewer(cfg, self.tmp)
-        out = self.capture_stdout(viewer.report)
-        self.assertIn("plan       08c047b8", out)
-        self.assertIn("plottable", out)
-
-
-class TestPageServerContract(HTTPFixture):
-    """What the page asks for, and whether this server answers it.
-
-    web/app.js reaches the outside world through exactly one seam -- getJSON() -- so
-    the set of routes it names IS the contract, and a hosted deployment has to compose
-    the same answers out of static tiles. Both halves of that are quiet when wrong: a
-    renamed route gives a page that boots and then shows nothing, and a route this
-    server drops is only noticed by whoever opens it next.
-
-    Derived from the files rather than restated, so adding a fetch to app.js without a
-    route in serve.py fails here rather than in a browser.
+    These were HTTP tests against serve.py until the local viewer was removed. Most of them
+    never needed a server: they read web/app.js and web/index.html and assert things about the
+    page itself, which is now published by site-stack.ts and served by CloudFront. The one that
+    did need it -- "every route the page names is one this server answers" -- is gone with it,
+    and what replaced it is the tile-source contract below plus TestIngest, which builds the
+    three static answers and reads them back.
     """
 
     def page_routes(self):
@@ -2465,28 +2280,64 @@ class TestPageServerContract(HTTPFixture):
             js = fh.read()
         return set(re.findall(r"'(/api/\w+)'", js))
 
-    def test_every_route_the_page_names_is_one_this_server_answers(self):
-        self.seed()
-        self.start()
-        for route in sorted(self.page_routes()):
-            status, _, body = self.get(route)
-            self.assertNotEqual(status, 404,
-                                f"web/app.js fetches {route}, which serve.py does not "
-                                f"route -- the page would boot and then show nothing")
-            self.assertEqual(status, 200, f"{route}: {body[:200]}")
-
     def test_the_three_composable_answers_are_the_ones_a_tile_source_must_supply(self):
-        # A hosted deployment has no server: web/tiles.js builds these three out of
-        # precomputed objects. Pinning the set here means adding a fourth to app.js
-        # fails until the tile source can answer it too.
+        # There is no server now: web/tiles.js builds these three out of precomputed objects.
+        # Pinning the set here means adding a fourth to app.js fails until the tile source can
+        # answer it too -- which, with nothing else able to answer, is the whole contract.
         self.assertEqual(self.page_routes() & {"/api/meta", "/api/window", "/api/latest"},
                          {"/api/meta", "/api/window", "/api/latest"})
 
+    # Routes the page still names that NOTHING answers any more. Both belonged to the local
+    # viewer, and both are unreachable rather than broken -- which is the thing worth
+    # asserting, and what the test below does.
+    #
+    # They are listed rather than removed because trimming web/app.js is a change to a page
+    # that is deployed, working, and pinned by every existing share's bundle hash. The
+    # tidying is a commit of its own; leaving the debt named is better than leaving it quiet.
+    VESTIGIAL = {
+        # The download link, gated on POLLS and hidden by [data-server-only].
+        "/api/csv",
+        # The SSH tunnel probe in verifyClosed(), reached only from the "Close tunnel" chip,
+        # which the launcher that opened the tunnel used to install.
+        "/api/stats",
+    }
+
+    def test_every_route_the_page_names_is_answerable_or_provably_gated(self):
+        # The inverse of the contract above, and it only became assertable when the server
+        # went away: while serve.py existed a route it answered was simply unavailable when
+        # hosted. Now nothing answers these, so what matters is that no code path can ask.
+        #
+        # An UNGATED dead route is the real bug -- it would be a fetch that 404s on the live
+        # page, or a link that downloads an error document, which is exactly what /api/csv did
+        # on the hosted viewer before it was gated (it resolved to /agg/api/csv?…).
+        answerable = {"/api/meta", "/api/window", "/api/latest", "/api/share"}
+        unknown = self.page_routes() - answerable - self.VESTIGIAL
+        self.assertEqual(unknown, set(),
+                         "web/app.js names a route nothing composes out of tiles, and that "
+                         "this test does not know to be gated")
+
+        with open(os.path.join(HERE, "web", "app.js")) as fh:
+            code = "\n".join(re.sub(r"//.*$", "", line) for line in fh.read().split("\n"))
+        with open(os.path.join(HERE, "web", "index.html")) as fh:
+            html = fh.read()
+        for route in sorted(self.VESTIGIAL):
+            uses = [m.start() for m in re.finditer(re.escape(f"'{route}'"), code)]
+            self.assertTrue(uses, f"{route} is listed as vestigial but app.js does not name it "
+                                  f"-- it has been tidied, so drop it from VESTIGIAL")
+            for at in uses:
+                # The gate has to be in the same function, not merely somewhere in the file.
+                fn_start = max(m.start() for m in re.finditer(r"\nfunction \w+", code[:at]))
+                enclosing = code[fn_start:at]
+                gated = ("POLLS" in enclosing or "SRC.kind === 'server'" in enclosing
+                         or "data-server-only" in html)
+                self.assertTrue(gated,
+                                f"{route} is fetched with nothing gating it on a server "
+                                f"source; on the hosted page that is a 404 a user can reach")
+
     def test_the_page_fetches_only_through_the_one_seam(self):
-        # Two renderers is the failure this whole arrangement exists to avoid, and a
-        # stray fetch() is how it would start: it would work on this server and quietly
-        # 404 against tiles. Comments are stripped first, since the prose above getJSON()
-        # names fetch() to say that nothing else may call it.
+        # Two renderers is the failure this whole arrangement exists to avoid, and a stray
+        # fetch() is how it would start. Comments are stripped first, since the prose above
+        # getJSON() names fetch() to say that nothing else may call it.
         with open(os.path.join(HERE, "web", "app.js")) as fh:
             code = "\n".join(re.sub(r"//.*$", "", line)
                              for line in fh.read().split("\n"))
@@ -2495,36 +2346,59 @@ class TestPageServerContract(HTTPFixture):
         # satisfied by moving a call rather than removing it.
         #
         # createShare() is the one WRITE the page makes, and it is deliberately not routed
-        # through getJSON(). That seam exists so one renderer can read from serve.py or from
-        # static tiles, and it is shaped for that: it returns parsed JSON and throws on any
-        # failure. A share POST has a body, and it has to tell 401 (sign in again) from 403
-        # (signing in cannot help) from 400 (the window has no data), which a thrown Error
-        # flattens. A tile source cannot answer it at all -- there is no server -- which is
-        # why the card only appears when SIGEN_SOURCE sets `share`.
+        # through getJSON(). That seam is shaped for reads: it returns parsed JSON and throws
+        # on any failure. A share POST has a body, and it has to tell 401 (sign in again) from
+        # 403 (signing in cannot help) from 400 (the window has no data), which a thrown Error
+        # flattens.
+        #
+        # verifyClosed() is the tunnel probe, and it is now dead code: the SSH tunnel and the
+        # launcher that opened it went with the local viewer. It is still listed rather than
+        # removed because trimming app.js is a change to a page that is deployed and working,
+        # and this test is not the place to make it. See the README's note on what is left to
+        # tidy.
         enclosing = [re.findall(r"function (\w+)\s*\(", code[:at])[-1] for at in sites]
         self.assertEqual(enclosing, ["getJSON", "createShare", "verifyClosed"],
-                         "fetch() belongs in getJSON(), createShare() and the tunnel probe "
-                         "only; every READ goes through getJSON()")
+                         "fetch() belongs in getJSON() and createShare() only; every READ "
+                         "goes through getJSON()")
 
-    def test_every_asset_the_page_links_is_servable(self):
+    def test_every_asset_the_page_links_is_published(self):
+        # This used to check serve.py's STATIC allowlist, which was the local viewer's list of
+        # servable files. The list that matters now is site-stack.ts's, and it is a stronger
+        # contract than the one it replaces: WEB_ASSETS is what the viewer bundle hash is
+        # computed over, so a file the page starts loading without being added there is a
+        # change the version cannot see -- and a share pinned to an "unchanged" version would
+        # then drift after all.
+        #
+        # Read out of the TypeScript because there is no JS harness, which is how every other
+        # cloud contract in this file is checked.
+        with open(os.path.join(HERE, "cloud", "infrastructure", "lib",
+                               "site-stack.ts")) as fh:
+            ts = fh.read()
+        m = re.search(r"const WEB_ASSETS = \[(.*?)\]", ts, re.S)
+        self.assertIsNotNone(m, "site-stack.ts should declare WEB_ASSETS")
+        published = set(re.findall(r"'([^']+)'", m.group(1)))
+        self.assertTrue(published, "WEB_ASSETS parsed empty")
+
         with open(os.path.join(HERE, "web", "index.html")) as fh:
             html = fh.read()
         for ref in sorted(set(re.findall(r'(?:src|href)="(/[^"]*)"', html))):
-            self.assertIn(ref, serve.STATIC,
-                          f"index.html links {ref}, which is not in serve.STATIC")
+            self.assertIn(ref.lstrip("/"), published,
+                          f"index.html links {ref}, which site-stack.ts does not publish "
+                          f"-- the page would load a 404 and the bundle hash would not "
+                          f"change when that file did")
 
     def test_the_retired_export_leaves_nothing_behind(self):
-        # Deleted deliberately, not left as a dead button: a control that 404s reads as
-        # a broken viewer rather than as a feature that moved.
+        # Deleted deliberately, not left as a dead button: a control that 404s reads as a
+        # broken viewer rather than as a feature that moved.
         #
         # `id="share"` came BACK, for the hosted share link -- but the self-contained HTML
-        # export it used to drive is still gone, so the snapshot ids and its wording must
-        # stay absent. The distinction is the point: one writes a file, the other writes an
-        # S3 prefix, and reviving the markup without reviving the export is correct.
-        self.seed()
-        self.start()
-        status, _, _ = self.get("/api/snapshot?hours=1")
-        self.assertEqual(status, 404)
+        # export it used to drive is still gone, so the snapshot ids and its wording must stay
+        # absent. The distinction is the point: one writes a file, the other writes an S3
+        # prefix, and reviving the markup without reviving the export is correct.
+        #
+        # The half of this that asked serve.py for /api/snapshot and expected a 404 is gone
+        # with the server. There is no route to 404 any more, which is a stronger guarantee
+        # than the one the assertion made.
         with open(os.path.join(HERE, "web", "index.html")) as fh:
             html = fh.read()
         for gone in ('id="snapshot-note"', 'id="snapshot-dl"', 'id="snapshot-summary"',
@@ -2559,8 +2433,11 @@ class TestPageServerContract(HTTPFixture):
         # was the uploader, which was never installed. On a tiles source `record_ts` is the
         # newest record that reached the bucket, and sync.py only advances that on rotation,
         # so the two failures are the SAME symptom and the page cannot tell them apart. It
-        # must therefore name both. serve.py reads the archive directly, so there it may
-        # still name the logger alone. See FINDINGS 29.
+        # must therefore name both. See FINDINGS 29.
+        #
+        # This matters MORE now, not less: with no local viewer the uploader is the only path
+        # the data has, so "the logger stopped" and "the upload stopped" are the two things
+        # that can go wrong and the page sees one symptom for both.
         with open(os.path.join(HERE, "web", "app.js")) as fh:
             code = "\n".join(re.sub(r"//.*$", "", line) for line in fh.read().split("\n"))
         fn = re.search(r"function renderFreshness\(\)\s*\{(.*?)\n\}", code, re.S)
@@ -2571,22 +2448,17 @@ class TestPageServerContract(HTTPFixture):
         self.assertIn("the logger or the uploader may have stopped", stall.group(1),
                       "a tiles source cannot distinguish a stopped logger from a stopped "
                       "uploader, so it must not pick one")
-        self.assertIn("SRC.kind === 'server'", stall.group(1),
-                      "the wording must branch on the source, not apply everywhere: "
-                      "serve.py reads the archive itself and there the logger IS the answer")
 
     def test_the_share_card_is_hidden_until_a_source_offers_a_share_endpoint(self):
-        # serve.py serves this page with no SIGEN_SOURCE, so SRC.share is undefined and the
-        # card must stay hidden -- there is no local share endpoint, and a button that
-        # cannot work is worse than no button. Only site-stack.ts's /view entry point sets
-        # it. The `hidden` attribute is what makes the default safe: app.js reveals the card,
-        # it never has to remember to hide it.
+        # The `hidden` attribute is what makes the default safe: app.js reveals the card, it
+        # never has to remember to hide it. Only site-stack.ts's /view entry point sets
+        # SRC.share, so on any other entry point the card stays shut.
         with open(os.path.join(HERE, "web", "index.html")) as fh:
             html = fh.read()
         card = re.search(r'<section[^>]*id="share"[^>]*>', html)
         self.assertIsNotNone(card, "the share card should exist in the one page")
         self.assertIn("hidden", card.group(0),
-                      "the share card must default to hidden: serve.py has no share endpoint")
+                      "the share card must default to hidden")
         self.assertIn("data-live-only", card.group(0),
                       "a frozen share cannot re-share itself, so applyFrozenMode() must "
                       "hide this card too")
@@ -3013,116 +2885,6 @@ class TestIncrementalOpenFile(ViewerFixture):
                               cache=self.cache)
         # The .gz is final; the open .bin is up to date, so neither needs work.
         self.assertEqual(again["files_decoded"], 0)
-
-
-class TestDecodeIsBoundedToOneCore(ViewerFixture):
-    """Concurrent requests must not multiply CPU use.
-
-    The logger has to hit a 2 s tick on the same host. Three simultaneous window
-    decodes during a deploy took its 5-minute median from ~90 ms to 164 ms and one
-    tick to 1943 ms -- past its own 1800 ms soak gate. So decoding is serialised,
-    and this asserts the serialisation rather than trusting the comment.
-    """
-
-    def test_two_windows_never_decode_at_the_same_time(self):
-        base = 1786600000.0
-        self.write_records("20260814T090000", self.data_records(base, 40))
-        cfg = dict(config.DEFAULTS)
-        cfg.update({"host": None, "data_dir": self.tmp})
-        viewer = serve.Viewer(cfg, self.tmp)
-
-        overlap = {"max": 0, "now": 0}
-        guard = threading.Lock()
-        real = series.window
-
-        def watched(*a, **kw):
-            with guard:
-                overlap["now"] += 1
-                overlap["max"] = max(overlap["max"], overlap["now"])
-            try:
-                time.sleep(0.05)          # widen the window a race would need
-                return real(*a, **kw)
-            finally:
-                with guard:
-                    overlap["now"] -= 1
-
-        series.window = watched
-        self.addCleanup(lambda: setattr(series, "window", real))
-        threads = [threading.Thread(target=viewer.window, args=({"hours": ["1"]},))
-                   for _ in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-        self.assertEqual(overlap["max"], 1,
-                         "decodes ran concurrently; the logger pays for that")
-        self.assertGreater(viewer.waited_s, 0, "contention should be recorded")
-
-    def test_the_lock_is_reentrant_so_csv_can_build_a_window(self):
-        base = 1786600000.0
-        self.write_records("20260814T090000", self.data_records(base, 20))
-        cfg = dict(config.DEFAULTS)
-        cfg.update({"host": None, "data_dir": self.tmp})
-        viewer = serve.Viewer(cfg, self.tmp)
-        # csv() -> window(), both taking the same lock. A plain Semaphore deadlocks.
-        out = viewer.csv({"hours": ["1"]})
-        self.assertIn("# sigen viewer", out)
-
-
-class TestBinding(ViewerFixture):
-    """A wildcard bind must answer on both families.
-
-    The bug this pins: an IPv4-only listener refuses the IPv6 address that mDNS
-    advertises for a .local name, and macOS tries IPv6 first. curl hides it by
-    falling back to IPv4, so the API tests fine from a shell while the browser
-    shows connection refused.
-    """
-
-    def serve_on(self, bind):
-        cfg = dict(config.DEFAULTS)
-        cfg.update({"host": None, "data_dir": self.tmp})
-        viewer = serve.Viewer(cfg, self.tmp)
-        real_stdout = sys.stdout
-        sys.stdout = io.StringIO()
-        self.addCleanup(lambda: setattr(sys, "stdout", real_stdout))
-        httpd = serve.Server((bind, 0), viewer)
-        port = httpd.server_address[1]
-        t = threading.Thread(target=httpd.serve_forever, daemon=True)
-        t.start()
-
-        def stop():
-            httpd.shutdown()
-            httpd.server_close()
-            t.join(timeout=5)
-        self.addCleanup(stop)
-        return httpd, port
-
-    def reachable(self, family, host, port):
-        s = socket.socket(family, socket.SOCK_STREAM)
-        s.settimeout(5)
-        try:
-            s.connect((host, port))
-            s.sendall(b"GET /api/stats HTTP/1.0\r\n\r\n")
-            return b"200" in s.recv(64)
-        except OSError:
-            return False
-        finally:
-            s.close()
-
-    def test_a_wildcard_bind_answers_on_ipv4_and_ipv6(self):
-        httpd, port = self.serve_on("0.0.0.0")
-        self.assertEqual(httpd.families(), "IPv4 and IPv6")
-        self.assertTrue(self.reachable(socket.AF_INET, "127.0.0.1", port),
-                        "IPv4 client refused by the wildcard listener")
-        self.assertTrue(self.reachable(socket.AF_INET6, "::1", port),
-                        "IPv6 client refused -- this is the browser's first attempt")
-
-    def test_an_explicit_v4_address_stays_v4_only(self):
-        httpd, port = self.serve_on("127.0.0.1")
-        self.assertEqual(httpd.families(), "IPv4")
-        self.assertTrue(self.reachable(socket.AF_INET, "127.0.0.1", port))
-        self.assertFalse(self.reachable(socket.AF_INET6, "::1", port),
-                         "asking for 127.0.0.1 means only that")
 
 
 class TestCache(ViewerFixture):
