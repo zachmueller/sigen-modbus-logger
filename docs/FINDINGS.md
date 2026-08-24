@@ -1241,6 +1241,10 @@ latency- and timestamp-sensitive job to cheaper hardware means auditing what the
 silently supplying — and a wrong clock is the failure mode that corrupts data while every
 component reports success.**
 
+The operational consequence, including what the mitigation does *not* cover — there is no runtime
+guard in `log.py`, so systemd ordering is the whole of it — is
+[docs/MIGRATION.md § 1](MIGRATION.md#1-the-clock-read-this-before-you-buy-the-hardware).
+
 ---
 
 ### 39. Debian refuses `pip install --user`, so the one dependency comes from apt

@@ -244,6 +244,7 @@ python3 config.py --render deploy/systemd/sigen-logger.service.template
 | `tests/test_offline.py` | The whole capture/decode path against a fake device. No hardware, no network. Also the config loader and the unit templates. |
 | `tests/test_web.py` | The read side: aggregation, health, tiles, ingest, the uploader's ledger. Asserts none of it can become a second Modbus client. Also the cloud and page contracts, at source level, since there is no JS harness. |
 | `docs/FINDINGS.md` | Every bug this project has found, what made each one quiet, and the rule it produced. Referenced by number from the code. |
+| `docs/MIGRATION.md` | Moving the capture host to another machine: the clock risk a host without an RTC introduces, the ordering the cutover needs, and what to verify. Read before the hardware is bought. |
 | `examples/` | A redacted excerpt of `dump.py --json` output. |
 
 The Python files sit flat at the repository root on purpose: Python puts the
@@ -766,7 +767,11 @@ Four details in those units are load-bearing:
   archive is keyed on that clock in the filename stamp `decode.py` sorts by, in its
   backwards-step check, and in the ingest Lambda's test for whether a tile span is closed. A
   record filed under the wrong hour can be baked into a tile promised `immutable` for a year.
-  This is the most important line in the file; see [Findings 38](docs/FINDINGS.md).
+  This is the most important line in the file. There is **no runtime guard in `log.py`** —
+  systemd ordering is the whole of the protection — so what it depends on, and the three
+  checks that settle it, are written out in
+  [docs/MIGRATION.md § 1](docs/MIGRATION.md#1-the-clock-read-this-before-you-buy-the-hardware).
+  See also [Findings 38](docs/FINDINGS.md).
 - **`ConditionPathExists=<install_dir>/config.json` on both.** A host with no config comes up
   quiet instead of crash-looping every 30 s on "no inverter host configured". That is what
   makes a freshly written image safe to boot before it has been given a credential.

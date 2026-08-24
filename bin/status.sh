@@ -51,6 +51,26 @@ if command -v timedatectl >/dev/null 2>&1; then
 else
   say "" "no timedatectl; cannot say whether the clock is synchronised"
 fi
+# A synchronised clock RIGHT NOW is not evidence that the logger will WAIT for one at the
+# next boot -- and the boot is the only time it matters. Those are two different facts and
+# only the second one protects the archive, so both are reported. The installers enable this
+# unit but do not fail if they cannot, so it really can be absent on a working-looking host.
+if command -v systemctl >/dev/null 2>&1; then
+  gate=$(systemctl is-enabled systemd-time-wait-sync.service 2>/dev/null) || gate=''
+  case "$gate" in
+    enabled|enabled-runtime|static|indirect)
+      printf '  clock gate: systemd-time-wait-sync is %s\n' "$gate" ;;
+    '')
+      echo "  clock gate: systemd-time-wait-sync NOT FOUND. If this host uses chrony or"
+      echo "    ntpsec instead of systemd-timesyncd, the logger's After= names a unit that"
+      echo "    does not exist and orders against nothing -- substitute chrony-wait.service." ;;
+    *)
+      echo "  clock gate: systemd-time-wait-sync is '$gate' -- the logger's After= orders"
+      echo "    against a unit that will not run, so at the next boot it can start before"
+      echo "    the clock is right. See FINDINGS 38."
+      echo "    sudo systemctl enable systemd-time-wait-sync" ;;
+  esac
+fi
 
 echo "=== logger ($SIGEN_LOGGER_UNIT) ==="
 unit_state "${SIGEN_LOGGER_UNIT}.service"
