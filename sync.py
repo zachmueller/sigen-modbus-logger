@@ -68,11 +68,12 @@ def wanted(name):
 def stranded(names):
     """Un-rotated `.bin` files that rotation has already moved past, oldest first.
 
-    log.py gzips the open `.bin` when it rotates, and only the `.bin.gz` travels -- see
-    wanted() and the module docstring. Nothing gzips a file afterwards, so a logger killed
-    mid-hour leaves its `.bin` behind and **that hour never reaches S3 by this route**. It
-    is reported rather than uploaded because uploading a file that might still be growing
-    is precisely what this daemon must not do.
+    log.py gzips the open `.bin` when it rotates and again when it closes, and only the
+    `.bin.gz` travels -- see wanted() and the module docstring. Nothing gzips a file
+    afterwards, so a logger that dies without running its shutdown path -- a crash, a
+    SIGKILL, a power cut -- leaves its `.bin` behind and **that hour never reaches S3 by
+    this route**. It is reported rather than uploaded because uploading a file that might
+    still be growing is precisely what this daemon must not do.
 
     What separates a stranded file from the open one is not its name or its age but the
     existence of a NEWER `.bin.gz`: that is the proof rotation has happened since, so this

@@ -82,6 +82,24 @@ class FakeModbus:
         pass
 
 
+class DeadModbus(FakeModbus):
+    """A device that is reachable but answers nothing -- port 502 refusing, not a slow link.
+
+    `connection_age()` returning None is the whole point: the real Modbus drops its socket on
+    a failed read, so during an outage there is no connection to report an age for. FakeModbus
+    reports a constant 0.0 and so never exercised that path.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__()          # stands in for Modbus(host, port, timeout_s)
+
+    def read(self, unit, addr, count, fc, retries=2):
+        raise IOError("connection refused")
+
+    def connection_age(self):
+        return None
+
+
 class TestPlanHash(unittest.TestCase):
     def test_default_plan_hash_is_frozen(self):
         self.assertEqual(log.plan_hash(log.build_tiers(base_cfg())),
@@ -238,12 +256,75 @@ class TestArchiveWriter(ArchiveFixture):
         self.assertEqual(archive.bytes_written, 2 * (log.HEADER_LEN + 2))
         self.assertTrue(os.path.exists(archive.manifest_path))
 
+    def test_close_gzips_the_final_file_so_it_is_not_stranded(self):
+        """Only `.bin.gz` travels, so a `.bin` left by a clean shutdown never reaches S3.
+
+        close() used to shut the handle and stop there, which stranded the closing file of
+        every run -- see FINDINGS 28. sync.py reports those but deliberately never uploads
+        one, so the fix has to happen here, while this process still owns the file.
+        """
+        archive = log.Archive(self.tmp, rotate_minutes=0, manifest=self.manifest)
+        archive.write(time.time(), 1, 100, b"\x00\x02")
+        archive.close()
+        names = os.listdir(self.tmp)
+        gz = [n for n in names if n.endswith(".bin.gz")]
+        self.assertEqual(len(gz), 1, names)
+        self.assertEqual([n for n in names if n.endswith(".bin")], [],
+                         "a plain .bin survived close(); sync.py would never upload it")
+        # Name alone is not enough: an empty or truncated .gz would pass the check above.
+        with gzip.open(os.path.join(self.tmp, gz[0]), "rb") as fh:
+            self.assertEqual(len(fh.read()), log.HEADER_LEN + 2)
+
+    def test_close_on_an_archive_that_never_opened_a_file_is_a_no_op(self):
+        """A capture that dies before its first record has no path to compress."""
+        archive = log.Archive(self.tmp, 0, self.manifest)
+        archive.close()
+        self.assertEqual([n for n in os.listdir(self.tmp) if ".bin" in n], [])
+
     def test_manifest_is_written_once_per_day(self):
         a1 = log.Archive(self.tmp, 0, self.manifest)
         first = os.path.getmtime(a1.manifest_path)
         a2 = log.Archive(self.tmp, 0, self.manifest)
         self.assertEqual(a1.manifest_path, a2.manifest_path)
         self.assertEqual(first, os.path.getmtime(a2.manifest_path))
+
+
+class TestCaptureDuringAnOutage(ArchiveFixture):
+    """capture() against a device that is up but refusing Modbus.
+
+    Nothing else drives capture() itself, which is how the crash below shipped: every test
+    exercised the pieces, none ran the loop with the device down. These are deliberately
+    short -- the loop paces itself at one tick per second, so duration is in seconds.
+    """
+
+    def setUp(self):
+        super().setUp()
+        real = log.Modbus
+        log.Modbus = DeadModbus          # capture() builds its own transport
+        self.addCleanup(lambda: setattr(log, "Modbus", real))
+
+    def test_a_scheduled_recycle_with_no_connection_does_not_crash(self):
+        """A recycle tick during an outage formatted None with {age:.0f} and died.
+
+        KeepAlive restarted it every time, so the daemon looked alive for eleven hours
+        while the archive took nothing -- and each restart stranded a `.bin`.
+        """
+        cfg = base_cfg(recycle_s=2, degrade_after=1, degrade_probe_s=1)
+        out = self.capture_stdout(log.capture, cfg, self.tiers, self.tmp,
+                                  3, 0, False, self.bundle)
+        # Proof the recycle tick at i=2 really ran with the device down, so this cannot
+        # pass by never reaching the path that broke.
+        self.assertIn("[degraded]", out)
+        # Nothing was open, so nothing should claim to have recycled anything.
+        self.assertNotIn("[recycle]", out)
+
+    def test_an_outage_still_reports_the_device_as_unreachable(self):
+        """The fix must stay quiet about recycles without muting the actual diagnosis."""
+        cfg = base_cfg(recycle_s=2, degrade_after=1, degrade_probe_s=1)
+        out = self.capture_stdout(log.capture, cfg, self.tiers, self.tmp,
+                                  3, 0, False, self.bundle)
+        self.assertIn("retry-exhausted failures", out)
+        self.assertNotIn("final connection age", out)
 
 
 class TestDecodeRoundTrip(ArchiveFixture):
