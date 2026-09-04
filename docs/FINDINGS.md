@@ -1467,6 +1467,45 @@ writer's own metric, and on latency oscillating 1.6x so that consecutive heartbe
 trend. A ranking decided by one sample of a noisy quantity will sometimes invert itself, and here it
 did so silently, in the direction of the worse choice.
 
+### 45. `launchctl kickstart -k` restarts the process and ignores the plist
+
+Adding `--discover` to the logger's launchd plist passed every check. `PlistBuddy` printed the
+new argument, `plutil -lint` said OK, `launchctl kickstart -k system/nz.zach.sigen-logger`
+reported success, and `ps` showed a fresh PID. The flag was not in effect.
+
+**`kickstart` restarts the process using the job configuration launchd already has loaded.**
+It does not re-read the file. Only `bootout` + `bootstrap` does — the launchd equivalent of
+`systemctl daemon-reload`, which the systemd installers in `deploy/systemd/` already call and
+which is easy to forget has a counterpart here.
+
+What makes it quiet is that `kickstart -k` is the *right* tool for the changes made far more
+often. `log.py`, `config.json` and everything else in the install directory are read at
+process start, so restarting the process is genuinely all they need. The plist is the one
+input that is read by launchd rather than by the program, and it is the one nothing in the
+restart path re-reads.
+
+```
+plist on disk:            ... --out /Users/zachmueller/sigen/data --discover
+launchctl print (cached): ... --out /Users/zachmueller/sigen/data
+ps:                       ... --out /Users/zachmueller/sigen/data
+```
+
+Two things to keep.
+
+**`launchctl print <label>` is the only witness.** The file, the linter and `ps` all agreed
+with each other and all three were describing something other than the loaded job. When a
+daemon's *definition* changes, verify against what the supervisor has loaded, not against
+what is on disk — the same shape as FINDINGS 12, where the fix was to compare which address
+each client actually connected to rather than trusting that the server was listening.
+
+**The startup banner is what caught it.** `capture()` prints `rediscovery ON: after 120s with
+no data, search the LAN for serial '...'` when the flag is set, and its absence from
+`sigen.log` was the whole detection. That line exists because a serial that turns out to be
+unknown must be discovered at startup rather than hours later mid-outage — and it paid off
+for an unrelated reason. **A feature that announces itself at startup is a feature whose
+absence is visible; one that only speaks when it acts is indistinguishable from one that was
+never enabled.**
+
 ---
 
 ## Known limits
