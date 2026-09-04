@@ -103,21 +103,43 @@ def parse_identity(buf):
             for key, off, n in IDENTITY_FIELDS}
 
 
+# Reads per candidate when rediscovering: one discarded, then this many timed.
+#
+# Why more than one. Timing a single cold call ranked the real unit's Wi-Fi module at
+# 192 ms and its wired port at 558 ms -- backwards, because repeated warm reads put the
+# wired port at 19 ms and the Wi-Fi module at 70. Two things make the first call a bad
+# measurement: it includes the TCP connect, and the first host probed absorbs whatever
+# the port sweep just did to the device's TCP stack. Steady-state read latency is also
+# simply the thing capture will actually experience, which is what we are choosing on.
+PROBE_READS = 3
+
+
 def serial_probe(cfg):
-    """A discover.find()-compatible probe: host -> serial string, or None.
+    """A discover.find()-compatible probe: host -> (serial, median read ms).
 
     Constructing the Modbus client here rather than in discover.py is deliberate --
     log.py stays the only module in the repository that opens a connection to the
     device, which is what makes the read-only guarantee a property of the packaging
-    and not of a code review. A short timeout: this runs against up to a few hosts
-    inside one degraded tick.
+    and not of a code review.
+
+    Reads are on ONE connection, discarding the first, so the number returned is
+    steady-state read latency and not a cold connect. See PROBE_READS.
     """
     unit, addr, count, fc = identity_block(cfg)
     timeout = min(cfg["timeout_s"], 3.0)
 
     def probe(host):
         with Modbus(host, cfg["port"], timeout) as mb:
-            return parse_identity(mb.read(unit, addr, count, fc, retries=0)).get("serial")
+            serial = parse_identity(
+                mb.read(unit, addr, count, fc, retries=0)).get("serial")
+            if not serial:
+                return None, None
+            lat = []
+            for _ in range(PROBE_READS):
+                t0 = time.perf_counter()
+                mb.read(unit, addr, count, fc, retries=0)
+                lat.append((time.perf_counter() - t0) * 1000)
+            return serial, statistics.median(lat)
     return probe
 
 

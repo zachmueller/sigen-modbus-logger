@@ -1342,6 +1342,11 @@ be deleted.**
 
 ### 42. `KeepAlive` restarted the logger every hour, so "it is running" had stopped meaning anything
 
+> **The device diagnosis in this entry is wrong — see FINDINGS 43.** `192.168.1.7` was not a wedged
+> inverter, it was a Google device that had taken the inverter's DHCP lease. Everything below about
+> the crash loop, the stranded files and `pending 0` stands; the paragraph immediately following does
+> not, and is kept as written because *how* it was wrong is the lesson 43 is about.
+
 The inverter stopped serving Modbus at 03:32 on 2026-09-04. It was not offline: `ping` had 0% loss,
 ARP resolved the MAC, and port 502 answered **`Connection refused`** — the host was up and the
 Modbus server was not. Ports 80, 443 and 8080 were closed too, and LAN round-trip was 100–400 ms,
@@ -1394,6 +1399,73 @@ against the previous code — the first with the traceback above.
 erases it once it does. Give the degraded path the tests the happy path already has, and pick the
 assertion that would have caught this one — not that `[recycle]` prints, but that a logger with no
 connection does not claim to have recycled one.**
+
+### 43. The "wedged device" was a different device, and 42's diagnosis was wrong
+
+FINDINGS 42 read the evidence at `192.168.1.7` — ICMP answering, ARP resolving, every TCP port
+refusing, 100–400 ms round-trip — and concluded *the inverter's Modbus server had wedged*. Every
+observation was accurate. The conclusion was not.
+
+`192.168.1.7` was **not the inverter at all**. Its MAC had become `d4:3a:2c:…`, a **Google** OUI: a
+Nest device had taken the DHCP lease. The inverter was answering Modbus the whole time, on two
+addresses, both reporting `SigenStor EC 10.0 SP AU` / serial `CMU120A84570199`:
+
+| | MAC vendor | ICMP | full 346-field decode |
+|---|---|---|---|
+| `192.168.1.15` | IEEE small block | 3.6–10.5 ms, TTL 255 | **1.2 s** — the wired Ethernet port |
+| `192.168.1.13` | **Espressif** | no reply | **3.3 s** — the Wi-Fi module |
+
+The router issues **2-hour DHCP leases** with no reservation for the controller. The Wi-Fi module
+dropped off long enough to lose the lease, came back on a different address, and something else
+claimed the old one.
+
+Two lessons, and the second is the one that changed the code.
+
+**"The host is up and the service is not" is one hypothesis, not a finding.** Every symptom of a
+wedged service is also a symptom of a *different machine* at that address. What separates them is
+identity, and identity was never checked: one `arp -n 192.168.1.7` would have ended it in a second,
+and a `/24` sweep for port 502 would have found the real unit in four. **When a service stops
+answering at a known address, establish that the address is still the thing you think it is before
+theorising about the service.** A refusal on every port — not just the one you care about — should
+have been the tell: a wedged Modbus server does not also close 80, 443 and 8080.
+
+**Latency was evidence and got read as noise.** The 100–400 ms round-trip that 42 filed under
+"wedged device rather than rebooted" was simply Wi-Fi — and the logger's own history said so, at a
+median of 100–163 ms with a p95 to 790 ms. It had been polling the Wi-Fi module all along, and the
+wired port was there the whole time at 19 ms.
+
+The outage ran for **fourteen hours** and nothing reported it, which is the part worth fixing rather
+than merely writing down. `discover.py` now sweeps for the unit and adopts the fastest host whose
+**serial** matches — identity, because the whole finding above is that an address is not an
+identity — and `bin/watchdog.py` pushes, because everything else here required someone to look.
+
+### 44. Timing one cold call ranked the slow interface first
+
+`discover.find()` originally timed its own identity call per candidate and adopted the fastest. On
+the real device that chose the **Wi-Fi module at 192 ms over the wired port at 558 ms** — backwards.
+Repeated reads on one connection put them at **19 ms wired against 70 ms wireless**:
+
+```
+192.168.1.15  cold(incl connect) 73 ms | warm reads 30 28 29 9 10 10 | median 19
+192.168.1.13  cold(incl connect) 110 ms | warm reads 85 88 31 97 69 34 | median 77
+```
+
+Two things spoiled the single measurement, and only one is obvious. It included the **TCP connect**;
+and the **first host probed absorbed the port sweep that had just run** — 508 connection attempts
+across two `/24`s, which leaves the device's TCP stack busy for whoever is asked next. The wired port
+happened to be probed first and wore the cost.
+
+The fix moved the measurement, not just the sample size. `log.serial_probe()` now opens one
+connection, **discards the first read**, and returns the median of three — and `discover.find()`
+takes the latency *from the probe* rather than timing it, because only the caller knows what a
+representative read is. Steady-state read latency is also simply the quantity being chosen on: it is
+what capture will experience for the next month.
+
+**A benchmark that runs once, immediately after something expensive, measures the expensive thing.**
+This project already knew that in the other direction — FINDINGS on measuring a reader against the
+writer's own metric, and on latency oscillating 1.6x so that consecutive heartbeats look like a
+trend. A ranking decided by one sample of a noisy quantity will sometimes invert itself, and here it
+did so silently, in the direction of the worse choice.
 
 ---
 

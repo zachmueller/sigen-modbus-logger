@@ -198,9 +198,18 @@ def find(expect_serial, probe, hint_hosts=(), port=502, sweep_budget_s=SWEEP_BUD
          identify_budget_s=IDENTIFY_BUDGET_S, log=None):
     """The address to poll, or None.
 
-    `probe(host)` must return that host's serial number as a string, or None if it
-    could not be read. It is the caller's Modbus read -- see the module docstring for
-    why the register access is not in here.
+    `probe(host)` must return `(serial, latency_ms)` -- the host's serial number as a
+    string, and how long a representative read of it took. `(None, None)` if it could
+    not be read. It is the caller's Modbus read; see the module docstring for why the
+    register access is not in here.
+
+    **The probe reports the latency rather than this function timing it**, and that is
+    load-bearing. Timing one cold call here ranked the real inverter's Wi-Fi module
+    (192 ms) above its wired port (558 ms) -- an inversion, since repeated warm reads
+    put the wired port at 19 ms against the Wi-Fi module's 70. The cold figure includes
+    the TCP connect, and the first host probed absorbs whatever the sweep just did to
+    the device's TCP stack. Only the caller knows how to measure a read properly, so
+    only the caller should.
 
     Returns {"host", "latency_ms", "matches": [(host, latency_ms), ...],
              "listeners": [...], "elapsed_s"} or None.
@@ -235,15 +244,15 @@ def find(expect_serial, probe, hint_hosts=(), port=502, sweep_budget_s=SWEEP_BUD
             say(f"  [discover] identification budget spent; {len(open_hosts)} hosts had "
                 f":{port} open but not all were asked who they are")
             break
-        t1 = time.monotonic()
         try:
-            serial = probe(host)
+            serial, latency_ms = probe(host)
         except Exception as e:
-            serial = None
+            serial, latency_ms = None, None
             others.append((host, f"{type(e).__name__}: {e}"))
-        latency_ms = (time.monotonic() - t1) * 1000
         if serial and serial == expect_serial:
-            matches.append((host, latency_ms))
+            # A match that could not be timed still counts, but must not sort first and
+            # win on a missing number. Push it to the back.
+            matches.append((host, latency_ms if latency_ms is not None else float("inf")))
         elif serial:
             # Worth logging loudly: a second, DIFFERENT inverter on the LAN is the
             # case where adopting the wrong one would look entirely healthy.

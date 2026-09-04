@@ -96,6 +96,13 @@ class FakeModbus:
     def close(self):
         pass
 
+    # The real Modbus is a context manager and serial_probe() uses it as one.
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
 
 class DeadModbus(FakeModbus):
     """A device that is reachable but answers nothing -- port 502 refusing, not a slow link.
@@ -801,13 +808,18 @@ class DiscoverFixture(unittest.TestCase):
 
     @staticmethod
     def probe_from(table):
-        """table: {host: serial or Exception}. Latency comes from dict order."""
+        """table: {host: serial | (serial, latency_ms) | Exception}.
+
+        A bare serial gets a latency derived from dict order, so "first in the table is
+        fastest" -- which lets a test state an ordering without stating numbers.
+        """
         def probe(host):
             v = table[host]
             if isinstance(v, Exception):
                 raise v
-            time.sleep(0.01 * (list(table).index(host) + 1))
-            return v
+            if isinstance(v, tuple):
+                return v
+            return v, 10.0 * (list(table).index(host) + 1)
         return probe
 
 
@@ -838,13 +850,38 @@ class TestFindPicksTheFastestMatch(DiscoverFixture):
     def test_the_wired_interface_wins_over_the_wireless_one(self):
         """The unit answers on both its Ethernet port and its Wi-Fi module with the
         same serial. Picking by latency lands on the wired one without anything here
-        having to know which address is which."""
+        having to know which address is which.
+
+        The numbers are the ones measured on the real unit: 19 ms wired, 70 ms wireless.
+        """
         self.stub_listeners(["10.0.0.13", "10.0.0.15"])
-        probe = self.probe_from({"10.0.0.15": "SN1", "10.0.0.13": "SN1"})
+        probe = self.probe_from({"10.0.0.13": ("SN1", 70.0), "10.0.0.15": ("SN1", 19.0)})
         found = discover.find("SN1", probe, log=lambda _s: None)
         self.assertEqual(found["host"], "10.0.0.15")
         self.assertEqual(len(found["matches"]), 2)
         self.assertLess(found["matches"][0][1], found["matches"][1][1])
+
+    def test_the_probes_latency_decides_not_the_order_it_was_found_in(self):
+        """The regression this contract exists for. Timing one cold call inside find()
+        ranked the real inverter's Wi-Fi module above its wired port, because the cold
+        figure includes the TCP connect and the first host probed absorbs whatever the
+        sweep just did to the device. So: slowest to answer, but reports the best read
+        latency, must still win."""
+        self.stub_listeners(["10.0.0.13", "10.0.0.15"])
+
+        def probe(host):
+            if host == "10.0.0.15":
+                time.sleep(0.05)             # answers last
+                return "SN1", 19.0           # but is genuinely the faster link
+            return "SN1", 70.0
+        found = discover.find("SN1", probe, log=lambda _s: None)
+        self.assertEqual(found["host"], "10.0.0.15")
+
+    def test_a_match_that_could_not_be_timed_does_not_win_on_a_missing_number(self):
+        self.stub_listeners(["10.0.0.13", "10.0.0.15"])
+        probe = self.probe_from({"10.0.0.13": ("SN1", None), "10.0.0.15": ("SN1", 70.0)})
+        found = discover.find("SN1", probe, log=lambda _s: None)
+        self.assertEqual(found["host"], "10.0.0.15")
 
     def test_a_different_serial_is_reported_but_never_adopted(self):
         self.stub_listeners(["10.0.0.7", "10.0.0.15"])
@@ -920,6 +957,51 @@ class TestParseIdentity(ArchiveFixture):
         ident = log.parse_identity(self.mb.read(unit, addr, count, fc))
         self.assertEqual(ident["serial"], self.manifest["device"]["serial"])
         self.assertEqual(ident["model"], self.manifest["device"]["model"])
+
+
+class TestSerialProbe(ArchiveFixture):
+    """log.serial_probe(), the half of rediscovery that talks to the device."""
+
+    def setUp(self):
+        super().setUp()
+        self.built = []
+        real = log.Modbus
+
+        def fake(host, port, timeout):
+            self.built.append((host, port, timeout))
+            return self.mb
+        log.Modbus = fake
+        self.addCleanup(lambda: setattr(log, "Modbus", real))
+
+    def test_it_returns_the_serial_and_a_latency(self):
+        serial, ms = log.serial_probe(self.cfg)("10.0.0.15")
+        self.assertEqual(serial, "TESTSERIAL")
+        self.assertIsInstance(ms, float)
+
+    def test_it_discards_the_first_read_and_times_the_rest(self):
+        """The first read includes the TCP connect, and timing it inverted the ranking
+        of the real unit's two interfaces. So it is read and thrown away."""
+        self.mb.reads.clear()
+        log.serial_probe(self.cfg)("10.0.0.15")
+        self.assertEqual(len(self.mb.reads), 1 + log.PROBE_READS)
+
+    def test_it_reads_only_the_identity_block_and_only_with_fc4(self):
+        self.mb.reads.clear()
+        log.serial_probe(self.cfg)("10.0.0.15")
+        unit, addr, count, fc = log.identity_block(self.cfg)
+        for got in self.mb.reads:
+            self.assertEqual(got, (unit, addr, count, fc))
+            self.assertEqual(got[3], 4, "FC4 is a read of input registers")
+
+    def test_it_honours_the_port_from_config_and_caps_the_timeout(self):
+        log.serial_probe(base_cfg(port=5020, timeout_s=30.0))("10.0.0.15")
+        host, port, timeout = self.built[-1]
+        self.assertEqual((host, port), ("10.0.0.15", 5020))
+        self.assertLessEqual(timeout, 3.0, "a scan must not sit on one host for 30 s")
+
+    def test_no_serial_means_no_latency_either(self):
+        self.mb.set_string(30515, "", 10)
+        self.assertEqual(log.serial_probe(self.cfg)("10.0.0.15"), (None, None))
 
 
 class TestRediscoveryDuringAnOutage(ArchiveFixture):
