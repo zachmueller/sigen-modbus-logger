@@ -56,6 +56,9 @@ def write_state(path, state):
         tmp = path + ".tmp"
         with open(tmp, "w") as fh:
             json.dump(state, fh, indent=1)
+            # Trailing newline: without it bin/status.sh's next line runs onto the closing
+            # brace, which is how this was noticed. A text file should end with one anyway.
+            fh.write("\n")
         os.replace(tmp, path)          # atomic: a truncated state file reads as "no history"
     except Exception as e:
         print(f"  cannot write {path}: {type(e).__name__}: {e}")
