@@ -86,6 +86,18 @@ PY
   PATTERNS="$PATTERNS $EXTRA"
 fi
 
+# The notification topic, read out of gitignored alert.conf for the same reason. An ntfy
+# topic is a capability, not just an identifier: anyone who learns it can both read the
+# alerts and post to them, so it belongs in this check exactly as much as a bucket name.
+# The topic, not the URL -- "https" and "ntfy.sh" appear legitimately in the tree.
+if [ -f alert.conf ]; then
+  TOPIC=$(sed -e 's/#.*//' -e 's/[[:space:]]//g' alert.conf \
+          | grep -v '^$' | head -1 | sed -e 's#^https\{0,1\}://##' -e 's#^[^/]*/##')
+  if [ -n "${TOPIC:-}" ] && [ "${#TOPIC}" -ge 4 ]; then
+    PATTERNS="$PATTERNS $TOPIC"
+  fi
+fi
+
 # Every pattern the caller added.
 for p in "$@"; do PATTERNS="$PATTERNS $p"; done
 

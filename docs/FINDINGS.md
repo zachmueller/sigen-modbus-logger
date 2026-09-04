@@ -1193,6 +1193,122 @@ and never from a file the failing command did not write. Then measure again AFTE
 raised without a cost-per-unit is not headroom, it is an unread number. And when a job's cost
 grows with the data, the fix is not a bigger deadline — it is somewhere without one.**
 
+> **38–42 are on the `pi` branch.** They document the Raspberry Pi migration — the clock a
+> host without an RTC does not have, `pip` on Debian, `keep_days` deleting the file that
+> carries the data offsite, the catalogue outliving its server, and the crash loop a
+> supervisor turned into apparent health. Numbers are global across both branches on purpose,
+> so a reference to a finding means one thing wherever it is read. `main` keeps the macOS
+> deployment; see the `pi` branch for those five.
+
+### 43. The address was not the identity, and every symptom agreed with the wrong theory
+
+The inverter stopped answering Modbus at 03:25 on 2026-09-04. It was not offline: `ping` had 0%
+loss, ARP resolved a MAC, and port 502 answered **`Connection refused`** — a live host with
+nothing listening. Ports 80, 443, 8080 and seven others refused too, and LAN round-trip was
+100–400 ms. That reads exactly like a wedged Modbus server, and it was not one.
+
+`192.168.1.7` was **not the inverter at all**. Its MAC had become `d4:3a:2c:…`, a **Google**
+OUI: a Nest device had taken the DHCP lease. The inverter was answering the whole time, on two
+addresses, both reporting `SigenStor EC 10.0 SP AU` / serial `CMU120A84570199`:
+
+| | MAC vendor | ICMP | full 346-field decode |
+|---|---|---|---|
+| `192.168.1.15` | IEEE small block | 3.6–10.5 ms, TTL 255 | **1.2 s** — the wired Ethernet port |
+| `192.168.1.13` | **Espressif** | no reply | **3.3 s** — the Wi-Fi module |
+
+The router issues **2-hour DHCP leases** with no reservation for the controller. The Wi-Fi
+module dropped off long enough to lose the lease, came back on a different address, and
+something else claimed the old one.
+
+Three lessons, and the last is the one that changed the code.
+
+**"The host is up and the service is not" is a hypothesis, not a finding.** Every symptom of a
+wedged service is also a symptom of a *different machine* at that address, and identity was
+never checked. One `arp -n 192.168.1.7` would have ended it in a second; a `/24` sweep for port
+502 found the real unit in four. **When a service stops answering at a known address, establish
+that the address is still the thing you think it is before theorising about the service.**
+
+**A refusal on ports nobody cares about was the tell.** A wedged Modbus server does not also
+close 80, 443 and 8080. Eleven refused ports describe a host with no services at all, which is
+a different animal from a host with one broken one.
+
+**Latency was evidence and got read as noise.** The 100–400 ms round-trip was simply Wi-Fi — and
+the logger's own history said so, at a median of 100–163 ms with a p95 to 790 ms and isolated
+spikes to 37 s. It had been polling the Wi-Fi module all along, and the wired port was there the
+whole time at 19 ms.
+
+The outage ran for **fourteen hours** and nothing reported it, which is the part worth fixing
+rather than merely writing down. `discover.py` now sweeps for the unit and adopts the fastest
+host whose **serial** matches — identity, because the whole finding above is that an address is
+not an identity — and `bin/watchdog.py` pushes, because everything else here required someone to
+look.
+
+### 44. Timing one cold call ranked the slow interface first
+
+`discover.find()` originally timed its own identity call per candidate and adopted the fastest. On
+the real device that chose the **Wi-Fi module at 192 ms over the wired port at 558 ms** — backwards.
+Repeated reads on one connection put them at **19 ms wired against 70 ms wireless**:
+
+```
+192.168.1.15  cold(incl connect) 73 ms | warm reads 30 28 29 9 10 10 | median 19
+192.168.1.13  cold(incl connect) 110 ms | warm reads 85 88 31 97 69 34 | median 77
+```
+
+Two things spoiled the single measurement, and only one is obvious. It included the **TCP connect**;
+and the **first host probed absorbed the port sweep that had just run** — 508 connection attempts
+across two `/24`s, which leaves the device's TCP stack busy for whoever is asked next. The wired port
+happened to be probed first and wore the cost.
+
+The fix moved the measurement, not just the sample size. `log.serial_probe()` now opens one
+connection, **discards the first read**, and returns the median of three — and `discover.find()`
+takes the latency *from the probe* rather than timing it, because only the caller knows what a
+representative read is. Steady-state read latency is also simply the quantity being chosen on: it is
+what capture will experience for the next month.
+
+**A benchmark that runs once, immediately after something expensive, measures the expensive thing.**
+This project already knew that in the other direction — FINDINGS on measuring a reader against the
+writer's own metric, and on latency oscillating 1.6x so that consecutive heartbeats look like a
+trend. A ranking decided by one sample of a noisy quantity will sometimes invert itself, and here it
+did so silently, in the direction of the worse choice.
+
+### 45. `launchctl kickstart -k` restarts the process and ignores the plist
+
+Adding `--discover` to the logger's launchd plist passed every check. `PlistBuddy` printed the
+new argument, `plutil -lint` said OK, `launchctl kickstart -k system/nz.zach.sigen-logger`
+reported success, and `ps` showed a fresh PID. The flag was not in effect.
+
+**`kickstart` restarts the process using the job configuration launchd already has loaded.**
+It does not re-read the file. Only `bootout` + `bootstrap` does — which is what
+`deploy/install-daemon.sh` and its siblings already do, and which is easy to forget when
+restarting by hand instead of re-running the installer.
+
+What makes it quiet is that `kickstart -k` is the *right* tool for the changes made far more
+often. `log.py`, `config.json` and everything else in the install directory are read at
+process start, so restarting the process is genuinely all they need. The plist is the one
+input that is read by launchd rather than by the program, and it is the one nothing in the
+restart path re-reads.
+
+```
+plist on disk:            ... --out /Users/zachmueller/sigen/data --discover
+launchctl print (cached): ... --out /Users/zachmueller/sigen/data
+ps:                       ... --out /Users/zachmueller/sigen/data
+```
+
+Two things to keep.
+
+**`launchctl print <label>` is the only witness.** The file, the linter and `ps` all agreed
+with each other and all three were describing something other than the loaded job. When a
+daemon's *definition* changes, verify against what the supervisor has loaded, not against
+what is on disk — the same shape as FINDINGS 12, where the fix was to compare which address
+each client actually connected to rather than trusting that the server was listening.
+
+**The startup banner is what caught it.** `capture()` prints `rediscovery ON: after 120s with
+no data, search the LAN for serial '...'` when the flag is set, and its absence from
+`sigen.log` was the whole detection. That line exists because a serial that turns out to be
+unknown must be discovered at startup rather than hours later mid-outage — and it paid off
+for an unrelated reason. **A feature that announces itself at startup is a feature whose
+absence is visible; one that only speaks when it acts is indistinguishable from one that was
+never enabled.**
 ---
 
 ## Known limits

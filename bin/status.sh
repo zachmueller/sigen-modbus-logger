@@ -32,6 +32,38 @@ else
 fi
 tail -3 "$SIGEN_LOG_DIR/viewer.err" 2>/dev/null | sed 's/^/  err: /' || true
 
+echo "=== watchdog ($SIGEN_WATCHDOG_LAUNCHD_LABEL) ==="
+# "state = not running" is the HEALTHY state here: this is a StartInterval job that
+# finishes, so between runs there is nothing to be running. The signal is the interval and
+# the last exit code, not the state.
+launchctl print "system/${SIGEN_WATCHDOG_LAUNCHD_LABEL}" 2>/dev/null \
+  | grep -E "^	state|last exit code|run interval" \
+  || echo "not loaded -- NOTHING is watching for a stalled capture"
+# The state file is the point of the whole daemon: whether the last check thought capture
+# was healthy, and since when if not.
+tail -6 "$SIGEN_LOG_DIR/watchdog.state" 2>/dev/null | sed 's/^/  /' \
+  || echo "  no watchdog.state yet -- it has not run"
+if [ -f "$DIR/alert.conf" ]; then
+  echo "  alert.conf present, so a breach can be reported"
+else
+  echo "  NO alert.conf -- a breach would be detected and never reach you"
+fi
+
+echo "=== polling ==="
+# Which address the logger is ACTUALLY using. It differs from config.json's host once
+# rediscovery has adopted a new one, and that difference is the thing you want to see
+# before going to look at the wrong device. See discover.py and FINDINGS 43.
+live=$(cat "$SIGEN_LOG_DIR/logger-host" 2>/dev/null) || live=''
+if [ -z "$live" ]; then
+  echo "  no logger-host file; assume config.json's host ($SIGEN_HOST)"
+elif [ "$live" = "$SIGEN_HOST" ]; then
+  echo "  $live (as configured)"
+else
+  echo "  $live  <- ADOPTED, config.json still says $SIGEN_HOST"
+  echo "    Rediscovery moved it. Capture is fine, but config.json is what a restart"
+  echo "    uses, so set host to the adopted address to survive one."
+fi
+
 echo "=== archive ==="
 printf "  files: %s   size: %s\n" \
   "$(ls "$SIGEN_DATA_DIR"/*.bin* 2>/dev/null | wc -l | tr -d ' ')" \

@@ -16,6 +16,10 @@ Usage:
                   note: --seconds counts scheduler ticks (1 s each), not samples
   --keep-days N   delete .bin.gz older than N days on rotation (0 = keep all)
   --soak-report   bucket latency by 5 min, apply pass/fail gates, abort on breach
+  --discover      during an outage, search the LAN for the inverter and adopt it if
+                  its serial matches. Off by default: a LAN sweep is not something a
+                  logger should do to someone's network unless they asked. See
+                  discover.py, and FINDINGS on the DHCP lease that made it necessary.
 
 Host, cadence, unit ids and the persistent-run tuning come from config.json; see
 config.py for every key and its default. CLI flags override it.
@@ -40,7 +44,9 @@ import sys
 import threading
 import time
 
+import alerts
 import config
+import discover
 import dump
 import lib
 from lib import Modbus, pct
@@ -81,6 +87,90 @@ def identity_block(cfg):
     return (cfg["inverter_unit"], 30500, 40, 4)  # model/serial/firmware, read once
 
 
+# Where each string sits inside that one 40-register read, in register units.
+IDENTITY_FIELDS = (("model", 0, 15), ("serial", 15, 10), ("firmware", 25, 15))
+
+
+def parse_identity(buf):
+    """model/serial/firmware from one identity_block() read.
+
+    Factored out of build_manifest() because rediscovery needs the same three strings
+    from the same read: a host is only adopted if its serial matches, and two copies
+    of these offsets could disagree about which host is ours.
+    """
+    return {key: buf[off * 2:(off + n) * 2].decode("ascii", "replace")
+                    .rstrip("\x00").strip()
+            for key, off, n in IDENTITY_FIELDS}
+
+
+# Reads per candidate when rediscovering: one discarded, then this many timed.
+#
+# Why more than one. Timing a single cold call ranked the real unit's Wi-Fi module at
+# 192 ms and its wired port at 558 ms -- backwards, because repeated warm reads put the
+# wired port at 19 ms and the Wi-Fi module at 70. Two things make the first call a bad
+# measurement: it includes the TCP connect, and the first host probed absorbs whatever
+# the port sweep just did to the device's TCP stack. Steady-state read latency is also
+# simply the thing capture will actually experience, which is what we are choosing on.
+PROBE_READS = 3
+
+
+def serial_probe(cfg):
+    """A discover.find()-compatible probe: host -> (serial, median read ms).
+
+    Constructing the Modbus client here rather than in discover.py is deliberate --
+    log.py stays the only module in the repository that opens a connection to the
+    device, which is what makes the read-only guarantee a property of the packaging
+    and not of a code review.
+
+    Reads are on ONE connection, discarding the first, so the number returned is
+    steady-state read latency and not a cold connect. See PROBE_READS.
+    """
+    unit, addr, count, fc = identity_block(cfg)
+    timeout = min(cfg["timeout_s"], 3.0)
+
+    def probe(host):
+        with Modbus(host, cfg["port"], timeout) as mb:
+            serial = parse_identity(
+                mb.read(unit, addr, count, fc, retries=0)).get("serial")
+            if not serial:
+                return None, None
+            lat = []
+            for _ in range(PROBE_READS):
+                t0 = time.perf_counter()
+                mb.read(unit, addr, count, fc, retries=0)
+                lat.append((time.perf_counter() - t0) * 1000)
+            return serial, statistics.median(lat)
+    return probe
+
+
+def known_serial(outdir, manifest=None):
+    """The serial this archive belongs to, or None.
+
+    Preference order matters. The live read is authoritative when it worked. When it
+    did not -- which is precisely the case rediscovery exists for, since the device
+    was already unreachable at startup -- fall back to the newest manifest on disk,
+    written by an earlier run that did reach the unit. Nothing is invented: if neither
+    source has a serial, discover.find() refuses to adopt anything.
+    """
+    if manifest:
+        serial = (manifest.get("device") or {}).get("serial")
+        if serial:
+            return serial
+    try:
+        names = [n for n in os.listdir(outdir) if n.endswith(".manifest.json")]
+    except OSError:
+        return None
+    for name in sorted(names, reverse=True):
+        try:
+            with open(os.path.join(outdir, name)) as fh:
+                serial = (json.load(fh).get("device") or {}).get("serial")
+            if serial:
+                return serial
+        except Exception:
+            continue          # a truncated or half-written manifest is not fatal here
+    return None
+
+
 HEADER = ">dHH"                # host epoch, present-block bitmask, latency ms
 HEADER_LEN = struct.calcsize(HEADER)
 FORMAT = "sigen-raw-1"
@@ -96,6 +186,15 @@ SOAK_WATCH = ["plant_system_time", "plant_accumulated_grid_import_energy",
 GATE_P95_FRAC = 0.50
 GATE_MAX_FRAC = 0.90
 BUCKET_HISTORY = 24  # completed buckets kept in memory when not soaking (2 h)
+
+# Rediscovery timing, in seconds of WALL CLOCK rather than ticks, so that retuning
+# fast_period_s cannot silently change how long an outage runs before the LAN is
+# searched -- the mistake the latency gates above already had to be fixed for.
+# The first scan is late enough not to fire on the ordinary brief outages the degraded
+# probe already handles, and the repeat is slow enough that a genuinely dead inverter
+# does not mean a sweep every minute forever.
+REDISCOVER_AFTER_S = 120
+REDISCOVER_EVERY_S = 600
 
 
 def gates(cfg):
@@ -273,11 +372,7 @@ def build_manifest(mb, bundle, cfg, tiers):
     if cfg["manifest_identity"]:
         try:
             unit, addr, count, fc = identity_block(cfg)
-            buf = mb.read(unit, addr, count, fc)
-            for key, off, n in [("model", 0, 15), ("serial", 15, 10),
-                                ("firmware", 25, 15)]:
-                ident[key] = buf[off * 2:(off + n) * 2].decode("ascii", "replace") \
-                    .rstrip("\x00").strip()
+            ident.update(parse_identity(mb.read(unit, addr, count, fc)))
         except Exception as e:
             ident["error"] = str(e)
     else:
@@ -500,7 +595,7 @@ def run_topology(mode, outdir, bundle, cfg):
 # ------------------------------------------------------------------- capture loop
 
 def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
-            fault_at=None, keep_days=0):
+            fault_at=None, keep_days=0, rediscover=False):
     fast_period = cfg["fast_period_s"]
     bucket_s = cfg["bucket_s"]
     max_lag_s = cfg["max_lag_s"]
@@ -528,6 +623,8 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
     mb = Modbus(cfg["host"], cfg["port"], cfg["timeout_s"])
     manifest = build_manifest(mb, bundle, cfg, tiers)
     archive = Archive(outdir, rotate_minutes, manifest, keep_days)
+    expect_serial = known_serial(outdir, manifest) if rediscover else None
+    discover.write_host_state(cfg.get("log_dir"), cfg["host"])
     print(f"Sigenergy raw capture @ {cfg['host']}:{cfg['port']}")
     print(f"  device   {manifest['device'].get('model','?')} "
           f"SN {manifest['device'].get('serial','?')}")
@@ -545,6 +642,14 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
     if soak:
         print(f"  soak gates: p95 < {gate_p95} ms, max < {gate_max} ms per "
               f"{bucket_s//60}-min bucket, abort on breach")
+    if rediscover:
+        # State the serial at startup rather than at the first scan. If it is unknown
+        # the search will refuse to adopt anything, and finding that out during an
+        # outage -- hours later, from a log nobody is reading -- is too late to fix it.
+        print(f"  rediscovery ON: after {REDISCOVER_AFTER_S}s with no data, search the "
+              f"LAN for serial "
+              + (repr(expect_serial) if expect_serial
+                 else "??? — UNKNOWN, so nothing will be adopted"))
     print()
 
     buckets, cur = [], None
@@ -558,6 +663,11 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
     aborted = None
     consecutive_dead = 0
     last_gap_log, gaps_at_last_log = -1e9, 0
+    # -1e9 rather than 0: monotonic() starts near zero on some platforms, and a zero
+    # here would make the first tick look like it had already scanned. Same trick as
+    # last_gap_log above.
+    dead_since, last_scan = None, -1e9
+    rediscoveries = 0
 
     while not stop["now"] and (duration == 0 or i < duration):
         target = t0 + i
@@ -611,8 +721,15 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
                       + (f"  empty {cur['empty']}" if cur["empty"] else "")
                       + (f"  gaps {gaps}" if gaps else "")
                       + (f"  recycles {recycles}" if recycles else "")
-                      + (f"  UNEXPECTED reconnects {mb.connects - 1 - recycles}"
-                         if mb.connects - 1 - recycles > 0 else ""),
+                      + (f"  rediscoveries {rediscoveries}" if rediscoveries else "")
+                      # Adopting an address closes the socket deliberately, so the
+                      # reconnect that follows is expected and is discounted here --
+                      # otherwise every rediscovery would inflate a counter whose whole
+                      # job is to mean "something dropped this connection and we do not
+                      # know what".
+                      + (f"  UNEXPECTED reconnects "
+                         f"{mb.connects - 1 - recycles - rediscoveries}"
+                         if mb.connects - 1 - recycles - rediscoveries > 0 else ""),
                       flush=True)
                 if soak and p95 is not None and (p95 >= gate_p95 or mx >= gate_max):
                     aborted = (f"bucket {cur['label']} breached the gate "
@@ -675,6 +792,45 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
             due = due[:1]
             degraded_ticks += 1
 
+            # Search for the device only on a probe tick, so the rate limiting above
+            # applies to the scan too, and only once the outage has lasted long enough
+            # that a moved address is a better explanation than a brief blip.
+            scan_now = time.monotonic()
+            if (rediscover and dead_since is not None
+                    and scan_now - dead_since >= REDISCOVER_AFTER_S
+                    and scan_now - last_scan >= REDISCOVER_EVERY_S):
+                last_scan = scan_now
+                print(f"  [discover] no data for {scan_now - dead_since:.0f}s — "
+                      f"searching the LAN for the inverter", flush=True)
+                found = discover.find(
+                    expect_serial, serial_probe(cfg), hint_hosts=(mb.host,),
+                    port=cfg["port"], log=lambda s: print(s, flush=True))
+                if found and found["host"] != mb.host:
+                    old = mb.host
+                    mb.close()
+                    mb.host = found["host"]
+                    rediscoveries += 1
+                    discover.write_host_state(cfg.get("log_dir"), mb.host)
+                    # Name the interfaces that also matched but lost. It is how you find
+                    # out the unit answers on two addresses, and which one is the slow one.
+                    runners_up = ", ".join(f"{h} at {ms:.0f} ms"
+                                           for h, ms in found["matches"][1:])
+                    also = f"; also on {runners_up}" if runners_up else ""
+                    msg = (f"inverter moved {old} -> {mb.host} (serial matched, "
+                           f"{found['latency_ms']:.0f} ms{also})")
+                    print(f"  [rediscovered] {msg}", flush=True)
+                    # Not resetting consecutive_dead: the next read is what proves the
+                    # new address, and letting it fire the existing [recovered] line
+                    # keeps one code path for "the device came back".
+                    alerts.notify("Sigen capture: inverter address changed", msg,
+                                  priority="high", tags="satellite",
+                                  install_dir=cfg.get("install_dir"),
+                                  log=lambda s: print(s, flush=True))
+                elif found:
+                    print(f"  [discover] serial matches at {found['host']}, which is "
+                          f"already the address being polled — the device is not "
+                          f"answering our reads", flush=True)
+
         mask, payload, retries, fails = 0, [], 0, 0
         for idx in due:
             label, unit, addr, count, fc, _, _ = tiers[idx]
@@ -700,10 +856,16 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
         if mask:
             if degraded:
                 print(f"  [recovered] device answering again after "
-                      f"{consecutive_dead} dead ticks", flush=True)
+                      f"{consecutive_dead} dead ticks"
+                      + (f" at {mb.host}" if rediscoveries else ""), flush=True)
             consecutive_dead = 0
+            dead_since = None
         else:
             consecutive_dead += 1
+            # Wall clock, so the rediscovery threshold means the same thing at any
+            # cadence and across the degraded probe's much slower tick rate.
+            if dead_since is None:
+                dead_since = time.monotonic()
             if consecutive_dead == degrade_after:
                 print(f"  [degraded] {consecutive_dead} ticks with no data — "
                       f"probing with 1 block/tick until the device returns",
@@ -762,6 +924,7 @@ def main():
     duration, soak, mode = 60, False, "capture"
     outdir, rotate_minutes, keep_days = None, None, None
     fault_at = None
+    rediscover = False
     rest, i = [], 0
     while i < len(args):
         a = args[i]
@@ -777,6 +940,8 @@ def main():
             soak = True; i += 1
         elif a == "--fault-inject":
             fault_at = int(args[i + 1]); i += 2
+        elif a == "--discover":
+            rediscover = True; i += 1
         elif a in ("--baseline", "--check"):
             mode = a[2:]; i += 1
         elif a in ("-h", "--help"):
@@ -798,7 +963,7 @@ def main():
         sys.exit(0 if run_topology(mode, cfg["data_dir"], bundle, cfg) else 1)
     sys.exit(0 if capture(cfg, tiers, cfg["data_dir"], duration,
                           cfg["rotate_minutes"], soak, bundle, fault_at,
-                          cfg["keep_days"]) else 1)
+                          cfg["keep_days"], rediscover) else 1)
 
 
 if __name__ == "__main__":

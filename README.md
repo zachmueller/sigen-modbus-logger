@@ -183,7 +183,9 @@ python3 config.py --render deploy/launchd.plist.template
 |---|---|
 | `config.py` | Config loader. Also `--show`, `--sh`, `--render`. |
 | `lib.py` | Modbus transport and decode primitives. Not a CLI. Owns the conventions capture and decode must agree on. |
-| `log.py` | The logger. Tiered raw capture, topology drift detection, soak harness. |
+| `log.py` | The logger. Tiered raw capture, topology drift detection, soak harness. The only module that constructs `lib.Modbus`. |
+| `discover.py` | Finds the inverter again when its address changes: a bounded LAN sweep, then the caller's identity probe, adopting the fastest **serial match**. Deliberately not a Modbus client — see its docstring. Not a CLI. |
+| `alerts.py` | Push notifications, and the one place that knows where the credential lives. Never raises and never blocks for long: a monitoring failure must not become an outage in the thing it monitors. Not a CLI. |
 | `decode.py` | Offline decode of the raw archive into CSV/JSONL/derived series. |
 | `dump.py` | One-shot full-map decode: what every documented register returns on this unit. |
 | `serve.py` | The local web viewer: an HTTP server that plots the archive. Never opens a Modbus connection. |
@@ -195,14 +197,17 @@ python3 config.py --render deploy/launchd.plist.template
 | `web/` | The viewer's page: one HTML file, one stylesheet, three scripts — the renderer, the charts, and the tile adapter. No framework, no CDN. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
 | `regmap.json` | The register map: 358 fields, 10 alarm appendices, 6 enums. Generated, not hand-written. |
-| `bin/status.sh` | Health check: logger and viewer daemon state, recent heartbeats, gap/degraded counts, archive size. No sudo. |
+| `bin/status.sh` | Health check: all four daemons, recent heartbeats, gap/degraded counts, which address is actually being polled, archive size. No sudo. |
 | `bin/latest.sh` | Newest values, vertically. The "is it working right now?" view. No sudo. |
+| `bin/watchdog.py` | The check that pushes rather than waiting to be read. Tells "the inverter stopped answering" apart from "the capture process is stuck", and notifies on a change of state. No sudo. |
 | `bin/tunnel.sh` | Run on the *viewing* machine: SSH-forwards the viewer to `localhost`, for a laptop that cannot route to the LAN address. |
 | `deploy/install-launcher.sh` | Run on a viewing **Mac**: generates a Spotlight-launchable `.app` that opens the tunnel and the page in one keystroke. |
 | `deploy/install-daemon.sh`, `uninstall-daemon.sh` | LaunchDaemon install/removal for the logger. Needs sudo. |
 | `deploy/install-viewer.sh`, `uninstall-viewer.sh` | The same for the viewer. Separate daemon, so restarting it cannot interrupt capture. |
 | `deploy/install-sync.sh`, `uninstall-sync.sh` | The same for the uploader. A third daemon, for the same reason. Checks boto3 and the credential *as the user the daemon will run as*. |
 | `deploy/sync.plist.template` | The uploader's LaunchDaemon. `StartInterval`, not `KeepAlive`: it is a job that finishes. |
+| `deploy/install-watchdog.sh`, `uninstall-watchdog.sh` | The same for the staleness check. A fourth daemon, because a check inside the process it is checking cannot report that process being wedged. Warns rather than fails when `alert.conf` is missing or too readable. |
+| `deploy/watchdog.plist.template` | The staleness check's LaunchDaemon. `StartInterval` every 15 min against a 30-min threshold, so an alert is not a whole threshold late. |
 | `deploy/launchd.plist.template` | LaunchDaemon definition, rendered from config at install time. |
 | `deploy/viewer.plist.template` | The viewer's LaunchDaemon definition. `ProcessType: Background`, so the logger wins any contention. |
 | `deploy/launchagent.plist.template` | LaunchAgent alternative, for a host that *does* auto-login. |
@@ -322,6 +327,9 @@ Designed to run indefinitely:
   during a real outage. (Its *original* justification turned out to be a
   measurement artefact — see [docs/FINDINGS.md](docs/FINDINGS.md).) Set to 0 to
   disable.
+- **Rediscovery** (`--discover`, off by default) — after `REDISCOVER_AFTER_S` (120 s) with
+  no data, sweep the LAN for the inverter and adopt it if its **serial matches**. See
+  [Rediscovery](#rediscovery-when-the-address-changes) below.
 - **Graceful shutdown** — SIGTERM/SIGINT close the archive and join outstanding
   gzip threads rather than truncating.
 - **Heartbeat** — one line per `bucket_s` with record count, size, latency
@@ -332,6 +340,55 @@ Designed to run indefinitely:
   idle whenever `fast_period_s` is even. Percentiles are computed over ticks that
   returned data; a bucket with none says `NO DATA — device not answering` rather
   than quoting the socket timeout as a device latency.
+
+### Rediscovery: when the address changes
+
+**The failure this exists for.** On 2026-09-04 the inverter's controller lost its DHCP
+lease, came back on a different address, and an unrelated device took over the old one —
+which answered ICMP and refused every TCP port. The logger polled that address for
+**fourteen hours**. Nothing was broken in a way any check could see: the daemon was
+running, the archive was growing, and `decode.py --last` correctly reported
+`logger is HEALTHY`, because it was. The *device* was the thing that had gone.
+See [Findings 43](docs/FINDINGS.md).
+
+Enable it with `log.py --discover`. It is **off by default**, and the flag lives in the
+plist's `ProgramArguments` rather than in `config.json`, because sweeping somebody's LAN is
+not something a logger should do unless the command that started it said so.
+
+What it does, once the device has been silent for `REDISCOVER_AFTER_S` and at most once per
+`REDISCOVER_EVERY_S`:
+
+1. Open plain TCP to `port` across the /24 of the address in use **and** the /24 this host
+   is on. Both, because if the router's LAN range is what changed, the old subnet is empty
+   and the local one has the device — and if the capture host moved, the reverse.
+2. For each host that answers, read the identity block (one FC4 read of 40 registers at
+   30500) and compare the **serial number**.
+3. Adopt the **lowest-latency exact match** and log `[rediscovered]`, then notify.
+
+Three properties worth knowing, because each is a decision rather than an accident:
+
+- **No serial, no adoption.** "Something is listening on 502" is not "this is my inverter":
+  a neighbour's unit, a heat pump or a building's BMS all answer the same way. The expected
+  serial comes from the live identity read, or — the case that matters, since the device was
+  already unreachable at startup — from the newest manifest on disk. If neither knows one,
+  the search refuses to return a host and says so.
+- **Fastest match wins, not first found.** The unit answers on both its wired port and its
+  Wi-Fi module with the same serial, and the wired one is several times faster on a small
+  read. Choosing by latency lands on it without anything having to know which is which. The
+  latency comes from the probe, not from timing one cold call — that inverted the ranking
+  once already, see [Findings 44](docs/FINDINGS.md).
+- **`plan_hash` does not include the host**, so adopting an address keeps the same series
+  and the archive stays continuous. The *manifest* records the address polled and is written
+  once per day, so a mid-day adoption leaves the morning's address recorded there. That is
+  provenance only — decoding needs none of it.
+
+The address actually in use is written to `logs/logger-host`, which is what `bin/status.sh`
+reports and what distinguishes "adopted" from "as configured". `config.json` is still what a
+restart uses, so set `host` to the adopted address once you have seen it settle.
+
+Rediscovery is **not** a substitute for a DHCP reservation — it turns a multi-hour outage
+into a gap of a few minutes, but the gap is still real. Reserving the controller's address
+on the router prevents it instead.
 
 ---
 
@@ -810,10 +867,13 @@ would not return after an unattended reboot. It still runs as an ordinary user;
 nothing here needs privilege.
 
 ```
-<install_dir>/          code (rsync'd or cloned)
-<install_dir>/config.json   local config — never rsync this over
-<install_dir>/data/     archive
-<install_dir>/logs/     sigen.log, sigen.err
+<install_dir>/               code (a git clone; see "Updating the code")
+<install_dir>/config.json    local config — pushed over SSH, never committed
+<install_dir>/alert.conf     notification target, mode 600 — pushed over SSH, never committed
+<install_dir>/data/          archive
+<install_dir>/logs/          sigen.log, sigen.err, viewer.log, sync.log, watchdog.log
+<install_dir>/logs/watchdog.state   what the last check reported, so the next does not repeat it
+<install_dir>/logs/logger-host      the address actually being polled (see Rediscovery)
 ```
 
 Set `install_dir`, `run_as_user`, `launchd_label` and `python` in the target
@@ -833,6 +893,15 @@ sudo deploy/install-viewer.sh      # needs web_launchd_label and web_port in con
 sudo deploy/uninstall-viewer.sh
 ```
 
+The **staleness check** is a fourth daemon, and separate from the logger for the reason that
+matters most: a check running inside the process it is checking cannot report that process
+being wedged. Telling that apart from "the inverter stopped answering" is its whole job.
+
+```sh
+sudo deploy/install-watchdog.sh    # needs watchdog_launchd_label; warns if alert.conf is missing
+sudo deploy/uninstall-watchdog.sh
+```
+
 It runs `ProcessType: Background` and `os.nice(5)`s itself, so the logger — which is
 `Interactive` and latency-sensitive — wins any contention for CPU. `web_port` must
 be above 1024; the viewer runs as `run_as_user`, not root.
@@ -842,18 +911,45 @@ loop can't hot-spin, `ProcessType: Interactive` so macOS doesn't throttle a
 latency-sensitive polling loop, and `python3 -u` so the heartbeat isn't buffered
 away.
 
-Updating the code:
+### Updating the code: commit, push, pull
+
+**The capture host is a git clone, and code reaches it by `git pull` — never by `rsync` or
+`scp`.** Copying files in leaves the host's checkout dirty in a way that a later `git pull`
+will either clobber or conflict with, and it leaves no record of what is deployed. The
+version running is then whatever someone last copied, which is not a question git can answer
+for you afterwards.
 
 ```sh
-rsync -av --exclude __pycache__ --exclude data --exclude logs --exclude config.json \
-      ./ youruser@yourhost.local:~/sigen/
-ssh youruser@yourhost.local 'kill -TERM $(pgrep -f sigen/log.py)'
+# on your workstation
+python3 -m unittest discover -s tests     # the host is not the place to find out
+bin/leak-check.sh                          # this repository is public
+git commit && git push
+
+# on the capture host
+ssh youruser@yourhost.local 'cd ~/sigen && git pull && kill -TERM $(pgrep -f sigen/log.py)'
 ```
 
 `kill -TERM` as the owning user needs no sudo: the logger shuts down gracefully
 and `KeepAlive` respawns it with the new code within ~30 s. Verify with
 `launchctl print system/<label> | grep -E "state|runs|last exit"` — a graceful
 restart shows `last exit code = 0` and an incremented `runs`.
+
+**Two things git must not carry, and so travel over SSH instead:** `config.json` (the
+inverter's LAN address, the bucket, the username) and `alert.conf` (the notification topic,
+which is a capability — anyone holding it can read the alerts and post to them). Both are
+gitignored, and `bin/leak-check.sh` reads them to check that neither has leaked into a
+tracked file or into history.
+
+```sh
+scp config.json youruser@yourhost.local:/tmp/c && \
+  ssh youruser@yourhost.local 'install -m 600 /tmp/c ~/sigen/config.json && rm /tmp/c'
+```
+
+**A `git pull` does not reload a plist.** `launchctl kickstart -k` restarts the process using
+the job configuration launchd already has loaded, which is right for a code or `config.json`
+change and wrong for a plist change — so a change to `ProgramArguments` needs
+`launchctl bootout` then `launchctl bootstrap`, or it will appear to apply and do nothing.
+See [Findings 45](docs/FINDINGS.md).
 
 **If the change touches the block plan or `fast_period_s`**, segregate the existing
 series first, because the plan fingerprint changes and old files must keep the
@@ -874,14 +970,46 @@ presses the button.
 
 ```sh
 bin/latest.sh                          # newest record, vertical
-bin/status.sh                          # both daemons, heartbeats, archive size
+bin/status.sh                          # all daemons, heartbeats, which address is live, archive
+python3 bin/watchdog.py --dry-run      # is capture stale, and which of the device or logger
 tail -f <log_dir>/sigen.log
 tail -f <log_dir>/viewer.log           # the viewer logs errors and page loads only
+tail -f <log_dir>/watchdog.log
 python3 serve.py --check               # what the viewer sees in the archive
 ```
 
 Log lines worth grepping: `[gap]` (schedule rebase after a stall), `[degraded]`
-(device unreachable, probing), `[recovered]`, and the heartbeat.
+(device unreachable, probing), `[recovered]`, `[discover]` / `[rediscovered]` (the
+address moved), and the heartbeat.
+
+#### The watchdog: being told, rather than looking
+
+Everything above requires someone to look. On 2026-09-04 nobody did for fourteen hours, and
+none of it would have helped if they had: the daemon was up, the archive was growing, and
+`bin/status.sh` was entirely happy. `bin/watchdog.py` is the piece that pushes.
+
+It reports **two states separately**, because they have different causes and different fixes:
+
+| State | Meaning | Where to look |
+|---|---|---|
+| `DEVICE` | The logger is fine and writing empty probe records; the inverter is not answering. | The network and the inverter. This is the 2026-09-04 failure. |
+| `LOGGER` | No record of any kind is being written — the capture process itself is stuck. | The daemon and `logs/sigen.err`. |
+| `ARCHIVE` | No decodable series at all. | Whether capture has ever run here. |
+
+It computes no freshness arithmetic of its own: `series.latest()` already draws the
+data-freshness vs record-freshness distinction the whole incident turned on.
+
+Notifications go to whatever single line is in **`alert.conf`** beside `config.json` — an
+ntfy topic name or a full URL. Keep it `chmod 600`: an ntfy topic is a *capability*, not just
+a name, since anyone holding it can both read the alerts and post to them. With no
+`alert.conf` the check still runs and writes `watchdog.state` — it just has nothing to tell
+you, and says so. It notifies on a **change** of state and re-nags at most once every 6
+hours; a watchdog that pushes every run trains you to ignore it. A notification that fails to
+send does **not** count as sent, so the next run retries.
+
+```sh
+python3 bin/watchdog.py --stale-after 1   # force one real push, to prove delivery
+```
 
 ---
 
@@ -911,6 +1039,13 @@ updating.
 | `no inverter host configured` | No `config.json`, or no `host` in it. Copy `config.example.json`. |
 | `exception 2 (ILLEGAL DATA ADDRESS)` on everything | Using FC3 on `ro` registers. Use FC4. |
 | `exception 2` on one specific block | The span ends mid-field, or exceeds ~124 registers. |
+| `ping` answers but `nc -z host 502` says **connection refused** | Almost certainly not your inverter any more. A refusal is a live host with nothing listening — a different device took the DHCP lease. `bin/watchdog.py` will say `DEVICE`, and `--discover` finds it. A *timeout* instead means no host or a filter, a different diagnosis. See [Findings 43](docs/FINDINGS.md). |
+| `[discover] nothing listening on :502` | The unit really is down or off the network, not merely moved. Rediscovery is working; there is nothing to find. |
+| `[discover] ... none reported serial` | Something answers Modbus but is not this inverter. Deliberately not adopted. |
+| `[discover] no expected serial is known` | The device was unreachable at startup *and* no manifest on disk carries a serial — a new install that has never captured. Nothing is adopted until one successful capture records one. |
+| `bin/status.sh` says `polling: X <- ADOPTED` | Rediscovery moved to a new address. Capture is fine, but `config.json` still names the old one and that is what a restart uses. Set `host` to the adopted address. |
+| Watchdog says nothing while capture is clearly stale | Check `logs/watchdog.log` for `no alert.conf` — it ran and had nowhere to report to. |
+| A plist change appears to apply and does nothing | `launchctl kickstart -k` reuses the loaded job config. Use `bootout` then `bootstrap`. `launchctl print <label>` is the only thing that shows the truth. See [Findings 45](docs/FINDINGS.md). |
 | Values look absurd but read cleanly | Suspect a dtype error in the map. Sanity-check against physical bounds. |
 | Timestamps 12 h out | Decoded with `localtime` instead of `gmtime`. See device quirk 4. |
 | Heartbeat stops but daemon shows `running` | Check for `[degraded]` — device unreachable. |

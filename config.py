@@ -75,6 +75,12 @@ DEFAULTS = {
     "web_bind": "0.0.0.0",     # "127.0.0.1" to require an SSH tunnel
     "web_launchd_label": "local.sigen-viewer",
     "sync_launchd_label": "local.sigen-sync",
+    # The staleness check (bin/watchdog.py). Its own daemon, and separate from the
+    # logger for the reason that matters: a check running inside the process it is
+    # checking cannot report that process being wedged, which is one of the two states
+    # it exists to tell apart. Grouped with the labels rather than with the viewer
+    # because it is a deployment concern, not a page.
+    "watchdog_launchd_label": "local.sigen-watchdog",
     "web_default_hours": 6,
     "web_show_identity": False,
 
@@ -106,7 +112,8 @@ PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
            "launchd_label", "run_as_user", "fast_period_s",
            "web_port", "web_bind", "web_launchd_label",
-           "sync_launchd_label", "s3_bucket", "s3_prefix", "aws_profile",
+           "sync_launchd_label", "watchdog_launchd_label",
+           "s3_bucket", "s3_prefix", "aws_profile",
            # Exported so deploy/install-sync.sh can refuse to install a daemon that will
            # only ever decline to upload: sync.py exits on a false sync_enabled, so an
            # installer blind to it succeeds and then fails every five minutes into a log
@@ -220,6 +227,19 @@ def load(require_host=True, overrides=None):
                           "use something above 1024 so the viewer needs no root")
     if cfg["web_default_hours"] < 1:
         raise ConfigError("web_default_hours must be >= 1")
+    # Four daemons now, and no two may share a label. A label names a file under
+    # /Library/LaunchDaemons and is what launchctl is given, so a duplicate means the
+    # second install overwrites the first -- the logger quietly becoming the uploader,
+    # or the watchdog replacing the thing it is supposed to watch. Checked here rather
+    # than in the installers because all four of them would otherwise have to.
+    label_keys = ("launchd_label", "web_launchd_label", "sync_launchd_label",
+                  "watchdog_launchd_label")
+    labels = [cfg[k] for k in label_keys]
+    if len(set(labels)) != len(labels):
+        raise ConfigError(
+            "launchd labels must all differ; they name four separate files under "
+            "/Library/LaunchDaemons. Got "
+            + ", ".join(f"{k}={cfg[k]!r}" for k in label_keys))
     if cfg["s3_prefix"] and not cfg["s3_prefix"].endswith("/"):
         # Otherwise every key would be "rawplan=..." -- a silently wrong prefix rather
         # than an error, and the ingest Lambda would never see the files.
@@ -254,6 +274,7 @@ def render(cfg, template):
         "@LABEL@": cfg["launchd_label"],
         "@WEB_LABEL@": cfg["web_launchd_label"],
         "@SYNC_LABEL@": cfg["sync_launchd_label"],
+        "@WATCHDOG_LABEL@": cfg["watchdog_launchd_label"],
         "@PYTHON@": cfg["python"],
         "@INSTALL_DIR@": cfg["install_dir"],
         "@DATA_DIR@": cfg["data_dir"],

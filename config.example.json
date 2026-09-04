@@ -42,5 +42,8 @@
  "s3_prefix": "raw/",
  "aws_profile": null,
  "sync_enabled": false,
- "sync_launchd_label": "local.sigen-sync"
+ "sync_launchd_label": "local.sigen-sync",
+
+ "__watching": "bin/watchdog.py, the check that notices capture has stopped and PUSHES rather than waiting to be read. Its own daemon, because a check running inside the process it is checking cannot report that process being wedged -- and telling that apart from 'the inverter stopped answering' is the whole job. All four launchd labels must differ; config.py refuses duplicates. There is deliberately nothing here for the notification target or for rediscovery. The target lives in alert.conf beside this file, mode 600 and gitignored, because an ntfy topic is a capability rather than a name -- anyone holding it can read the alerts and post to them -- and this repository is public; see alerts.py. Rediscovery is a `log.py --discover` flag on the daemon's ProgramArguments, not a setting, because a LAN sweep is not something a logger should do to somebody's network unless the command that started it said so. The staleness threshold is likewise `bin/watchdog.py --stale-after`, in deploy/watchdog.plist.template. See FINDINGS 43.",
+ "watchdog_launchd_label": "local.sigen-watchdog"
 }

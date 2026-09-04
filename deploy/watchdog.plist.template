@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The staleness check, rendered by deploy/install-watchdog.sh via `config.py --render`.
+     Do not install this file directly: the placeholders are filled from config.json.
+
+     A fourth daemon, separate from the logger for the reason that matters most here: a
+     check that runs inside the process it is checking cannot report that process being
+     wedged, and telling that apart from "the inverter stopped answering" is the whole
+     job. The latter is what happened on 2026-09-04 -- fourteen hours during which the
+     daemon was running, the archive was growing, and nothing said a word. See
+     docs/FINDINGS.md 43.
+
+     StartInterval rather than KeepAlive: this is a job that finishes. It reads the tail
+     of the newest archive files, decides, maybe sends one notification, and exits.
+     Fifteen minutes against a 30-minute staleness threshold, so the alert arrives
+     promptly once the threshold is crossed rather than up to a whole threshold late.
+
+     It opens no connection to the inverter. It reads the archive on disk and POSTs to
+     the notification target in alert.conf, and nothing else. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>@WATCHDOG_LABEL@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@PYTHON@</string>
+		<!-- -u so the one line it prints lands in the log as it happens -->
+		<string>-u</string>
+		<string>@INSTALL_DIR@/bin/watchdog.py</string>
+		<string>--stale-after</string>
+		<string>1800</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>@INSTALL_DIR@</string>
+	<!-- Left true even though a cold start reads as stale for at most one interval: the
+	     check is read-only, and "no data yet" is a truthful thing for it to say. -->
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<!-- Run as a normal user, not root. It reads the archive and alert.conf, both of
+	     which are the invoking user's, and needs no privilege beyond that. -->
+	<key>UserName</key>
+	<string>@USER@</string>
+	<!-- Background, NOT Interactive: the logger is the latency-sensitive process on this
+	     host and must win any contention, including for the disk this check reads. -->
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>@LOG_DIR@/watchdog.log</string>
+	<key>StandardErrorPath</key>
+	<string>@LOG_DIR@/watchdog.err</string>
+</dict>
+</plist>
