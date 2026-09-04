@@ -217,7 +217,9 @@ python3 config.py --render deploy/systemd/sigen-logger.service.template
 |---|---|
 | `config.py` | Config loader. Also `--show`, `--sh`, `--render`. |
 | `lib.py` | Modbus transport and decode primitives. Not a CLI. Owns the conventions capture and decode must agree on. |
-| `log.py` | The logger. Tiered raw capture, topology drift detection, soak harness. |
+| `log.py` | The logger. Tiered raw capture, topology drift detection, soak harness. The only module that constructs `lib.Modbus`. |
+| `discover.py` | Finds the inverter again when its address changes: a bounded LAN sweep, then the caller's identity probe, adopting the fastest **serial match**. Deliberately not a Modbus client — see its docstring. Not a CLI. |
+| `alerts.py` | Push notifications, and the one place that knows where the credential lives. Never raises and never blocks for long: a monitoring failure must not become an outage in the thing it monitors. Not a CLI. |
 | `decode.py` | Offline decode of the raw archive into CSV/JSONL/derived series. |
 | `dump.py` | One-shot full-map decode: what every documented register returns on this unit. |
 | `sync.py` | Copies rotated archive files to S3. The one module that needs `boto3`, imported lazily inside it. Off unless `sync_enabled` — and on a capture host it is the only path the data has. |
@@ -229,18 +231,20 @@ python3 config.py --render deploy/systemd/sigen-logger.service.template
 | `web/` | The page: one HTML file, one stylesheet, three scripts — the renderer, the charts, and the tile adapter. Published by the site stack. No framework, no CDN. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
 | `regmap.json` | The register map: 358 fields, 10 alarm appendices, 6 enums. Generated, not hand-written. |
-| `bin/status.sh` | Health check: clock sync, both units, recent heartbeats, gap/degraded counts, the uploader's timer, archive size, free space. No sudo. |
+| `bin/status.sh` | Health check: clock sync, all three units, recent heartbeats, gap/degraded counts, the timers, which address is actually being polled, archive size, free space. No sudo. |
 | `bin/latest.sh` | Newest values, vertically. The "is it working right now?" view. No sudo. |
+| `bin/watchdog.py` | The check that pushes rather than waiting to be read. Tells "the inverter stopped answering" apart from "the capture process is stuck", and notifies on a change of state. No sudo. |
 | `bin/leak-check.sh` | Run before every push: does anything installation-specific appear in a tracked file, now or in history? |
-| `deploy/systemd/*.template` | The two units and the uploader's timer, rendered from config at install time. |
+| `deploy/systemd/*.template` | The three units and the two timers, rendered from config at install time. |
 | `deploy/systemd/install-logger.sh`, `uninstall-logger.sh` | Unit install/removal for the logger. Verifies the rendered unit *before* installing it. Needs sudo. |
 | `deploy/systemd/install-sync.sh`, `uninstall-sync.sh` | The same for the uploader's service and timer. Checks boto3 and the credential *as the user the unit will run as*. |
+| `deploy/systemd/install-watchdog.sh`, `uninstall-watchdog.sh` | The same for the staleness check. Warns rather than fails when `alert.conf` is missing or too readable — a check that cannot tell you anything is worth installing loudly, not quietly. |
 | `deploy/systemd/_lib.sh` | The render → verify → install → enable → prove-it sequence both installers share. |
 | `deploy/pi/bootstrap.sh` | Runs **on the Pi**: packages, timezone, the clock, flash-wear settings, the watchdog, logrotate, the units. The one description of a configured host. |
 | `deploy/pi/provision.sh` | Runs **on your workstation**: rsyncs the code, pushes `config.json` and one AWS profile over SSH, then runs `bootstrap.sh`. Idempotent; re-running is how you deploy a change. |
 | `deploy/pi/sanitize.sh` | Runs **on the Pi** before capturing a golden image: removes both secrets, the archive, the SSH host keys and the machine id, then zero-fills free space. |
 | `deploy/pi/capture-image.sh` | Runs **on macOS**: reads a sanitized drive to a compressed `.img.xz`. The one script here that can destroy something, so it refuses anything that is not external and makes you type the disk id twice. |
-| `deploy/pi/logrotate.sigen` | Rotation for the two log files. `copytruncate`, because systemd holds them open. |
+| `deploy/pi/logrotate.sigen` | Rotation for the log files. `copytruncate`, because systemd holds them open. |
 | `tests/test_offline.py` | The whole capture/decode path against a fake device. No hardware, no network. Also the config loader and the unit templates. |
 | `tests/test_web.py` | The read side: aggregation, health, tiles, ingest, the uploader's ledger. Asserts none of it can become a second Modbus client. Also the cloud and page contracts, at source level, since there is no JS harness. |
 | `docs/FINDINGS.md` | Every bug this project has found, what made each one quiet, and the rule it produced. Referenced by number from the code. |
@@ -359,6 +363,9 @@ Designed to run indefinitely:
   during a real outage. (Its *original* justification turned out to be a
   measurement artefact — see [docs/FINDINGS.md](docs/FINDINGS.md).) Set to 0 to
   disable.
+- **Rediscovery** (`--discover`, off by default) — after `REDISCOVER_AFTER_S` (120 s) with
+  no data, sweep the LAN for the inverter and adopt it if its **serial matches**. See
+  [Rediscovery](#rediscovery-when-the-address-changes) below.
 - **Graceful shutdown** — SIGTERM/SIGINT close the archive and join outstanding
   gzip threads rather than truncating.
 - **Heartbeat** — one line per `bucket_s` with record count, size, latency
@@ -369,6 +376,53 @@ Designed to run indefinitely:
   idle whenever `fast_period_s` is even. Percentiles are computed over ticks that
   returned data; a bucket with none says `NO DATA — device not answering` rather
   than quoting the socket timeout as a device latency.
+
+### Rediscovery: when the address changes
+
+**The failure this exists for.** On 2026-09-04 the inverter's controller lost its DHCP
+lease, came back on a different address, and an unrelated device took over the old one —
+which answered ICMP and refused every TCP port. The logger polled that address for
+**fourteen hours**. Nothing was broken in a way any check could see: the daemon was
+running, the archive was growing, and `decode.py --last` correctly reported
+`logger is HEALTHY`, because it was. The *device* was the thing that had gone.
+
+Enable it with `log.py --discover`. It is **off by default**, and the flag lives on the
+unit's `ExecStart` rather than in `config.json`, because sweeping somebody's LAN is not
+something a logger should do unless the command that started it said so.
+
+What it does, once the device has been silent for `REDISCOVER_AFTER_S` and at most once per
+`REDISCOVER_EVERY_S`:
+
+1. Open plain TCP to `port` across the /24 of the address in use **and** the /24 this host
+   is on. Both, because if the router's LAN range is what changed, the old subnet is empty
+   and the local one has the device — and if the capture host moved, the reverse.
+2. For each host that answers, read the identity block (one FC4 read of 40 registers at
+   30500) and compare the **serial number**.
+3. Adopt the **lowest-latency exact match** and log `[rediscovered]`, then notify.
+
+Three properties worth knowing, because each one is a decision rather than an accident:
+
+- **No serial, no adoption.** "Something is listening on 502" is not "this is my inverter":
+  a neighbour's unit, a heat pump or a building's BMS all answer the same way. The expected
+  serial comes from the live identity read, or — the case that matters, since the device was
+  already unreachable at startup — from the newest manifest on disk. If neither knows one,
+  the search refuses to return a host and says so.
+- **Fastest match wins, not first found.** The unit answers on both its wired port and its
+  Wi-Fi module with the same serial, and the wired one is several times faster. Choosing by
+  latency lands on it without anything having to know which address is which.
+- **`plan_hash` does not include the host**, so adopting an address keeps the same series
+  and the archive stays continuous. The *manifest* records the address polled and is written
+  once per day, so a mid-day adoption leaves the morning's address recorded there. That is
+  provenance only — decoding needs none of it.
+
+The address actually in use is written to `logs/logger-host`, which is what
+`bin/status.sh` reports and what distinguishes "adopted" from "as configured".
+`config.json` is still what a restart uses, so set `host` to the adopted address once you
+have seen it settle.
+
+Rediscovery is **not** a substitute for a DHCP reservation — it turns a multi-hour outage
+into a gap of a few minutes, but the gap is still real. Reserving the controller's address
+on the router prevents it instead.
 
 ---
 
@@ -749,16 +803,20 @@ Nothing here needs privilege, and the host listens on nothing but SSH.
 <install_dir>/               code (rsync'd by provision.sh)
 <install_dir>/config.json    local config — pushed separately, never rsync'd over
 <install_dir>/data/          archive: the open .bin, rotated .bin.gz, manifests, .uploaded.json
-<install_dir>/logs/          sigen.log, sigen.err, sync.log, sync.err
+<install_dir>/logs/          sigen.log, sigen.err, sync.log, sync.err, watchdog.log, watchdog.err
+<install_dir>/logs/watchdog.state   what the last check reported, so the next one does not repeat it
+<install_dir>/logs/logger-host      the address actually being polled (see Rediscovery)
+<install_dir>/alert.conf     notification target, mode 600 — pushed separately, never rsync'd
 ~/.aws/credentials           one profile, PutObject only — pushed separately
 ```
 
-### The two units
+### The three units
 
 | Unit | What it is | Why it is its own unit |
 |---|---|---|
-| `sigen-logger.service` | `log.py --seconds 0`, `Restart=always`, `Nice=-5` | The latency-sensitive one. It must win contention and nothing may be able to restart it as a side effect. |
+| `sigen-logger.service` | `log.py --seconds 0 --discover`, `Restart=always`, `Nice=-5` | The latency-sensitive one. It must win contention and nothing may be able to restart it as a side effect. |
 | `sigen-sync.timer` → `sigen-sync.service` | `sync.py --once`, `Type=oneshot`, every 5 minutes | A job that finishes, not a daemon. Separate so restarting the uploader cannot interrupt capture; it reads rotated files and writes only its own ledger. |
+| `sigen-watchdog.timer` → `sigen-watchdog.service` | `bin/watchdog.py --stale-after 1800`, `Type=oneshot`, every 15 minutes | Separate from the logger for the reason that matters: **a check inside the process it is checking cannot report that process being wedged.** Distinguishing that from "the inverter stopped answering" is the whole job. |
 
 Four details in those units are load-bearing:
 
@@ -899,11 +957,13 @@ the identifier a second time.
 ### Monitoring
 
 ```sh
-bin/status.sh                          # clock, both units, heartbeats, timer, archive, free space
+bin/status.sh                          # clock, all three units, heartbeats, timers, archive, space
 bin/latest.sh                          # newest record, vertical
 python3 sync.py --status               # uploaded, pending, stranded, when it last ran
+python3 bin/watchdog.py --dry-run      # is capture stale, and which of the device or logger
 tail -f <log_dir>/sigen.log
 tail -f <log_dir>/sync.log
+tail -f <log_dir>/watchdog.log
 ```
 
 `bin/status.sh` reports the clock **first**, above everything the clock dates, and every
@@ -911,11 +971,46 @@ section states an absence rather than printing an empty heading — an inactive 
 start condition simply did not hold is not a failure, and it says which.
 
 Log lines worth grepping: `[gap]` (schedule rebase after a stall), `[degraded]` (device
-unreachable, probing), `[recovered]`, and the heartbeat.
+unreachable, probing), `[recovered]`, `[discover]` / `[rediscovered]` (the address moved),
+and the heartbeat.
 
 **The real monitor is the hosted page.** With no local viewer, "is it working?" is answered by
 `agg/latest.json`'s `record_ts` advancing — which covers the logger and the uploader together.
 `bin/status.sh` is what tells you which of the two stopped when it does not.
+
+### The watchdog: being told, rather than looking
+
+Everything above requires someone to look. On 2026-09-04 nobody did for fourteen hours, and
+none of it would have helped if they had not: the daemon was up, the archive was growing, and
+`bin/status.sh` was entirely happy. `bin/watchdog.py` is the piece that pushes.
+
+```sh
+python3 bin/watchdog.py --dry-run        # what it would say, sending nothing
+python3 bin/watchdog.py --stale-after 1  # force one real notification, to prove delivery
+```
+
+It reports **two states separately**, because they have different causes and different fixes:
+
+| State | Meaning | Where to look |
+|---|---|---|
+| `DEVICE` | The logger is fine and writing empty probe records; the inverter is not answering. | The network and the inverter. This is the 2026-09-04 failure. |
+| `LOGGER` | No record of any kind is being written — the capture process itself is stuck. | The daemon and `logs/sigen.err`. |
+| `ARCHIVE` | No decodable series at all. | Whether capture has ever run here. |
+
+It computes no freshness arithmetic of its own: `series.latest()` already draws the
+data-freshness vs record-freshness distinction the whole incident turned on, and it is what
+the hosted page reads, so a second implementation could disagree with the page.
+
+Notifications go to whatever single line is in **`alert.conf`** beside `config.json` — an
+ntfy topic name or a full URL. Keep it `chmod 600`: an ntfy topic is a *capability*, not just
+a name, since anyone holding it can both read the alerts and post to them. It is gitignored,
+and `bin/leak-check.sh` reads it to add the topic to the patterns it scans the tree and
+history for. With no `alert.conf` the check still runs and still writes `watchdog.state` —
+it just has nothing to tell you, and says so.
+
+It notifies on a **change** of state and re-nags at most once every 6 hours. A watchdog that
+pushes on every run trains you to ignore it, which is the same outcome as not having one. A
+notification that fails to send does **not** count as sent, so the next run retries.
 
 ---
 
@@ -969,6 +1064,13 @@ updating.
 | `latest.sh` age bounces around over repeated runs | Empty probe records land every ~35 s during an outage, so record age sawtooths. `--last` labels this explicitly as DEVICE NOT ANSWERING. |
 | Flood of `[gap]` lines, `retries` climbing | The device is unreachable. Confirm with `ping` / `nc -z host 502`. Expected during installer work or a power-down; capture resumes by itself. |
 | `[degraded]` with no `[recovered]` | Still unreachable. Empty records (mask 0) continue to mark the outage in the archive. |
+| `ping` answers but `nc -z host 502` says **connection refused** | Almost certainly not your inverter any more. A refusal is a live host with nothing listening — a different device took the DHCP lease. Sweep for it: `bin/watchdog.py` will say `DEVICE`, and `--discover` finds it. A *timeout* instead means no host or a filter, which is a different diagnosis. |
+| `[discover] nothing listening on :502` | The unit really is down or off the network, not merely moved. Rediscovery is working; there is nothing to find. |
+| `[discover] ... none reported serial` | Something answers Modbus but is not this inverter. Deliberately not adopted. |
+| `[discover] no expected serial is known` | The device was unreachable at startup *and* no manifest on disk carries a serial — a brand-new install that has never captured. Nothing will be adopted until one successful capture records one. |
+| `bin/status.sh` says `polling: X <- ADOPTED` | Rediscovery moved to a new address. Capture is fine, but `config.json` still names the old one and that is what a restart uses. Set `host` to the adopted address. |
+| Watchdog notifies `DEVICE` but the page looks fine | The page lags by up to the rotation interval. The watchdog reads the local archive and is the earlier signal of the two. |
+| Watchdog says nothing while capture is clearly stale | Check `logs/watchdog.log` for `no alert.conf` — the check ran and had nowhere to report to. Also confirm the timer, not just the service, is enabled. |
 | Heartbeat silent but records accumulating | Only possible if `bucket_s` and `fast_period_s` interact badly. Emission is on bucket transition. |
 | The page's newest data is up to an hour old | Expected. Tiles appear when the logger rotates. Nothing in the page can ask for newer — reload the browser. |
 | The page says the logger **or the uploader** may have stopped | It cannot tell which: `record_ts` only advances on rotation, so both look the same from there. `bin/status.sh` on the Pi distinguishes them. |

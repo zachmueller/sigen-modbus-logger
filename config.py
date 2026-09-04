@@ -59,6 +59,11 @@ DEFAULTS = {
     "python": "/usr/bin/python3",
     "logger_unit": "sigen-logger",
     "sync_unit": "sigen-sync",
+    # Three daemons now: capture, upload, and the thing that notices capture has stopped.
+    # The watchdog is separate from the logger deliberately -- a check that runs inside
+    # the process it is checking cannot report that process being wedged, which is one of
+    # the two states it exists to distinguish.
+    "watchdog_unit": "sigen-watchdog",
     "run_as_user": None,       # required by deploy/systemd/install-logger.sh
 
     # --- capture tuning ---------------------------------------------------
@@ -107,7 +112,7 @@ PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 
 # Keys exported to sh by --sh, as SIGEN_<UPPER>.
 SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
-           "logger_unit", "sync_unit", "run_as_user", "fast_period_s",
+           "logger_unit", "sync_unit", "watchdog_unit", "run_as_user", "fast_period_s",
            "s3_bucket", "s3_prefix", "aws_profile",
            # Exported so deploy/systemd/install-sync.sh can refuse to install a unit that
            # will only ever decline to upload: sync.py exits on a false sync_enabled, so an
@@ -221,10 +226,13 @@ def load(require_host=True, overrides=None):
     # because both of them would have to check it, and a second uploader scanning the
     # same archive -- or a unit file overwritten by the other daemon's -- is the kind
     # of collision that only shows up as a puzzle later.
-    if cfg["logger_unit"] == cfg["sync_unit"]:
-        raise ConfigError(f"logger_unit and sync_unit are both {cfg['logger_unit']!r}; "
-                          "they name two unit files and must differ")
-    for key in ("logger_unit", "sync_unit"):
+    unit_keys = ("logger_unit", "sync_unit", "watchdog_unit")
+    names = [cfg[k] for k in unit_keys]
+    if len(set(names)) != len(names):
+        raise ConfigError(
+            "logger_unit, sync_unit and watchdog_unit name three unit files and must "
+            f"all differ; got {', '.join(f'{k}={cfg[k]!r}' for k in unit_keys)}")
+    for key in unit_keys:
         # systemd derives the unit filename from this, so a name with a slash or a
         # suffix would install somewhere nobody looks. Refuse it here, where the
         # message can say why, rather than in `systemd-analyze verify`.
@@ -264,6 +272,7 @@ def render(cfg, template):
     subs = {
         "@LOGGER_UNIT@": cfg["logger_unit"],
         "@SYNC_UNIT@": cfg["sync_unit"],
+        "@WATCHDOG_UNIT@": cfg["watchdog_unit"],
         "@PYTHON@": cfg["python"],
         "@INSTALL_DIR@": cfg["install_dir"],
         "@DATA_DIR@": cfg["data_dir"],

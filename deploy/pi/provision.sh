@@ -4,7 +4,7 @@
 # Run this ON YOUR WORKSTATION, not on the Pi:
 #
 #   deploy/pi/provision.sh pi@sigen-pi.local                  # code + secrets + bootstrap
-#   deploy/pi/provision.sh --config-only pi@sigen-pi.local    # the two secrets, then restart
+#   deploy/pi/provision.sh --config-only pi@sigen-pi.local    # the secrets, then restart
 #   deploy/pi/provision.sh --code-only   pi@sigen-pi.local    # the code + bootstrap, then restart
 #
 # Idempotent. Re-running is how you deploy a change: it rsyncs, re-runs bootstrap.sh, and
@@ -19,6 +19,8 @@
 # WHAT COUNTS AS A SECRET HERE, and why they travel over SSH rather than in the image:
 #   config.json         the inverter's LAN address, the bucket, the username
 #   ~/.aws/credentials  an access key for the PutObject-only logger IAM user
+#   alert.conf          the notification topic -- a capability, not a name: anyone holding it
+#                       can read the alerts and post to them. Optional; skipped if absent.
 # The image's boot partition is FAT32 and readable by anything it is plugged into, so
 # nothing sensitive is ever written there.
 set -e
@@ -76,6 +78,7 @@ if [ "$CODE" = 1 ]; then
   # the config, which is per-host and pushed separately below.
   rsync -a --delete --info=stats1 \
     --exclude 'config.json' \
+    --exclude 'alert.conf' \
     --exclude 'data/' \
     --exclude 'logs/' \
     --exclude '__pycache__/' \
@@ -96,6 +99,18 @@ if [ "$SECRETS" = 1 ]; then
   ssh "$TARGET" "install -m 600 /tmp/sigen-config.json '$REMOTE_DIR/config.json' \
                  && rm -f /tmp/sigen-config.json"
   echo "  config.json (mode 600)"
+
+  # Optional, unlike the other two: a host with no alert.conf still runs the watchdog and
+  # still writes watchdog.state, it just has nothing to notify. Absent is a valid state, so
+  # this says which rather than failing.
+  if [ -f alert.conf ]; then
+    scp -q alert.conf "$TARGET:/tmp/sigen-alert.conf"
+    ssh "$TARGET" "install -m 600 /tmp/sigen-alert.conf '$REMOTE_DIR/alert.conf' \
+                   && rm -f /tmp/sigen-alert.conf"
+    echo "  alert.conf (mode 600)"
+  else
+    echo "  alert.conf: none here, so the watchdog on that host will have nowhere to report"
+  fi
 
   if [ -n "$SIGEN_AWS_PROFILE" ]; then
     # Only the one profile, not the whole credentials file: this Mac's ~/.aws also holds the

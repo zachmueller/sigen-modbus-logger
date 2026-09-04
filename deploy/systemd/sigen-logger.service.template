@@ -31,7 +31,12 @@ Type=simple
 User=@USER@
 WorkingDirectory=@INSTALL_DIR@
 # -u or stdout buffering hides the 5-minute heartbeat entirely.
-ExecStart=@PYTHON@ -u @INSTALL_DIR@/log.py --seconds 0 --out @DATA_DIR@
+# --discover: when the device stops answering, sweep the LAN and adopt the fastest host
+# whose SERIAL matches. It is a flag rather than a config key because sweeping a network
+# is something the command that starts the logger should have to say out loud. Without it,
+# a DHCP lease moving the inverter is a silent outage until someone looks -- which on
+# 2026-09-04 took fourteen hours. See discover.py and the README.
+ExecStart=@PYTHON@ -u @INSTALL_DIR@/log.py --seconds 0 --out @DATA_DIR@ --discover
 
 Restart=always
 # So a crash loop cannot hot-spin. The launchd plist called this ThrottleInterval.

@@ -14,9 +14,11 @@ plausible-looking wrong numbers rather than an error. These tests assert the
 things that would fail quietly.
 """
 import gzip
+import importlib.util
 import io
 import json
 import os
+import shutil
 import struct
 import sys
 import tempfile
@@ -26,11 +28,24 @@ from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import alerts          # noqa: E402
 import config          # noqa: E402
 import decode          # noqa: E402
+import discover        # noqa: E402
 import dump            # noqa: E402
 import lib             # noqa: E402
 import log             # noqa: E402
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_watchdog():
+    """bin/watchdog.py as a module. It is a script, not an importable package path."""
+    spec = importlib.util.spec_from_file_location(
+        "sigen_watchdog", os.path.join(REPO, "bin", "watchdog.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 # The plan hash of the shipped default block plan. Frozen deliberately: every
 # archive file and manifest already written carries it in its filename, and
@@ -90,8 +105,13 @@ class DeadModbus(FakeModbus):
     reports a constant 0.0 and so never exercised that path.
     """
 
-    def __init__(self, *a, **kw):
+    def __init__(self, host=None, port=502, timeout=6.0):
         super().__init__()          # stands in for Modbus(host, port, timeout_s)
+        # The real Modbus keeps the address it was constructed with, and rediscovery
+        # works by mutating it. Swallowing it here left mb.host reading "fake", which
+        # hid the very distinction "did we adopt a different address?" depends on.
+        if host is not None:
+            self.host = host
 
     def read(self, unit, addr, count, fc, retries=2):
         raise IOError("connection refused")
@@ -644,14 +664,20 @@ class TestConfig(unittest.TestCase):
         out = ArchiveFixture.capture_stdout(config.emit_sh, config.load())
         self.assertIn("SIGEN_LOGGER_UNIT=sigen-logger", out)
         self.assertIn("SIGEN_SYNC_UNIT=sigen-sync", out)
+        self.assertIn("SIGEN_WATCHDOG_UNIT=sigen-watchdog", out)
 
-    def test_two_units_may_not_be_one(self):
-        # They name two files under /etc/systemd/system. One name means the second install
-        # overwrites the first, and the logger quietly becomes an uploader.
-        self.write({"host": "h", "logger_unit": "same", "sync_unit": "same"})
-        with self.assertRaises(SystemExit) as cm:
-            config.load()
-        self.assertIn("must differ", str(cm.exception))
+    def test_no_two_units_may_be_one(self):
+        # They name three files under /etc/systemd/system. A shared name means the second
+        # install overwrites the first, and the logger quietly becomes an uploader.
+        # Every pair, not just the first: adding the watchdog is exactly the change that
+        # could have left a new collision unchecked.
+        for a, b in (("logger_unit", "sync_unit"),
+                     ("logger_unit", "watchdog_unit"),
+                     ("sync_unit", "watchdog_unit")):
+            self.write({"host": "h", a: "same", b: "same"})
+            with self.assertRaises(SystemExit) as cm:
+                config.load()
+            self.assertIn("must all differ", str(cm.exception), f"{a} vs {b}")
 
     def test_a_unit_name_may_not_carry_a_path_or_a_suffix(self):
         # systemd derives the filename from this, so either would install somewhere nobody
@@ -688,7 +714,7 @@ class TestConfig(unittest.TestCase):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         d = os.path.join(here, "deploy", "systemd")
         templates = sorted(f for f in os.listdir(d) if f.endswith(".template"))
-        self.assertEqual(len(templates), 3, "a template was added or removed")
+        self.assertEqual(len(templates), 5, "a template was added or removed")
         for name in templates:
             text = config.render(config.load(), os.path.join(d, name))
             self.assertNotIn("@", text, f"{name} has an unsubstituted token")
@@ -722,12 +748,531 @@ class TestReadOnly(unittest.TestCase):
     def test_no_source_file_issues_a_write_function_code(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for name in ("lib.py", "log.py", "dump.py", "decode.py", "series.py",
-                     "tiles.py", "ingest.py", "sync.py"):
+                     "tiles.py", "ingest.py", "sync.py", "discover.py", "alerts.py"):
             with open(os.path.join(here, name)) as fh:
                 src = fh.read()
             for fc in (" 5,", " 6,", " 15,", " 16,"):
                 self.assertNotIn(f"fc={fc.strip().rstrip(',')}", src,
                                  f"{name} may be issuing a Modbus write")
+
+
+class TestSweepTargets(unittest.TestCase):
+    """Which addresses a rediscovery sweep will try, and in what order."""
+
+    def test_hints_are_tried_first_and_in_order(self):
+        targets = discover.sweep_targets(["10.0.0.9", "10.0.0.4"])
+        self.assertEqual(targets[:2], ["10.0.0.9", "10.0.0.4"])
+
+    def test_both_the_old_subnet_and_the_local_one_are_covered(self):
+        """If the router's LAN range is what changed, the old /24 is empty.
+
+        Searching only the hint's subnet would find nothing and give no clue why.
+        """
+        real = discover.local_ipv4
+        discover.local_ipv4 = lambda: "192.168.9.20"
+        self.addCleanup(lambda: setattr(discover, "local_ipv4", real))
+        targets = discover.sweep_targets(["10.0.0.4"])
+        self.assertIn("10.0.0.77", targets)
+        self.assertIn("192.168.9.77", targets)
+
+    def test_broadcast_network_and_self_are_never_probed(self):
+        real = discover.local_ipv4
+        discover.local_ipv4 = lambda: "10.0.0.20"
+        self.addCleanup(lambda: setattr(discover, "local_ipv4", real))
+        targets = discover.sweep_targets(["10.0.0.4"])
+        self.assertNotIn("10.0.0.0", targets)
+        self.assertNotIn("10.0.0.255", targets)
+        self.assertNotIn("10.0.0.20", targets, "we are not the inverter")
+
+    def test_a_malformed_hint_does_not_produce_a_garbage_subnet(self):
+        real = discover.local_ipv4
+        discover.local_ipv4 = lambda: None
+        self.addCleanup(lambda: setattr(discover, "local_ipv4", real))
+        self.assertEqual(discover.sweep_targets(["not-an-ip"]), ["not-an-ip"])
+
+
+class DiscoverFixture(unittest.TestCase):
+    """discover.find() with the port sweep stubbed out. No sockets are opened."""
+
+    def stub_listeners(self, hosts):
+        real = discover.listeners
+        discover.listeners = lambda targets, port, **kw: list(hosts)
+        self.addCleanup(lambda: setattr(discover, "listeners", real))
+
+    @staticmethod
+    def probe_from(table):
+        """table: {host: serial or Exception}. Latency comes from dict order."""
+        def probe(host):
+            v = table[host]
+            if isinstance(v, Exception):
+                raise v
+            time.sleep(0.01 * (list(table).index(host) + 1))
+            return v
+        return probe
+
+
+class TestFindRefusesWithoutAKnownSerial(DiscoverFixture):
+    """The safety property: no serial, no adoption.
+
+    "Something is listening on 502" is not "this is my inverter" -- a neighbour's unit
+    answers identically, and adopting it would record someone else's plant into an
+    archive claiming to be this one's, looking entirely healthy while doing it.
+    """
+
+    def test_no_serial_means_no_host_and_a_stated_reason(self):
+        self.stub_listeners(["10.0.0.5"])
+        said = []
+        for empty in (None, ""):
+            self.assertIsNone(discover.find(empty, self.probe_from({}),
+                                            log=said.append))
+        self.assertTrue(any("refusing to adopt" in s for s in said))
+
+    def test_the_probe_is_never_even_called_without_a_serial(self):
+        def explode(_host):
+            raise AssertionError("probed the LAN with nothing to compare against")
+        self.stub_listeners(["10.0.0.5"])
+        self.assertIsNone(discover.find(None, explode))
+
+
+class TestFindPicksTheFastestMatch(DiscoverFixture):
+    def test_the_wired_interface_wins_over_the_wireless_one(self):
+        """The unit answers on both its Ethernet port and its Wi-Fi module with the
+        same serial. Picking by latency lands on the wired one without anything here
+        having to know which address is which."""
+        self.stub_listeners(["10.0.0.13", "10.0.0.15"])
+        probe = self.probe_from({"10.0.0.15": "SN1", "10.0.0.13": "SN1"})
+        found = discover.find("SN1", probe, log=lambda _s: None)
+        self.assertEqual(found["host"], "10.0.0.15")
+        self.assertEqual(len(found["matches"]), 2)
+        self.assertLess(found["matches"][0][1], found["matches"][1][1])
+
+    def test_a_different_serial_is_reported_but_never_adopted(self):
+        self.stub_listeners(["10.0.0.7", "10.0.0.15"])
+        probe = self.probe_from({"10.0.0.7": "SOMEONE-ELSE", "10.0.0.15": "SN1"})
+        said = []
+        found = discover.find("SN1", probe, log=said.append)
+        self.assertEqual(found["host"], "10.0.0.15")
+        self.assertEqual([h for h, _ in found["matches"]], ["10.0.0.15"])
+        self.assertTrue(any("not ours" in s for s in said),
+                        "a second, different inverter on the LAN must be logged loudly")
+
+    def test_no_match_returns_none_and_says_how_many_were_listening(self):
+        self.stub_listeners(["10.0.0.7"])
+        said = []
+        self.assertIsNone(discover.find("SN1", self.probe_from({"10.0.0.7": "OTHER"}),
+                                        log=said.append))
+        self.assertTrue(any("none reported serial" in s for s in said))
+
+    def test_nothing_listening_returns_none(self):
+        self.stub_listeners([])
+        said = []
+        self.assertIsNone(discover.find("SN1", self.probe_from({}), log=said.append))
+        self.assertTrue(any("nothing listening" in s for s in said))
+
+    def test_a_probe_that_raises_does_not_abort_the_search(self):
+        """One unreachable host among several must not cost us the one that answers."""
+        self.stub_listeners(["10.0.0.7", "10.0.0.15"])
+        probe = self.probe_from({"10.0.0.7": IOError("refused"), "10.0.0.15": "SN1"})
+        found = discover.find("SN1", probe, log=lambda _s: None)
+        self.assertEqual(found["host"], "10.0.0.15")
+
+
+class TestHostStateFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sigen-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_round_trips_and_tolerates_absence(self):
+        self.assertIsNone(discover.read_host_state(self.tmp))
+        discover.write_host_state(self.tmp, "10.0.0.15")
+        self.assertEqual(discover.read_host_state(self.tmp), "10.0.0.15")
+
+    def test_writing_never_raises_on_a_bad_path(self):
+        discover.write_host_state(None, "10.0.0.15")
+        discover.write_host_state(os.path.join(self.tmp, "x\x00y"), "10.0.0.15")
+
+
+class TestKnownSerial(ArchiveFixture):
+    def test_a_live_read_wins(self):
+        self.assertEqual(log.known_serial(self.tmp, self.manifest), "TESTSERIAL")
+
+    def test_falls_back_to_the_newest_manifest_on_disk(self):
+        """The case that matters: the device was already unreachable at startup, so the
+        live identity read failed and the only source left is an earlier run's manifest."""
+        self.write_archive(n_data=1)
+        self.assertEqual(log.known_serial(self.tmp, {"device": {"error": "refused"}}),
+                         "TESTSERIAL")
+
+    def test_none_when_nothing_knows(self):
+        self.assertIsNone(log.known_serial(self.tmp, None))
+
+    def test_a_corrupt_manifest_is_skipped_rather_than_fatal(self):
+        with open(os.path.join(self.tmp, "sigen-20260101-deadbeef.manifest.json"), "w") as fh:
+            fh.write("{not json")
+        self.write_archive(n_data=1)
+        self.assertEqual(log.known_serial(self.tmp, None), "TESTSERIAL")
+
+
+class TestParseIdentity(ArchiveFixture):
+    def test_the_manifest_and_the_probe_read_the_same_offsets(self):
+        """Two copies of these offsets could disagree about which host is ours."""
+        unit, addr, count, fc = log.identity_block(self.cfg)
+        ident = log.parse_identity(self.mb.read(unit, addr, count, fc))
+        self.assertEqual(ident["serial"], self.manifest["device"]["serial"])
+        self.assertEqual(ident["model"], self.manifest["device"]["model"])
+
+
+class TestRediscoveryDuringAnOutage(ArchiveFixture):
+    """capture() adopting a new address while the configured one is refusing.
+
+    The 2026-09-04 failure end to end: the device is up somewhere else, the old address
+    refuses, and the logger has to notice and move.
+    """
+
+    def setUp(self):
+        super().setUp()
+        real = log.Modbus
+        log.Modbus = DeadModbus
+        self.addCleanup(lambda: setattr(log, "Modbus", real))
+        # The thresholds are wall-clock seconds; a 3-second test cannot wait 120.
+        for name in ("REDISCOVER_AFTER_S", "REDISCOVER_EVERY_S"):
+            old = getattr(log, name)
+            setattr(log, name, 0)
+            self.addCleanup(lambda n=name, o=old: setattr(log, n, o))
+        # Never let a test reach the network or a notification service.
+        real_find = discover.find
+        self.addCleanup(lambda: setattr(discover, "find", real_find))
+        real_notify = alerts.notify
+        self.notifications = []
+        alerts.notify = lambda *a, **kw: self.notifications.append(a) or True
+        self.addCleanup(lambda: setattr(alerts, "notify", real_notify))
+        self.write_archive(n_data=1)     # so a serial is discoverable on disk
+
+    def run_capture(self, cfg, seconds=3):
+        return self.capture_stdout(log.capture, cfg, self.tiers, self.tmp, seconds, 0,
+                                   False, self.bundle, None, 0, True)
+
+    def test_a_matching_host_is_adopted_and_announced(self):
+        discover.find = lambda serial, probe, **kw: {
+            "host": "10.0.0.15", "latency_ms": 16.0,
+            "matches": [("10.0.0.15", 16.0), ("10.0.0.13", 112.0)],
+            "listeners": ["10.0.0.13", "10.0.0.15"], "elapsed_s": 1.0}
+        cfg = base_cfg(degrade_after=1, degrade_probe_s=1,
+                       log_dir=self.tmp, install_dir=self.tmp)
+        out = self.run_capture(cfg)
+        self.assertIn("[rediscovered]", out)
+        self.assertIn("10.0.0.15", out)
+        self.assertIn("also on 10.0.0.13", out, "the slower interface should be named")
+        self.assertEqual(discover.read_host_state(self.tmp), "10.0.0.15")
+        self.assertTrue(self.notifications, "an address change must be pushed")
+
+    def test_the_configured_host_is_left_alone_when_nothing_is_found(self):
+        discover.find = lambda serial, probe, **kw: None
+        cfg = base_cfg(degrade_after=1, degrade_probe_s=1,
+                       log_dir=self.tmp, install_dir=self.tmp)
+        out = self.run_capture(cfg)
+        self.assertIn("[discover]", out)
+        self.assertNotIn("[rediscovered]", out)
+        self.assertEqual(discover.read_host_state(self.tmp), cfg["host"],
+                         "a failed search must not rewrite the host in use")
+        self.assertFalse(self.notifications)
+
+    def test_finding_the_address_we_are_already_on_is_not_an_adoption(self):
+        """Same address back means the device is refusing our reads, not that it moved.
+        Reporting it as a move would send you looking for a network fault."""
+        cfg = base_cfg(degrade_after=1, degrade_probe_s=1,
+                       log_dir=self.tmp, install_dir=self.tmp)
+        discover.find = lambda serial, probe, **kw: {
+            "host": cfg["host"], "latency_ms": 20.0,
+            "matches": [(cfg["host"], 20.0)], "listeners": [cfg["host"]],
+            "elapsed_s": 1.0}
+        out = self.run_capture(cfg)
+        self.assertNotIn("[rediscovered]", out)
+        self.assertIn("already the address being polled", out)
+        self.assertFalse(self.notifications)
+
+    def test_rediscovery_off_by_default_never_scans(self):
+        def explode(*_a, **_kw):
+            raise AssertionError("scanned the LAN without --discover")
+        discover.find = explode
+        cfg = base_cfg(degrade_after=1, degrade_probe_s=1, log_dir=self.tmp)
+        out = self.capture_stdout(log.capture, cfg, self.tiers, self.tmp, 3, 0,
+                                  False, self.bundle)
+        self.assertIn("[degraded]", out)
+        self.assertNotIn("[discover]", out)
+
+    def test_an_adopted_address_is_not_counted_as_an_unexpected_reconnect(self):
+        """Adopting closes the socket deliberately. Letting that inflate the counter
+        whose job is to mean "something dropped this and we do not know what" would
+        make every rediscovery look like a second, unexplained fault."""
+        discover.find = lambda serial, probe, **kw: {
+            "host": "10.0.0.15", "latency_ms": 16.0,
+            "matches": [("10.0.0.15", 16.0)], "listeners": ["10.0.0.15"],
+            "elapsed_s": 1.0}
+        cfg = base_cfg(degrade_after=1, degrade_probe_s=1, bucket_s=2,
+                       log_dir=self.tmp, install_dir=self.tmp)
+        out = self.run_capture(cfg, seconds=6)
+        self.assertIn("rediscoveries", out)
+        self.assertNotIn("UNEXPECTED reconnects", out)
+
+
+class TestWatchdogUnitTemplates(unittest.TestCase):
+    """The properties of the watchdog units that no other test would notice losing."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sigen-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w") as fh:
+            json.dump({"host": "h", "install_dir": "/opt/sigen",
+                       "run_as_user": "someone"}, fh)
+        os.environ["SIGEN_CONFIG"] = path
+        self.addCleanup(lambda: os.environ.pop("SIGEN_CONFIG", None))
+        d = os.path.join(REPO, "deploy", "systemd")
+        self.service = config.render(
+            config.load(), os.path.join(d, "sigen-watchdog.service.template"))
+        self.timer = config.render(
+            config.load(), os.path.join(d, "sigen-watchdog.timer.template"))
+
+    @staticmethod
+    def directives(text):
+        """The lines systemd acts on. These templates explain themselves at length, and
+        every one of those comments quotes directives it is arguing against."""
+        return [ln.strip() for ln in text.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+
+    def test_it_runs_as_a_user_and_not_as_root(self):
+        self.assertIn("User=someone", self.directives(self.service))
+
+    def test_it_is_a_job_that_finishes_not_a_daemon(self):
+        # Restart=always on a check that exits would be a crash loop that looks like health,
+        # which is the shape of the bug this whole feature exists because of.
+        directives = self.directives(self.service)
+        self.assertIn("Type=oneshot", directives)
+        self.assertFalse([d for d in directives if d.startswith("Restart=")])
+
+    def test_the_state_file_directory_is_writable_and_the_archive_is_not(self):
+        # watchdog.state is how one run tells the next what it already reported. Without it
+        # every run re-notifies; with a writable archive the check could corrupt what it reads.
+        rw = [d for d in self.directives(self.service)
+              if d.startswith("ReadWritePaths=")]
+        self.assertEqual(rw, ["ReadWritePaths=/opt/sigen/logs"])
+
+    def test_an_unprovisioned_host_does_not_crash_loop(self):
+        self.assertIn("ConditionPathExists=/opt/sigen/config.json", self.service)
+
+    def test_the_timer_is_what_gets_enabled(self):
+        self.assertIn("WantedBy=timers.target", self.timer)
+        self.assertIn("Unit=sigen-watchdog.service", self.timer)
+
+    def test_it_does_not_check_before_a_healthy_logger_could_have_data(self):
+        """At boot the archive is legitimately stale. Checking at the uploader's 60 s would
+        report an outage that is really a cold start."""
+        boot = int(self.timer.split("OnBootSec=")[1].split()[0])
+        self.assertGreaterEqual(boot, 300)
+
+    def test_the_cadence_is_finer_than_the_staleness_threshold(self):
+        """Otherwise the alert can arrive up to a whole threshold late."""
+        every = int(self.timer.split("OnUnitActiveSec=")[1].split()[0])
+        threshold = int(self.service.split("--stale-after ")[1].split()[0])
+        self.assertLess(every, threshold)
+
+
+class TestAlertConf(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="sigen-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        alerts._warned.clear()
+
+    def write(self, text):
+        with open(os.path.join(self.tmp, alerts.CONF_NAME), "w") as fh:
+            fh.write(text)
+
+    def test_a_full_url_is_used_as_given(self):
+        self.write("https://ntfy.example/topic\n")
+        self.assertEqual(alerts.load_target(self.tmp), "https://ntfy.example/topic")
+
+    def test_a_bare_topic_becomes_an_ntfy_url(self):
+        self.write("my-topic\n")
+        self.assertEqual(alerts.load_target(self.tmp), "https://ntfy.sh/my-topic")
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        self.write("# the topic is a capability, keep it out of git\n\nmy-topic\n")
+        self.assertEqual(alerts.load_target(self.tmp), "https://ntfy.sh/my-topic")
+
+    def test_an_absent_file_disables_alerting_without_raising(self):
+        said = []
+        self.assertIsNone(alerts.load_target(self.tmp, log=said.append))
+        self.assertTrue(any("notifications disabled" in s for s in said))
+
+    def test_the_absence_is_said_once_not_every_run(self):
+        said = []
+        for _ in range(3):
+            alerts.load_target(self.tmp, log=said.append)
+        self.assertEqual(len(said), 1)
+
+    def test_notify_without_a_conf_reports_failure_and_does_not_raise(self):
+        self.assertFalse(alerts.notify("t", "b", install_dir=self.tmp))
+
+    def test_notify_never_raises_when_the_service_is_unreachable(self):
+        self.write("http://127.0.0.1:1/never-listening\n")
+        said = []
+        self.assertFalse(alerts.notify("t", "b", install_dir=self.tmp,
+                                       log=said.append))
+        self.assertTrue(any("failed" in s for s in said))
+
+
+class TestWatchdog(ArchiveFixture):
+    """The check that would have caught the 2026-09-04 outage."""
+
+    def setUp(self):
+        super().setUp()
+        self.watchdog = load_watchdog()
+        self.cfg = base_cfg(data_dir=self.tmp, log_dir=self.tmp, install_dir=self.tmp)
+
+    def assess(self, stale_after_s=1800):
+        return self.watchdog.assess(self.cfg, stale_after_s)
+
+    def write_outage(self, data_age_s, probes=6):
+        """The shape of a real outage: old data, but probe records arriving right now.
+
+        Two files, because it cannot be done in one. write_archive() derives the empty
+        records' timestamps from the same t0 as the data records, so a single old file
+        is an archive that stopped being written to -- a stalled *logger*, which is a
+        different diagnosis. The device case needs the logger to be demonstrably alive.
+        """
+        self.write_archive(n_data=3, stamp="20260814T090000",
+                           t0=time.time() - data_age_s)
+        # 30 s apart and ending now, which is under the 90 s stall threshold, so the
+        # logger reads as healthy -- exactly as it did on 2026-09-04.
+        self.write_archive(n_data=0, n_empty=probes, stamp="20260814T100000",
+                           t0=time.time() - 30 * (probes - 1))
+
+    def test_a_fresh_archive_is_not_an_alert(self):
+        self.write_archive(n_data=5, t0=time.time() - 10)
+        kind, summary, _ = self.assess()
+        self.assertIsNone(kind, summary)
+
+    def test_old_data_with_a_healthy_logger_is_a_device_problem(self):
+        """The distinction the whole incident turned on: the logger was fine."""
+        self.write_outage(data_age_s=4000)
+        kind, summary, detail = self.assess(stale_after_s=1800)
+        self.assertEqual(kind, "DEVICE")
+        self.assertIn("no data for", summary)
+        self.assertIn("the inverter is", detail)
+        self.assertIn("not answering", detail)
+
+    def test_data_inside_the_threshold_is_not_an_alert(self):
+        self.write_outage(data_age_s=600)
+        self.assertIsNone(self.assess(stale_after_s=1800)[0])
+
+    def test_an_archive_of_nothing_but_probes_is_maximally_stale(self):
+        """series.latest() scans a bounded number of files, so a long enough outage
+        leaves no last-good sample to age at all. That is the 14-hour case."""
+        self.write_archive(n_data=0, n_empty=6, t0=time.time() - 150)
+        kind, _, detail = self.assess()
+        self.assertEqual(kind, "DEVICE")
+        self.assertIn("only empty probe records", detail)
+
+    def test_no_archive_at_all_is_reported_distinctly(self):
+        kind, _, _ = self.assess()
+        self.assertEqual(kind, "ARCHIVE")
+
+    def test_the_adopted_address_is_named_not_the_configured_one(self):
+        """After rediscovery these differ, and naming the configured host would send
+        you to the wrong machine."""
+        self.write_outage(data_age_s=4000)
+        discover.write_host_state(self.tmp, "10.0.0.15")
+        self.assertIn("10.0.0.15", self.assess()[2])
+        self.assertNotIn(self.cfg["host"], self.assess()[2])
+
+    def test_a_stalled_logger_is_not_reported_as_a_device_fault(self):
+        # No record of any kind for far longer than the stall threshold: the capture
+        # process, not the inverter. Different cause, different fix, so different alert.
+        self.write_archive(n_data=2, t0=time.time() - 90000)
+        kind, _, detail = self.assess()
+        self.assertEqual(kind, "LOGGER")
+        self.assertIn("logger process", detail)
+
+
+class TestWatchdogNotifiesOnTransitions(ArchiveFixture):
+    def setUp(self):
+        super().setUp()
+        self.watchdog = load_watchdog()
+        self.sent = []
+        real = alerts.notify
+        alerts.notify = lambda title, body, **kw: (self.sent.append(title) or True)
+        self.addCleanup(lambda: setattr(alerts, "notify", real))
+        self.cfg = base_cfg(data_dir=self.tmp, log_dir=self.tmp, install_dir=self.tmp)
+        real_load = config.load
+        config.load = lambda **kw: self.cfg
+        self.addCleanup(lambda: setattr(config, "load", real_load))
+
+    def write_outage(self, data_age_s=4000, probes=6):
+        """Old data with probes still arriving. See TestWatchdog.write_outage."""
+        self.write_archive(n_data=3, stamp="20260814T090000",
+                           t0=time.time() - data_age_s)
+        self.write_archive(n_data=0, n_empty=probes, stamp="20260814T100000",
+                           t0=time.time() - 30 * (probes - 1))
+
+    def run_once(self, argv=()):
+        old = sys.argv
+        sys.argv = ["watchdog.py"] + list(argv)
+        self.rc = None
+        try:
+            buf, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(err):
+                self.rc = self.watchdog.main()
+            return buf.getvalue()
+        finally:
+            sys.argv = old
+
+    def test_a_healthy_first_run_says_nothing(self):
+        """A watchdog that pushes on every run trains you to ignore it."""
+        self.write_archive(n_data=5, t0=time.time() - 10)
+        out = self.run_once()
+        self.assertIn("OK", out)
+        self.assertEqual(self.sent, [])
+
+    def test_going_stale_notifies_once_not_every_run(self):
+        self.write_outage()
+        self.run_once()
+        self.assertEqual(len(self.sent), 1)
+        self.run_once()
+        self.assertEqual(len(self.sent), 1, "a sustained outage must not re-nag hourly")
+
+    def test_recovery_notifies_too(self):
+        self.write_outage()
+        self.run_once()
+        self.assertEqual(len(self.sent), 1)
+        for name in os.listdir(self.tmp):
+            if name.endswith(".bin") or name.endswith(".bin.gz"):
+                os.unlink(os.path.join(self.tmp, name))
+        self.write_archive(n_data=5, stamp="20260814T120000", t0=time.time() - 10)
+        self.run_once()
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("recovered", self.sent[1])
+
+    def test_dry_run_never_sends(self):
+        self.write_outage()
+        out = self.run_once(["--dry-run"])
+        self.assertIn("would have notified", out)
+        self.assertEqual(self.sent, [])
+
+    def test_a_failed_notification_is_retried_next_run(self):
+        """Treating an undelivered alert as delivered is how an outage stays silent."""
+        alerts.notify = lambda title, body, **kw: False
+        self.write_outage()
+        out = self.run_once()
+        self.assertIn("NOT notified", out)
+        state = self.load_json(os.path.join(self.tmp, self.watchdog.STATE_NAME))
+        self.assertFalse(state["last_notified"])
+
+    def test_it_exits_zero_even_when_stale(self):
+        """A non-zero exit would make launchd log a failed job on top of the alert."""
+        self.write_outage()
+        self.run_once()
+        self.assertEqual(self.rc, 0)
 
 
 if __name__ == "__main__":

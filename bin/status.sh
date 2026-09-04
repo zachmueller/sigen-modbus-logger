@@ -94,6 +94,28 @@ say "$(tail -2 "$SIGEN_LOG_DIR/sync.log" 2>/dev/null)" "no sync.log yet"
 err=$(tail -3 "$SIGEN_LOG_DIR/sync.err" 2>/dev/null) || err=''
 say "$err" "sync.err is empty -- which is what it should be"
 
+echo "=== watchdog ($SIGEN_WATCHDOG_UNIT) ==="
+unit_state "${SIGEN_WATCHDOG_UNIT}.service"
+say "$(systemctl list-timers --all "${SIGEN_WATCHDOG_UNIT}.timer" --no-pager 2>/dev/null)" \
+    "no timer; nothing will notice that capture has stopped"
+# The state file is the whole point of the watchdog and the one thing worth reading here:
+# it says whether the last check thought capture was healthy, and since when if not.
+say "$(cat "$SIGEN_LOG_DIR/watchdog.state" 2>/dev/null)" \
+    "no watchdog.state yet -- it has not run, or logs/ is not where it writes"
+# Which address the logger is ACTUALLY polling. It differs from config.json's host after
+# rediscovery has adopted a new one, and that difference is the thing you want to see
+# before you go looking at the wrong device. See discover.py.
+live=$(cat "$SIGEN_LOG_DIR/logger-host" 2>/dev/null) || live=''
+if [ -z "$live" ]; then
+  echo "  polling: no logger-host file; assume config.json's host ($SIGEN_HOST)"
+elif [ "$live" = "$SIGEN_HOST" ]; then
+  echo "  polling: $live (as configured)"
+else
+  echo "  polling: $live  <- ADOPTED, config.json still says $SIGEN_HOST"
+  echo "    Rediscovery moved it. Capture is fine; config.json is what a restart uses,"
+  echo "    so set host to the adopted address if you want it to survive one."
+fi
+
 echo "=== archive ==="
 size=$(du -sh "$SIGEN_DATA_DIR" 2>/dev/null | cut -f1)
 printf "  files: %s   size: %s\n" \

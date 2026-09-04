@@ -151,6 +151,10 @@ else
   echo "  There is no local viewer any more, so the upload is the only path the data has."
   echo "  Set both in config.json, then: sudo $DIR/deploy/systemd/install-sync.sh"
 fi
+# Installed unconditionally, unlike the uploader. It needs no credential to be useful --
+# without alert.conf it still writes watchdog.state and still answers bin/status.sh -- and
+# the failure it exists to catch is one that leaves every other check reporting health.
+"$DIR/deploy/systemd/install-watchdog.sh"
 
 say "done"
 echo "noatime and the watchdog need a reboot:  sudo reboot"

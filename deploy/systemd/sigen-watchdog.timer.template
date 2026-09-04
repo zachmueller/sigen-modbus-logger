@@ -1,0 +1,31 @@
+# When the staleness check runs, rendered by deploy/systemd/install-watchdog.sh via
+# `config.py --render`. This is the unit you enable; it activates @WATCHDOG_UNIT@.service.
+#
+# Fifteen minutes against a 30-minute staleness threshold. The cadence is deliberately
+# finer than the threshold so that the alert arrives promptly once the threshold is crossed,
+# rather than up to a whole threshold late -- but not so fine that the check is a constant
+# reader competing with the logger for the same flash.
+
+[Unit]
+Description=Run the Sigenergy staleness check every 15 minutes
+Documentation=https://github.com/zachmu/sigen-modbus-logger
+
+[Timer]
+Unit=@WATCHDOG_UNIT@.service
+
+# Later than the uploader's 60 s. At boot the archive is legitimately stale -- the logger
+# has not written a data record yet, and its clock gate may not even have cleared -- so
+# checking too early would report an outage that is really a cold start. Five minutes is
+# past the point where a healthy logger has data.
+OnBootSec=300
+# From the END of the last run, so a slow check cannot overlap the next one.
+OnUnitActiveSec=900
+
+AccuracySec=60
+# Offset from the uploader's window on purpose: two jobs waking on the same jiffy to read
+# the same directory while the logger is trying to hit a two-second tick is a contention
+# that costs nothing to avoid.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

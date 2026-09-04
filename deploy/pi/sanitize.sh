@@ -62,6 +62,10 @@ fi
 say "secrets"
 rm -f "$DIR/config.json"
 echo "  removed config.json"
+# The notification topic. A capability, so it belongs in an image no more than a key does --
+# and an image that kept it would have every clone posting to the original's alerts.
+rm -f "$DIR/alert.conf"
+echo "  removed alert.conf"
 # Every user's, not just the run-as user's: a credential in root's home would travel too.
 for home in /root /home/*; do
   [ -d "$home" ] || continue

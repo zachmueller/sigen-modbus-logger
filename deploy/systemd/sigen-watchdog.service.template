@@ -1,0 +1,55 @@
+# The staleness check, rendered by deploy/systemd/install-watchdog.sh via
+# `config.py --render`. Do not install this file directly: the placeholders are filled
+# from config.json.
+#
+# A third unit, separate from the logger for the reason that matters most here: a check
+# that runs inside the process it is checking cannot report that process being wedged,
+# and "the capture stalled" is one of the two states this exists to tell apart. The other
+# is "the inverter stopped answering", which is the 2026-09-04 failure -- fourteen hours
+# during which the daemon was running, the archive was growing, and nothing said a word.
+#
+# Type=oneshot with a timer, not Restart=always: this is a job that finishes. It reads the
+# newest archive files, decides, maybe sends one notification, and exits.
+#
+# It opens no connection to the inverter. It reads the archive on disk and POSTs to the
+# notification service, nothing else.
+
+[Unit]
+Description=Sigenergy capture staleness check
+Documentation=https://github.com/zachmu/sigen-modbus-logger
+Wants=network-online.target
+After=network-online.target
+
+# Same reason as the other two: an image that has not been given a config must not spend
+# its life failing into a log nobody is watching yet.
+ConditionPathExists=@INSTALL_DIR@/config.json
+
+[Service]
+Type=oneshot
+# A normal user, not root. It needs to read the archive and alert.conf, both of which are
+# that user's, and no privilege beyond that.
+User=@USER@
+WorkingDirectory=@INSTALL_DIR@
+# -u so the one line it prints lands in the log as it happens rather than at exit.
+ExecStart=@PYTHON@ -u @INSTALL_DIR@/bin/watchdog.py --stale-after 1800
+
+# The logger is the latency-sensitive process and must win any contention. Decoding the
+# tail of a few archive files is cheap, but it is still a reader competing with a real-time
+# writer on the same flash -- see FINDINGS on measuring a reader against the writer's own
+# latency rather than against its own response time.
+Nice=10
+IOSchedulingClass=idle
+
+StandardOutput=append:@LOG_DIR@/watchdog.log
+StandardError=append:@LOG_DIR@/watchdog.err
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The archive is read-only to this job. @LOG_DIR@ is writable because watchdog.state lives
+# there and is how one run tells the next what it already reported -- without it every run
+# would re-notify, which trains you to ignore the alert.
+ReadWritePaths=@LOG_DIR@
