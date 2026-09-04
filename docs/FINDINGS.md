@@ -1340,6 +1340,63 @@ be deleted.**
 
 ---
 
+### 42. `KeepAlive` restarted the logger every hour, so "it is running" had stopped meaning anything
+
+The inverter stopped serving Modbus at 03:32 on 2026-09-04. It was not offline: `ping` had 0% loss,
+ARP resolved the MAC, and port 502 answered **`Connection refused`** — the host was up and the
+Modbus server was not. Ports 80, 443 and 8080 were closed too, and LAN round-trip was 100–400 ms,
+which is a wedged device rather than a rebooted one. **A refusal and a timeout are different facts.
+One says "wrong service", the other "wrong network", and only one of them is worth a router.**
+
+The outage was eleven hours old before anyone looked, and everything asked in the first minute said
+health:
+
+- `ps` showed `log.py` running; the launchd job was loaded.
+- `sync.py --status`: `uploaded 529 files, pending 0, failed 0, last run 3 min ago`.
+- The hosted viewer showed nothing recent — which reads exactly like an upload problem.
+
+The uploader was working and had nothing to carry. Suspecting it is FINDINGS 29 inverted: there the
+logger was blamed for the uploader's absence, here the uploader for the logger's silence. **A queue
+that is empty and a queue that is broken produce the same `pending 0`. The archive's newest record
+separates them; the daemon's status cannot.**
+
+And the process that was running was not the one that had started. The scheduled connection recycle
+formatted `mb.connection_age()` with `{age:.0f}`. During an outage `read()` drops the socket, so
+`connected_at` is `None`, so `connection_age()` is `None`:
+
+```
+  File "log.py", line 620, in capture
+    print(f"  [recycle] closing connection at age {age:.0f}s "
+TypeError: unsupported format string passed to NoneType.__format__
+```
+
+Once per `recycle_s` — hourly — for the whole outage. `KeepAlive` restarted it thirty seconds later,
+`ThrottleInterval` kept the loop from looking frantic, and `sigen.err` accumulated ten identical
+tracebacks that nothing was reading. The giveaway had been in `ps` from the start: `log.py`'s start
+time was 1:36 PM, while `serve.py` beside it had been up nineteen days. **A supervised process that
+crash-loops passes every check that asks whether it is running. Read its start time, and read it
+against something that has genuinely been up.**
+
+Each restart also cost a file. `Archive.close()` closed the handle and never compressed it, so every
+crash left an un-rotated `.bin` — seven of them, the FINDINGS 28 shape, arriving one an hour. That
+path is reached by SIGTERM, a reboot and `--seconds` elapsing as much as by a crash, so the closing
+file of *every* run had always been stranded; the crash loop only made it hourly instead of
+per-shutdown. Compressing at close is safe where FINDINGS 31's manual `gzip` was not, and for a
+reason worth stating: the process still owns the file, and the span cannot already be offsite under
+its `.bin` name, because `sync.py` only ever uploads `.bin.gz`. **The seven files that already exist
+still need FINDINGS 31's four steps — not a `gzip`.**
+
+`capture()` had no test. The archive writer, the scheduler and the soak report were all covered; the
+loop that composes them had never been run with the device down. It now is, and both new tests fail
+against the previous code — the first with the traceback above.
+
+**A crash in an error path is hidden twice: it needs a failure before it can fire, and a supervisor
+erases it once it does. Give the degraded path the tests the happy path already has, and pick the
+assertion that would have caught this one — not that `[recycle]` prints, but that a logger with no
+connection does not claim to have recycled one.**
+
+---
+
 ## Known limits
 
 - **Only one client should poll at a time.** Concurrent-client behaviour is
