@@ -243,6 +243,18 @@ class Archive:
         if self.fh:
             self.fh.close()
             self.fh = None
+            # Compress the file this run was holding open, exactly as rotation does. Only
+            # `.bin.gz` travels (sync.py's wanted()) and nothing gzips a `.bin` afterwards,
+            # so without this the closing file of EVERY run -- SIGTERM from the service
+            # manager, a reboot, Ctrl-C, --seconds elapsing -- stayed a plain `.bin`, and
+            # that span reached S3 only if somebody noticed. See FINDINGS 28. Queued before
+            # the join below so this call waits for it instead of exiting mid-compress.
+            #
+            # Safe where a manual `gzip` is not (FINDINGS 31): we are the process that owns
+            # the file, and the span cannot already be offsite under its `.bin` name because
+            # sync.py only ever uploads `.bin.gz`. A crash or a power cut still leaves a
+            # `.bin` behind, so sync.py's stranded() report stays necessary.
+            self._gzip_async(self.path)
         for t in self.threads:  # let outstanding gzips finish rather than truncate
             t.join(timeout=30)
 
@@ -614,17 +626,30 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
                 buckets.pop(0)
 
         if recycle_s and i and i % recycle_s == 0:
+            # There is nothing to recycle while the device is unreachable: read() drops the
+            # socket on failure, so connection_age() is None and every line below would be
+            # describing a connection that does not exist. Formatting that None was crashing
+            # the capture once per recycle_s for the whole of an outage -- and KeepAlive
+            # restarted it, so the daemon looked alive while the archive stayed empty and
+            # each restart stranded an un-rotated .bin (FINDINGS 28). Skip quietly: the
+            # degraded and NO DATA lines are already saying the device is gone.
             age = mb.connection_age()
-            mb.close()          # next read reconnects, ~17 ms
-            recycles += 1
-            print(f"  [recycle] closing connection at age {age:.0f}s "
-                  f"(scheduled every {recycle_s}s)", flush=True)
+            if age is not None:
+                mb.close()          # next read reconnects, ~17 ms
+                recycles += 1
+                print(f"  [recycle] closing connection at age {age:.0f}s "
+                      f"(scheduled every {recycle_s}s)", flush=True)
 
         if fault_at is not None and i == fault_at:
             # Simulate the device dropping a long-lived connection, which is the
             # untested failure mode. read() reconnects on the next call.
+            # Same None as the recycle above: if the tick lands during an outage there is
+            # no socket to drop, and an injection that quietly did nothing would otherwise
+            # be read as a passing test.
+            age = mb.connection_age()
             print(f"  [fault injection] closing socket at t={i}s "
-                  f"(connection age {mb.connection_age():.0f}s)")
+                  + (f"(connection age {age:.0f}s)" if age is not None
+                     else "(no connection was open — nothing to drop)"))
             mb.close()
 
         # With a fast tier slower than 1 s, most ticks have nothing scheduled. Skip
