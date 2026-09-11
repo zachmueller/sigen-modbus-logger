@@ -76,7 +76,11 @@ if [ "$CODE" = 1 ]; then
   # the tree keeps running on the Pi, which is a very quiet way to debug the wrong code.
   # The excludes are what must never be overwritten or carried: the archive, the logs, and
   # the config, which is per-host and pushed separately below.
-  rsync -a --delete --info=stats1 \
+  #
+  # --stats, not --info=stats1: macOS 26 ships openrsync ("protocol version 29, rsync version
+  # 2.6.9 compatible"), which has no --info at all and exits on the usage message without
+  # copying anything. --stats says the same thing and both openrsync and GNU rsync 3.x take it.
+  rsync -a --delete --stats \
     --exclude 'config.json' \
     --exclude 'alert.conf' \
     --exclude 'data/' \
