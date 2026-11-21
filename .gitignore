@@ -6,6 +6,10 @@ config.json
 # post to them. bin/leak-check.sh reads this file to add the topic to what it scans for.
 alert.conf
 
+# The IoT certificate and private key live.py connects with (certificate.pem.crt and
+# private.pem.key). The key is a credential; provision.sh pushes both mode 600.
+live-cert/
+
 # Captured data. Manifests carry the unit's model, serial and the address polled,
 # so an archive identifies a specific installation -- see manifest_identity.
 data/

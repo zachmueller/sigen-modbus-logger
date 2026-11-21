@@ -672,15 +672,17 @@ class TestConfig(unittest.TestCase):
         self.assertIn("SIGEN_LOGGER_UNIT=sigen-logger", out)
         self.assertIn("SIGEN_SYNC_UNIT=sigen-sync", out)
         self.assertIn("SIGEN_WATCHDOG_UNIT=sigen-watchdog", out)
+        self.assertIn("SIGEN_LIVE_UNIT=sigen-live", out)
 
     def test_no_two_units_may_be_one(self):
-        # They name three files under /etc/systemd/system. A shared name means the second
-        # install overwrites the first, and the logger quietly becomes an uploader.
-        # Every pair, not just the first: adding the watchdog is exactly the change that
-        # could have left a new collision unchecked.
-        for a, b in (("logger_unit", "sync_unit"),
-                     ("logger_unit", "watchdog_unit"),
-                     ("sync_unit", "watchdog_unit")):
+        # They name four files under /etc/systemd/system. A shared name means the second
+        # install overwrites the first, and the logger quietly becomes an uploader -- or,
+        # with the live unit, a sidecar whose failure no longer leaves capture running.
+        # Every pair, not just the first: adding a unit is exactly the change that could
+        # leave a new collision unchecked, so the pairs are generated from config's own list.
+        import itertools
+        self.assertIn("live_unit", config.UNIT_KEYS)
+        for a, b in itertools.combinations(config.UNIT_KEYS, 2):
             self.write({"host": "h", a: "same", b: "same"})
             with self.assertRaises(SystemExit) as cm:
                 config.load()
@@ -721,7 +723,7 @@ class TestConfig(unittest.TestCase):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         d = os.path.join(here, "deploy", "systemd")
         templates = sorted(f for f in os.listdir(d) if f.endswith(".template"))
-        self.assertEqual(len(templates), 5, "a template was added or removed")
+        self.assertEqual(len(templates), 6, "a template was added or removed")
         for name in templates:
             text = config.render(config.load(), os.path.join(d, name))
             self.assertNotIn("@", text, f"{name} has an unsubstituted token")
@@ -755,7 +757,8 @@ class TestReadOnly(unittest.TestCase):
     def test_no_source_file_issues_a_write_function_code(self):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for name in ("lib.py", "log.py", "dump.py", "decode.py", "series.py",
-                     "tiles.py", "ingest.py", "sync.py", "discover.py", "alerts.py"):
+                     "tiles.py", "ingest.py", "sync.py", "discover.py", "alerts.py",
+                     "livetap.py", "live.py", "livefields.py"):
             with open(os.path.join(here, name)) as fh:
                 src = fh.read()
             for fc in (" 5,", " 6,", " 15,", " 16,"):

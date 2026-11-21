@@ -51,13 +51,19 @@ say "packages"
 # "error: externally-managed-environment" (PEP 668). See docs/FINDINGS.md 39.
 #
 # netcat-openbsd because bin/status.sh uses `nc -z`, and Pi OS Lite does not ship it.
+#
+# python3-paho-mqtt for live.py, the live sidecar, and for nothing else -- it is imported
+# lazily and only there, as boto3 is in sync.py. Installed whether or not live_enabled is set,
+# so a golden image captured from this host carries it and turning the stream on later is a
+# config change rather than a package install.
 DEBIAN_FRONTEND=noninteractive apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  git rsync python3 python3-boto3 netcat-openbsd logrotate >/dev/null
+  git rsync python3 python3-boto3 python3-paho-mqtt netcat-openbsd logrotate >/dev/null
 python3 -c 'import sys; assert sys.version_info >= (3, 9), sys.version'
-printf '  python3 %s, boto3 %s\n' \
+printf '  python3 %s, boto3 %s, paho-mqtt %s\n' \
   "$(python3 -c 'import sys;print(".".join(map(str,sys.version_info[:3])))')" \
-  "$(python3 -c 'import boto3;print(boto3.__version__)')"
+  "$(python3 -c 'import boto3;print(boto3.__version__)')" \
+  "$(python3 -c 'import paho.mqtt;print(paho.mqtt.__version__)')"
 
 # ------------------------------------------------------------------- the clock
 say "clock"
@@ -155,6 +161,17 @@ fi
 # without alert.conf it still writes watchdog.state and still answers bin/status.sh -- and
 # the failure it exists to catch is one that leaves every other check reporting health.
 "$DIR/deploy/systemd/install-watchdog.sh"
+# Last, and the only installer whose failure does NOT stop this script. Everything above is
+# what makes this a capture host; the live stream is an experiment riding alongside it, and a
+# missing certificate or a typo in live_endpoint must never be the reason a host comes up
+# without its uploader or its watchdog. So a failure here is reported and skipped.
+if [ "$SIGEN_LIVE_ENABLED" = "True" ]; then
+  "$DIR/deploy/systemd/install-live.sh" || {
+    echo "  live NOT installed: install-live.sh failed (above). Capture is unaffected."
+    echo "  Fix what it said, then: sudo $DIR/deploy/systemd/install-live.sh"; }
+else
+  echo "  live NOT installed: live_enabled is not true in config.json."
+fi
 
 say "done"
 echo "noatime and the watchdog need a reboot:  sudo reboot"

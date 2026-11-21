@@ -12,7 +12,7 @@
  "data_dir": null,
  "log_dir": null,
 
- "__deployment": "systemd. The unit names below are the labels of record: they name the files under /etc/systemd/system and they are what systemctl is given. All three must differ from each other. run_as_user is required -- an empty systemd User= is not an error, it just runs the unit as root, which is what these units exist to avoid. See deploy/systemd/ and deploy/pi/.",
+ "__deployment": "systemd. The unit names below are the labels of record: they name the files under /etc/systemd/system and they are what systemctl is given. All four (live_unit is further down) must differ from each other. run_as_user is required -- an empty systemd User= is not an error, it just runs the unit as root, which is what these units exist to avoid. See deploy/systemd/ and deploy/pi/.",
  "python": "/usr/bin/python3",
  "logger_unit": "sigen-logger",
  "sync_unit": "sigen-sync",
@@ -41,5 +41,16 @@
  "s3_region": "us-east-1",
  "s3_prefix": "raw/",
  "aws_profile": "sigen-logger",
- "sync_enabled": true
+ "sync_enabled": true,
+
+ "__live": "live.py, the live stream: log.py offers each archived record to it over a Unix datagram socket (fire-and-forget; the archive never waits for it and it adds no reads of the device), and it publishes seven metrics to AWS IoT Core every tick. Off here and by default, because it needs a cloud stack and a certificate first; the Pi's own config.json sets it true. live_endpoint is the account's IoT data endpoint, host only, from `aws iot describe-endpoint --endpoint-type iot:Data-ATS`. The certificate and key are FILES, by default in live-cert/ beside this file as certificate.pem.crt and private.pem.key; deploy/pi/provision.sh pushes them mode 600 and they are gitignored. Nothing in this block can stop the logger starting: it is checked by `live.py --check`, not by config.py. It needs paho-mqtt, from `sudo apt install python3-paho-mqtt`. See cloud/README.md.",
+ "live_enabled": false,
+ "live_unit": "sigen-live",
+ "live_socket": null,
+ "live_endpoint": "example-ats.iot.ap-southeast-2.amazonaws.com",
+ "live_port": 8883,
+ "live_topic": "sigen/live",
+ "live_client_id": "sigen-pi",
+ "live_cert": null,
+ "live_key": null
 }

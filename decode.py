@@ -147,6 +147,41 @@ def records_from(manifest, path, offset=0):
             yield ts, latency, out
 
 
+def block_sizes(manifest):
+    """{block_index: payload bytes} -- what parse_record() needs, computed once per plan."""
+    return {b["index"]: b["bytes"] for b in manifest["blocks"]}
+
+
+def parse_record(sizes, rec):
+    """(ts, mask, latency_ms, {block_index: bytes}) from ONE record's bytes, in memory.
+
+    The same split records_from() does while streaming a file, for a caller that is handed
+    records one at a time -- live.py, which gets each one over a socket the moment it is
+    archived. records_from() is deliberately left as it is: it has to tolerate a record torn
+    by a kill at the end of a file, which this does not. Here a length that does not match
+    the mask is an error, because a datagram arrives whole or not at all.
+    """
+    if len(rec) < HEADER_LEN:
+        raise ValueError(f"record is {len(rec)} bytes, shorter than its header")
+    ts, mask, latency = struct.unpack(HEADER, rec[:HEADER_LEN])
+    known = 0
+    for i in sizes:
+        known |= 1 << i
+    if mask & ~known:
+        raise ValueError(f"mask {mask:#x} names blocks this plan does not have")
+    present = [i for i in sorted(sizes) if mask >> i & 1]
+    need = sum(sizes[i] for i in present)
+    payload = rec[HEADER_LEN:]
+    if len(payload) != need:
+        raise ValueError(f"mask {mask:#x} needs {need} payload bytes, record has "
+                         f"{len(payload)}")
+    out, off = {}, 0
+    for i in present:
+        out[i] = payload[off:off + sizes[i]]
+        off += sizes[i]
+    return ts, mask, latency, out
+
+
 def records(manifest, paths):
     """Yield (ts, latency_ms, {block_index: bytes}) per record, in file order."""
     for path in paths:

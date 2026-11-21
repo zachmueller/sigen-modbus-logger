@@ -139,7 +139,11 @@ class TestViewerIsReadOnly(unittest.TestCase):
     # assertions below rather than by whichever the author remembered. tiles.py is here
     # because it also runs in the ingest Lambda, where a Modbus client would be pointed
     # at a LAN address it cannot reach -- but the guarantee is the same one either way.
-    MODULES = ("series.py", "tiles.py", "ingest.py", "panels.py")
+    MODULES = ("series.py", "tiles.py", "ingest.py", "panels.py",
+               # The live side reads what log.py already read. live.py in particular runs on
+               # the capture host next to the logger, where a Modbus client would be a second
+               # poller of the very device the design exists to leave alone.
+               "live.py", "livetap.py", "livefields.py")
 
     def used_names(self, name):
         with open(os.path.join(HERE, name)) as fh:
@@ -187,7 +191,10 @@ class TestDependenciesStayContained(unittest.TestCase):
 
     # Everything that must run on a bare Python: capture, decode, and the local viewer.
     STDLIB_ONLY = ("config.py", "lib.py", "log.py", "decode.py", "dump.py", "series.py",
-                   "panels.py", "tiles.py", "ingest.py", "regmap_gen.py")
+                   "panels.py", "tiles.py", "ingest.py", "regmap_gen.py",
+                   # livetap.py is imported by log.py, so it is part of capture; livefields.py
+                   # is imported by the live Lambda as well as by live.py.
+                   "livetap.py", "livefields.py")
 
     def tree_of(self, name):
         with open(os.path.join(HERE, name)) as fh:
@@ -210,6 +217,18 @@ class TestDependenciesStayContained(unittest.TestCase):
         for name in self.STDLIB_ONLY:
             self.assertNotIn("boto3", self.imported_by(name),
                              f"{name} must run on a bare Python; boto3 belongs in sync.py")
+
+    def test_only_live_py_imports_paho_and_lazily(self):
+        # The second deliberate breach, contained the same way as the first. log.py imports
+        # livetap, so if paho reached livetap the logger would need it to START.
+        for name in self.STDLIB_ONLY + ("sync.py",):
+            self.assertNotIn("paho", self.imported_by(name),
+                             f"{name} must not need paho-mqtt; it belongs in live.py")
+        self.assertIn("paho", self.imported_by("live.py"), "live.py does need paho")
+        self.assertNotIn("paho", self.imported_by("live.py", top_level_only=True),
+                         "paho must be imported inside the function that needs it, so "
+                         "--stdout and --check work on a host without it")
+        self.assertNotIn("boto3", self.imported_by("live.py"))
 
     def test_sync_imports_boto3_lazily(self):
         # At module scope it would break `sync.py --status` and `--dry-run` on a machine

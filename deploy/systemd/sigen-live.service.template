@@ -1,0 +1,74 @@
+# The live sidecar, rendered by deploy/systemd/install-live.sh via `config.py --render`.
+# Do not install this file directly: the placeholders below are filled from config.json.
+#
+# It receives each record log.py has just archived (livetap.py) and publishes seven metrics
+# to AWS IoT Core. It never talks to the inverter, and the logger never waits for it.
+
+[Unit]
+Description=Sigenergy live stream (log.py's records to AWS IoT Core)
+Documentation=https://github.com/zachmu/sigen-modbus-logger
+
+# DELIBERATELY NOTHING NAMING THE LOGGER: no Requires=, BindsTo=, PartOf=, Before= or After=.
+# Each of those couples the two units' lifecycles in some direction -- PartOf= would restart
+# this when the logger restarts, which is harmless; Requires= in the other unit's file would
+# stop the LOGGER when this fails, which is the exact outcome this design exists to rule out.
+# The two meet only at a socket, and either can be absent: the tap drops records when this is
+# down, and this waits quietly when the logger is.
+#
+# No clock gate either, unlike the logger: nothing here is stamped by this process -- `t` is
+# the logger's own timestamp -- and a TLS handshake against a wrong clock just fails and is
+# retried by paho until timesyncd has answered.
+Wants=network-online.target
+After=network-online.target
+
+# So an unprovisioned host comes up quiet. See the logger's unit for the longer version.
+ConditionPathExists=@INSTALL_DIR@/config.json
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@INSTALL_DIR@
+# -u, or the heartbeat and every connect/disconnect line sit in a buffer.
+ExecStart=@PYTHON@ -u @INSTALL_DIR@/live.py
+
+# on-failure, not always: live.py exits 0 when live_enabled is false, and a host that has
+# turned the stream off should get one line saying so rather than a restart every 30 s.
+Restart=on-failure
+RestartSec=30
+
+# The socket log.py sends to. systemd creates /run/@LIVE_UNIT@ owned by User= before
+# ExecStart and removes it at stop -- and removing it is what makes the tap fail fast with
+# ENOENT instead of queueing into a socket nobody will read.
+RuntimeDirectory=@LIVE_UNIT@
+RuntimeDirectoryMode=0700
+
+# The opposite of the logger's Nice=-5. This is the process that must LOSE every contention
+# on this host: the logger's tick latency is the measurement, and this is a nice-to-have.
+# The quota and memory ceiling are fences, not estimates -- it uses a fraction of either --
+# so a bug here (a reconnect spin, a leak in a dependency) is capped before it can reach the
+# logger's share of a small machine.
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=25%
+MemoryMax=128M
+
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+StandardOutput=append:@LOG_DIR@/live.log
+StandardError=append:@LOG_DIR@/live.err
+
+# It reads config.json, the manifests in data_dir and its certificate; writes live.state;
+# binds one Unix socket in its RuntimeDirectory; and opens one outbound TLS connection.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# RuntimeDirectory= is writable without being named here. log_dir is for live.state, and is
+# also where live_socket can be pointed if /run ever turns out not to work for the sender.
+ReadWritePaths=@LOG_DIR@
+
+[Install]
+WantedBy=multi-user.target

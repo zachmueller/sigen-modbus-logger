@@ -116,6 +116,26 @@ else
   echo "    so set host to the adopted address if you want it to survive one."
 fi
 
+echo "=== live ($SIGEN_LIVE_UNIT) ==="
+# Two halves, reported separately because they fail separately: the LOGGER'S tap (is it
+# offering records?) and the SIDECAR (is it receiving and publishing them?). Either can be
+# down while the other is fine, and capture is unaffected by both.
+if [ "$SIGEN_LIVE_ENABLED" != "True" ]; then
+  echo "  off: live_enabled is not true in config.json, so the logger offers nothing"
+else
+  unit_state "${SIGEN_LIVE_UNIT}.service"
+  tap=$(grep -E '\[live\] tap' "$LOG" 2>/dev/null | tail -1) || tap=''
+  say "$tap" "tap: no [live] line in sigen.log yet -- the logger has not been restarted with live_enabled"
+  # live.state is rewritten every five minutes; `last` is the newest message published, which
+  # is the quickest way to compare live values against bin/latest.sh.
+  say "$(cat "$SIGEN_LOG_DIR/live.state" 2>/dev/null)" \
+      "no live.state yet -- the sidecar has not completed a heartbeat"
+  say "$(grep -E '\[mqtt\]' "$SIGEN_LOG_DIR/live.log" 2>/dev/null | tail -2)" \
+      "no [mqtt] line in live.log yet -- it has not tried to connect"
+  err=$(tail -3 "$SIGEN_LOG_DIR/live.err" 2>/dev/null) || err=''
+  say "$err" "live.err is empty -- which is what it should be"
+fi
+
 echo "=== archive ==="
 size=$(du -sh "$SIGEN_DATA_DIR" 2>/dev/null | cut -f1)
 printf "  files: %s   size: %s\n" \

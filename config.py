@@ -101,13 +101,34 @@ DEFAULTS = {
     # Manifests carry model/serial/firmware so an archive can be traced to the
     # unit that produced it. Set false before sharing raw archives.
     "manifest_identity": True,
+
+    # --- live stream (live.py) --------------------------------------------
+    # A parallel path, not a replacement: log.py offers each archived record to live.py over
+    # a Unix datagram socket (livetap.py), and live.py publishes seven metrics to AWS IoT Core
+    # every tick. It reads nothing from the device that log.py did not already read.
+    #
+    # Off by default, like sync. And NOTHING below is validated here beyond its type: this
+    # file is loaded by log.py too, and a mistake in the live settings must never be able to
+    # stop the archive from starting. live.py --check is where they are checked.
+    #
+    # The certificate and key are files beside config.json, never values in it -- the key is
+    # the credential, and provision.sh pushes it mode 600 the way it pushes the AWS profile.
+    "live_enabled": False,
+    "live_unit": "sigen-live",
+    "live_socket": None,       # default /run/<live_unit>/live.sock (the unit creates it)
+    "live_endpoint": None,     # IoT Core data endpoint, host only: xxxx-ats.iot.<region>...
+    "live_port": 8883,
+    "live_topic": "sigen/live",
+    "live_client_id": "sigen-pi",
+    "live_cert": None,         # default <install_dir>/live-cert/certificate.pem.crt
+    "live_key": None,          # default <install_dir>/live-cert/private.pem.key
 }
 
 INT_KEYS = ("port", "plant_unit", "inverter_unit", "fast_period_s",
             "rotate_minutes", "keep_days", "degrade_after", "degrade_probe_s",
-            "recycle_s", "max_lag_s", "gap_log_quiet_s", "bucket_s")
+            "recycle_s", "max_lag_s", "gap_log_quiet_s", "bucket_s", "live_port")
 FLOAT_KEYS = ("timeout_s",)
-BOOL_KEYS = ("manifest_identity", "sync_enabled")
+BOOL_KEYS = ("manifest_identity", "sync_enabled", "live_enabled")
 PATH_KEYS = ("install_dir", "data_dir", "log_dir", "python")
 
 # Keys exported to sh by --sh, as SIGEN_<UPPER>.
@@ -119,7 +140,14 @@ SH_KEYS = ("host", "port", "install_dir", "data_dir", "log_dir", "python",
            # installer blind to it succeeds and then fails every five minutes into a log
            # nobody is watching yet. s3_region for symmetry -- a wrong region is a
            # confusing failure at runtime and a cheap check here.
-           "s3_region", "sync_enabled")
+           "s3_region", "sync_enabled",
+           # The same reasoning for the live unit, plus the two certificate paths, which
+           # provision.sh needs to know where on the Pi to put the files it pushes.
+           "live_unit", "live_enabled", "live_socket", "live_cert", "live_key")
+
+# Every systemd unit this repository installs. One list, so a fifth unit cannot be added
+# without the collision check below covering it.
+UNIT_KEYS = ("logger_unit", "sync_unit", "watchdog_unit", "live_unit")
 
 
 class ConfigError(SystemExit):
@@ -210,6 +238,16 @@ def load(require_host=True, overrides=None):
     cfg["log_dir"] = (expand(cfg["log_dir"]) if cfg["log_dir"]
                       else os.path.join(cfg["install_dir"], "logs"))
     cfg["python"] = expand(cfg["python"])
+    # Defaults that depend on other keys, so they follow whichever unit name and install
+    # directory this host uses. /run/<unit> is what the unit's RuntimeDirectory= creates.
+    cfg["live_socket"] = (expand(cfg["live_socket"]) if cfg["live_socket"]
+                          else f"/run/{cfg['live_unit']}/live.sock")
+    cfg["live_cert"] = (expand(cfg["live_cert"]) if cfg["live_cert"]
+                        else os.path.join(cfg["install_dir"], "live-cert",
+                                          "certificate.pem.crt"))
+    cfg["live_key"] = (expand(cfg["live_key"]) if cfg["live_key"]
+                       else os.path.join(cfg["install_dir"], "live-cert",
+                                         "private.pem.key"))
 
     if require_host and not cfg["host"]:
         raise ConfigError(
@@ -222,17 +260,18 @@ def load(require_host=True, overrides=None):
                           "per second)")
     if cfg["degrade_after"] < 1:
         raise ConfigError("degrade_after must be >= 1")
-    # Two units, and they may not be one. Checked here rather than in the installers
-    # because both of them would have to check it, and a second uploader scanning the
-    # same archive -- or a unit file overwritten by the other daemon's -- is the kind
-    # of collision that only shows up as a puzzle later.
-    unit_keys = ("logger_unit", "sync_unit", "watchdog_unit")
-    names = [cfg[k] for k in unit_keys]
+    # Four units, and no two may be one. Checked here rather than in the installers
+    # because all of them would have to check it, and a second uploader scanning the
+    # same archive -- or a unit file overwritten by another daemon's -- is the kind
+    # of collision that only shows up as a puzzle later. The live unit is in the list
+    # even though nothing else about live is validated here: install-live.sh writing
+    # over the LOGGER's unit file is the one live mistake that could stop capture.
+    names = [cfg[k] for k in UNIT_KEYS]
     if len(set(names)) != len(names):
         raise ConfigError(
-            "logger_unit, sync_unit and watchdog_unit name three unit files and must "
-            f"all differ; got {', '.join(f'{k}={cfg[k]!r}' for k in unit_keys)}")
-    for key in unit_keys:
+            f"{', '.join(UNIT_KEYS)} name {len(UNIT_KEYS)} unit files and must "
+            f"all differ; got {', '.join(f'{k}={cfg[k]!r}' for k in UNIT_KEYS)}")
+    for key in UNIT_KEYS:
         # systemd derives the unit filename from this, so a name with a slash or a
         # suffix would install somewhere nobody looks. Refuse it here, where the
         # message can say why, rather than in `systemd-analyze verify`.
@@ -273,6 +312,7 @@ def render(cfg, template):
         "@LOGGER_UNIT@": cfg["logger_unit"],
         "@SYNC_UNIT@": cfg["sync_unit"],
         "@WATCHDOG_UNIT@": cfg["watchdog_unit"],
+        "@LIVE_UNIT@": cfg["live_unit"],
         "@PYTHON@": cfg["python"],
         "@INSTALL_DIR@": cfg["install_dir"],
         "@DATA_DIR@": cfg["data_dir"],

@@ -1,4 +1,4 @@
-# Rotation for the logger's, uploader's and watchdog's log files. Installed to
+# Rotation for the logger's, uploader's, watchdog's and live sidecar's log files. Installed to
 # /etc/logrotate.d/sigen by deploy/pi/bootstrap.sh, which substitutes @LOG_DIR@ and @USER@
 # from config.json.
 #
@@ -15,7 +15,9 @@
 @LOG_DIR@/sync.log
 @LOG_DIR@/sync.err
 @LOG_DIR@/watchdog.log
-@LOG_DIR@/watchdog.err {
+@LOG_DIR@/watchdog.err
+@LOG_DIR@/live.log
+@LOG_DIR@/live.err {
 	weekly
 	rotate 4
 	compress

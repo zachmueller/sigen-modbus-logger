@@ -21,6 +21,9 @@
 #   ~/.aws/credentials  an access key for the PutObject-only logger IAM user
 #   alert.conf          the notification topic -- a capability, not a name: anyone holding it
 #                       can read the alerts and post to them. Optional; skipped if absent.
+#   live-cert/          the IoT certificate and private key live.py connects with. Allowed to
+#                       connect as one client id and publish to one topic, nothing more.
+#                       Optional; skipped if absent, and needed only when live_enabled is true.
 # The image's boot partition is FAT32 and readable by anything it is plugged into, so
 # nothing sensitive is ever written there.
 set -e
@@ -83,6 +86,7 @@ if [ "$CODE" = 1 ]; then
   rsync -a --delete --stats \
     --exclude 'config.json' \
     --exclude 'alert.conf' \
+    --exclude 'live-cert/' \
     --exclude 'data/' \
     --exclude 'logs/' \
     --exclude '__pycache__/' \
@@ -114,6 +118,25 @@ if [ "$SECRETS" = 1 ]; then
     echo "  alert.conf (mode 600)"
   else
     echo "  alert.conf: none here, so the watchdog on that host will have nowhere to report"
+  fi
+
+  # The live certificate. The two files go to wherever config.json's live_cert and live_key
+  # resolve on the Pi -- by default <install_dir>/live-cert/ -- in a directory only the
+  # run-as user can enter. The certificate is not secret; the key is the credential.
+  if [ -f live-cert/certificate.pem.crt ] && [ -f live-cert/private.pem.key ]; then
+    scp -q live-cert/certificate.pem.crt "$TARGET:/tmp/sigen-live.crt"
+    scp -q live-cert/private.pem.key "$TARGET:/tmp/sigen-live.key"
+    ssh "$TARGET" "install -d -m 700 \"\$(dirname '$SIGEN_LIVE_CERT')\" \
+                     \"\$(dirname '$SIGEN_LIVE_KEY')\" \
+                   && install -m 600 /tmp/sigen-live.crt '$SIGEN_LIVE_CERT' \
+                   && install -m 600 /tmp/sigen-live.key '$SIGEN_LIVE_KEY' \
+                   && rm -f /tmp/sigen-live.crt /tmp/sigen-live.key"
+    echo "  live-cert/ certificate and key (mode 600)"
+  elif [ "$SIGEN_LIVE_ENABLED" = "True" ]; then
+    echo "  live-cert/: MISSING, but live_enabled is true -- install-live.sh will refuse and"
+    echo "    the live stream will not run. Capture is unaffected. See cloud/README.md."
+  else
+    echo "  live-cert/: none here (live_enabled is not true, so none is needed)"
   fi
 
   if [ -n "$SIGEN_AWS_PROFILE" ]; then
@@ -162,6 +185,12 @@ echo "=== (re)start the units"
 # restart, not start, and it covers both cases: a clone whose units have never run, and a
 # running host whose config.json just changed. SIGTERM is what log.py handles -- it closes
 # the archive and joins its gzip threads rather than truncating the open .bin.
+#
+# The live sidecar FIRST, so its socket exists by the time the restarted logger starts
+# offering records; the other way round costs one "not delivering" line and nothing else.
+if [ "$SIGEN_LIVE_ENABLED" = "True" ]; then
+  ssh "$TARGET" "sudo systemctl restart ${SIGEN_LIVE_UNIT}.service || true"
+fi
 ssh "$TARGET" "sudo systemctl restart ${SIGEN_LOGGER_UNIT}.service || true"
 ssh "$TARGET" "sudo systemctl restart ${SIGEN_SYNC_UNIT}.timer || true"
 

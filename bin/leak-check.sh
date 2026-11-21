@@ -38,7 +38,11 @@ cd "$DIR"
 # Space-separated, so no pattern may CONTAIN a space: the loop below word-splits this, and
 # "BEGIN[ _]PRIVATE" split into three broken regexes that git rejected. Use `.` where a
 # space is wanted.
-PATTERNS='GOCSPX AKIA ASIA aws_secret_access_key BEGIN.PRIVATE.KEY xoxb-'
+#
+# `BEGIN.([A-Z]+.)?PRIVATE.KEY`, not `BEGIN.PRIVATE.KEY`: the second matches only a PKCS#8 key.
+# The key AWS IoT hands out for a device certificate is PKCS#1 -- "BEGIN RSA PRIVATE KEY" --
+# with a word between BEGIN and PRIVATE, and the narrower pattern walked straight past it.
+PATTERNS='GOCSPX AKIA ASIA aws_secret_access_key BEGIN.([A-Z]+.)?PRIVATE.KEY xoxb-'
 
 # Installation-specific patterns, read out of the gitignored config so this script itself
 # names nothing. Without cloud.json only the fixed patterns above are checked.

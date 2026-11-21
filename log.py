@@ -49,6 +49,7 @@ import config
 import discover
 import dump
 import lib
+import livetap
 from lib import Modbus, pct
 
 
@@ -337,6 +338,9 @@ class Archive:
         self.fh.flush()
         self.bytes_written += len(rec)
         self.records += 1
+        # Returned so the live tap is handed exactly the bytes that reached the archive,
+        # rather than a second packing of the same header that could ever differ from it.
+        return rec
 
     def close(self):
         if self.fh:
@@ -623,6 +627,22 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
     mb = Modbus(cfg["host"], cfg["port"], cfg["timeout_s"])
     manifest = build_manifest(mb, bundle, cfg, tiers)
     archive = Archive(outdir, rotate_minutes, manifest, keep_days)
+    # The live tap: every archived record is also offered to live.py over a Unix datagram
+    # socket, after it is on disk. Fire-and-forget by construction -- see livetap.py -- so the
+    # sidecar being absent, slow or broken costs this loop one failed syscall and nothing else.
+    # It reads only what this loop already read; the live stream adds no request to the device.
+    #
+    # Guarded here as well as inside livetap, deliberately twice: Tap promises never to raise,
+    # and this loop does not take that promise on trust, because the cost of it being broken
+    # one day is the archive.
+    tap = None
+    if cfg.get("live_enabled"):
+        try:
+            tap = livetap.Tap(cfg.get("live_socket"), manifest["plan_hash"],
+                              log=lambda s: print(s, flush=True))
+        except Exception as e:
+            print(f"  [live] tap not started ({type(e).__name__}: {e}); capture is "
+                  f"unaffected", flush=True)
     expect_serial = known_serial(outdir, manifest) if rediscover else None
     discover.write_host_state(cfg.get("log_dir"), cfg["host"])
     print(f"Sigenergy raw capture @ {cfg['host']}:{cfg['port']}")
@@ -650,6 +670,9 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
               f"LAN for serial "
               + (repr(expect_serial) if expect_serial
                  else "??? — UNKNOWN, so nothing will be adopted"))
+    if tap is not None:
+        print(f"  live tap ON: each record is also offered to {cfg.get('live_socket')} "
+              f"(fire-and-forget; no extra reads)")
     print()
 
     buckets, cur = [], None
@@ -872,7 +895,14 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
                       flush=True)
 
         latency_ms = (time.perf_counter() - tick_start) * 1000
-        archive.write(time.time(), mask, int(latency_ms), b"".join(payload))
+        rec = archive.write(time.time(), mask, int(latency_ms), b"".join(payload))
+        # After the write, never before: the archive is the record of truth, and nothing the
+        # live path does can be allowed to stand between a tick and the disk.
+        if tap is not None:
+            try:
+                tap.send(rec)
+            except Exception:
+                pass
 
         if mask:
             cur["lat"].append(latency_ms)
@@ -894,6 +924,11 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
 
     ticks = i
     archive.close()
+    if tap is not None:
+        try:
+            tap.close()
+        except Exception:
+            pass
     age = mb.connection_age()
     mb.close()
 
@@ -909,6 +944,8 @@ def capture(cfg, tiers, outdir, duration, rotate_minutes, soak, bundle,
           + (f" · schedule gaps {gaps}" if gaps else "")
           + (f" · degraded ticks {degraded_ticks}" if degraded_ticks else "")
           + (f" · pruned {archive.pruned} old archives" if archive.pruned else ""))
+    if tap is not None:
+        print(f"  live tap: {tap.sent} records delivered, {tap.dropped} dropped")
     if aborted:
         print(f"\n  ABORTED: {aborted}")
 

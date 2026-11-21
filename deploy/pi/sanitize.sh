@@ -31,6 +31,7 @@ else
   echo "no config.json; assuming this host is already sanitized" >&2
   SIGEN_LOGGER_UNIT=${SIGEN_LOGGER_UNIT:-sigen-logger}
   SIGEN_SYNC_UNIT=${SIGEN_SYNC_UNIT:-sigen-sync}
+  SIGEN_LIVE_UNIT=${SIGEN_LIVE_UNIT:-sigen-live}
 fi
 
 say() { printf '\n=== %s\n' "$1"; }
@@ -41,6 +42,7 @@ say "stopping capture"
 # joins its gzip threads rather than leaving a truncated .bin in the image.
 systemctl stop "${SIGEN_SYNC_UNIT}.timer" 2>/dev/null || true
 systemctl stop "${SIGEN_SYNC_UNIT}.service" 2>/dev/null || true
+systemctl stop "${SIGEN_LIVE_UNIT}.service" 2>/dev/null || true
 systemctl stop "${SIGEN_LOGGER_UNIT}.service" 2>/dev/null || true
 echo "  stopped (units stay installed and enabled -- that is the point)"
 
@@ -66,6 +68,14 @@ echo "  removed config.json"
 # and an image that kept it would have every clone posting to the original's alerts.
 rm -f "$DIR/alert.conf"
 echo "  removed alert.conf"
+# The IoT private key. A clone holding it would connect as this host's client id, and IoT
+# allows one connection per id -- so the clone and the original would knock each other off
+# the broker every few seconds, each looking like a flaky network from its own side.
+rm -rf "$DIR/live-cert"
+if [ -n "${SIGEN_LIVE_KEY:-}" ]; then
+  rm -f "$SIGEN_LIVE_KEY" "${SIGEN_LIVE_CERT:-}"
+fi
+echo "  removed the live certificate and key"
 # Every user's, not just the run-as user's: a credential in root's home would travel too.
 for home in /root /home/*; do
   [ -d "$home" ] || continue
