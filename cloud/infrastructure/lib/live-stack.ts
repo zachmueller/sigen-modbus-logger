@@ -273,24 +273,29 @@ export class LiveStack extends cdk.Stack {
 			['SessionRoute', 'POST /api/live/session', 'api/live/session', 1, 10],
 		];
 		const routeSettings: Record<string, unknown> = {};
+		const routeResources: cdk.CfnResource[] = [];
 		for (const [id, routeKey, permPath, rate, burst] of routes) {
-			new cdk.aws_apigatewayv2.CfnRoute(this, id, {
+			routeResources.push(new cdk.aws_apigatewayv2.CfnRoute(this, id, {
 				apiId: api.ref, routeKey,
 				target: cdk.Fn.join('', ['integrations/', integration.ref]),
-			});
+			}));
 			liveFn.addPermission(`${id}Invoke`, {
 				principal: new cdk.aws_iam.ServicePrincipal('apigateway.amazonaws.com'),
 				sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${api.ref}/*/*/${permPath}`,
 			});
 			routeSettings[routeKey] = { ThrottlingRateLimit: rate, ThrottlingBurstLimit: burst };
 		}
-		new cdk.aws_apigatewayv2.CfnStage(this, 'LiveStage', {
+		const stage = new cdk.aws_apigatewayv2.CfnStage(this, 'LiveStage', {
 			apiId: api.ref, stageName: '$default', autoDeploy: true,
 			// Anything without its own line above -- a route added later and forgotten -- gets the
 			// tightest setting rather than the account default of thousands a second.
 			defaultRouteSettings: { throttlingRateLimit: 1, throttlingBurstLimit: 5 },
 			routeSettings,
 		});
+		// routeSettings names routes by KEY, a string, so CloudFormation sees no reference and is
+		// free to create the stage first -- and the stage is then refused: "Unable to find Route
+		// by key POST /api/live/session". The first deploy of this stack failed exactly so.
+		for (const r of routeResources) stage.addDependency(r);
 		this.apiDomain = `${api.ref}.execute-api.${this.region}.amazonaws.com`;
 		new cdk.CfnOutput(this, 'LiveApiDomain', {
 			value: this.apiDomain,

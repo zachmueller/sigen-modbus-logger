@@ -1213,6 +1213,9 @@ class TestTheViewerCap(unittest.TestCase):
         for route in ("'GET /api/live/seed'", "'POST /api/live/session'"):
             self.assertRegex(self.ts, re.escape(route) + r", '[^']+', \d+, \d+\]")
         self.assertIn("defaultRouteSettings: { throttlingRateLimit: 1", self.ts)
+        # The stage names routes by key, which CloudFormation cannot see as a dependency; the
+        # first deploy created the stage first and was refused. The order is now explicit.
+        self.assertIn("for (const r of routeResources) stage.addDependency(r);", self.ts)
 
     def test_the_function_writes_only_slot_leases(self):
         self.assertIn("'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'", self.ts)
