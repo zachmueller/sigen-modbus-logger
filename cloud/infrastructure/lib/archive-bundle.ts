@@ -41,7 +41,19 @@ export function readPackageList(file: string = PACKAGE_LIST): string[] {
  * ships.
  */
 export function archiveLambdaCode(handlerDir: string): cdk.aws_lambda.Code {
-	const files = readPackageList();
+	return packagedLambdaCode(handlerDir, readPackageList());
+}
+
+/**
+ * The same arrangement for a handler with its own list, `<handlerDir>/PACKAGE.txt` -- the live
+ * Lambda, which needs livefields.py and panels.py and none of the archive modules. Its list is
+ * held to its import closure by tests/test_live.py, the way the ingest list is by test_web.py.
+ */
+export function ownPackageLambdaCode(handlerDir: string): cdk.aws_lambda.Code {
+	return packagedLambdaCode(handlerDir, readPackageList(path.join(handlerDir, 'PACKAGE.txt')));
+}
+
+function packagedLambdaCode(handlerDir: string, files: string[]): cdk.aws_lambda.Code {
 	return cdk.aws_lambda.Code.fromAsset(handlerDir, {
 		assetHashType: cdk.AssetHashType.OUTPUT,
 		// A local bundling step rather than a Docker image: the "build" is a handful of file

@@ -23,7 +23,7 @@ const WEB = path.join(REPO_ROOT, 'web');
  * the pinned bundle. Being absent from this list is also what lets the Site deployment prune the
  * object it left behind.
  */
-const HTML_ENTRY_POINTS = ['view'] as const;
+const HTML_ENTRY_POINTS = ['view', 'live'] as const;
 
 /** Copied verbatim; their extensions tell S3 what they are. */
 const WEB_ASSETS = ['app.js', 'tiles.js', 'charts.js', 'style.css', 'favicon.svg'] as const;
@@ -37,6 +37,18 @@ const WEB_ASSETS = ['app.js', 'tiles.js', 'charts.js', 'style.css', 'favicon.svg
  * references from the page itself and insisting every one of them was rewritten.
  */
 const VIEWER_SOURCES = ['index.html', ...WEB_ASSETS] as const;
+
+/**
+ * The live page's own files. Published beside WEB_ASSETS but deliberately NOT part of
+ * VIEWER_SOURCES: a share is a frozen archive view and has no use for a stream, so these must
+ * not be copied into every pinned bundle or move its hash. The live page loads charts.js and
+ * style.css from WEB_ASSETS as well -- one renderer, one palette -- which is why editing those
+ * still versions the bundle, and editing these never does.
+ *
+ * Only published once SigenLive exists (props.liveApiDomain), so a deployment without the live
+ * stack has no page that would fail on its first fetch.
+ */
+const LIVE_ASSETS = ['live.js', 'livechart.js', 'live.css', 'vendor/mqtt.min.js'] as const;
 
 /**
  * The identity of the viewer bundle: sha256 over the name and bytes of every file above,
@@ -89,6 +101,8 @@ export interface SiteStackProps extends cdk.StackProps {
 	cfg: CloudConfig;
 	edgeVersionArn: string;
 	callbackApiDomain: string;
+	/** SigenLive's HTTP API, in live_region. Absent: no /live, no /api/live/*. */
+	liveApiDomain?: string;
 }
 
 export class SiteStack extends cdk.Stack {
@@ -127,6 +141,54 @@ export class SiteStack extends cdk.Stack {
 			props.callbackApiDomain, {
 				protocolPolicy: cdk.aws_cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
 			});
+
+		// ---- the live view ---------------------------------------------------
+		// Same-origin with the page, through CloudFront, for the same reason as /auth/*: the
+		// session cookie only travels to this host, and a page on one origin fetching another
+		// would need CORS that nothing else here has.
+		//
+		// `livePublic` is ONE expression, used for both /live and /api/live/*, so the page and its
+		// data can never be gated differently -- gating one and not the other would be theatre in
+		// one direction and a broken page in the other. The API's own authorizer (live-stack.ts)
+		// reads the same flag.
+		const live = props.liveApiDomain;
+		const livePublic = cfg.livePublic;
+		const liveBehaviors: Record<string, cdk.aws_cloudfront.BehaviorOptions> = {};
+		if (live) {
+			const liveOrigin = new cdk.aws_cloudfront_origins.HttpOrigin(live, {
+				protocolPolicy: cdk.aws_cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+			});
+			// The seed says max-age=2, and honouring it is what makes a crowd opening the page at
+			// once cost one Query. The session route says no-store and is never cached. Capped at
+			// 5 s so a mistake in the handler cannot pin a stale seed for long.
+			const liveApiCache = new cdk.aws_cloudfront.CachePolicy(this, 'LiveApiCache', {
+				comment: 'Live API: honour the origin, never longer than 5 s',
+				defaultTtl: cdk.Duration.seconds(0),
+				minTtl: cdk.Duration.seconds(0),
+				maxTtl: cdk.Duration.seconds(5),
+				enableAcceptEncodingGzip: true,
+				enableAcceptEncodingBrotli: true,
+			});
+			liveBehaviors['/live'] = {
+				origin: siteOrigin,
+				viewerProtocolPolicy: cdk.aws_cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+				cachePolicy: cdk.aws_cloudfront.CachePolicy.CACHING_DISABLED,
+				compress: true,
+				...(livePublic ? {} : { edgeLambdas: gate }),
+			};
+			liveBehaviors['/api/live/*'] = {
+				origin: liveOrigin,
+				viewerProtocolPolicy: cdk.aws_cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+				// ALLOW_ALL because the session route is a POST; CloudFront refuses a method a
+				// behaviour does not list before anything logs it.
+				allowedMethods: cdk.aws_cloudfront.AllowedMethods.ALLOW_ALL,
+				cachePolicy: liveApiCache,
+				// Cookies and the body reach the API (its authorizer reads the cookie once the
+				// view is locked); the Host header does not, or API Gateway cannot route it.
+				originRequestPolicy: cdk.aws_cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+				...(livePublic ? {} : { edgeLambdas: gateSigningBody }),
+			};
+		}
 
 		// ---- POST /api/share -------------------------------------------------
 		// It lives in THIS stack, not the data stack, for two reasons. It needs no
@@ -351,6 +413,8 @@ function handler(event) {
 					cachePolicy: immutable,
 					compress: true,
 				},
+				// -- the live view: public or gated by cfg.livePublic, above --------
+				...liveBehaviors,
 			},
 		});
 
@@ -453,7 +517,7 @@ function handler(event) {
 			assetHashType: cdk.AssetHashType.OUTPUT,
 			bundling: {
 				image: cdk.DockerImage.fromRegistry('scratch'),
-				local: { tryBundle: (out: string) => buildSite(out, cfg, version) },
+				local: { tryBundle: (out: string) => buildSite(out, cfg, version, !!live) },
 			},
 		});
 		const siteBucket = cdk.aws_s3.Bucket.fromBucketName(this, 'SiteBucket', cfg.bucket);
@@ -477,8 +541,10 @@ function handler(event) {
 			// Only this prefix, so a deployment cannot reach raw/ or agg/.
 			prune: true,
 			distribution: dist,
-			distributionPaths: ['/index.html', '/app.js', '/tiles.js', '/charts.js',
-				'/style.css', '/favicon.svg'],
+			// Derived from the lists, so a file added to either is invalidated without anyone
+			// remembering to add it here.
+			distributionPaths: ['/index.html', ...WEB_ASSETS.map((f) => '/' + f),
+				...(live ? LIVE_ASSETS.map((f) => '/' + f) : [])],
 		});
 
 		// The extensionless HTML entry points, told what they are.
@@ -493,9 +559,9 @@ function handler(event) {
 			// one prefix would race to remove each other's work.
 			prune: false,
 			distribution: dist,
-			// Only /view. A share's page is immutable and lives under /share/<uid>/, so there is
-			// no shared entry point behind /p/* left to invalidate.
-			distributionPaths: ['/view'],
+			// The entry points this deployment actually wrote. A share's page is immutable and lives
+			// under /share/<uid>/, so there is no shared entry point behind /p/* to invalidate.
+			distributionPaths: entryPoints(!!live).map((f) => '/' + f),
 		});
 
 		// The pinned bundle, for a share to copy its page out of. Every object here is immutable
@@ -547,7 +613,12 @@ function handler(event) {
  * in its data and live in its code, and a link sent in August was drawn by whatever existed when
  * it was opened. The bundle below is the other half of that promise.
  */
-function buildSite(out: string, cfg: CloudConfig, version: string): boolean {
+/** The extensionless pages this deployment writes. `live` only when the live stack exists. */
+function entryPoints(withLive: boolean): string[] {
+	return HTML_ENTRY_POINTS.filter((f) => withLive || f !== 'live');
+}
+
+function buildSite(out: string, cfg: CloudConfig, version: string, withLive: boolean): boolean {
 	const page = fs.readFileSync(path.join(WEB, 'index.html'), 'utf-8');
 	const ANCHOR = '<script src="/tiles.js"></script>';
 	if (!page.includes(ANCHOR)) {
@@ -596,20 +667,43 @@ function buildSite(out: string, cfg: CloudConfig, version: string): boolean {
 		fs.copyFileSync(path.join(WEB, f), path.join(pinned, f));
 	}
 
-	fs.writeFileSync(path.join(out, 'index.html'), landingPage(cfg));
+	// The live page: its own HTML, not index.html with a different SIGEN_SOURCE -- it is a
+	// different page, drawing a stream rather than tiles. Every root-absolute file it loads must
+	// be one this function publishes, checked here because a missing one is a page that renders
+	// blank with a 404 in the console and nothing on the screen.
+	if (withLive) {
+		const livePage = fs.readFileSync(path.join(WEB, 'live.html'), 'utf-8');
+		const published = new Set<string>([...WEB_ASSETS, ...LIVE_ASSETS].map((f) => '/' + f));
+		for (const m of livePage.matchAll(/(?:src|href)="(\/[^"]*)"/g)) {
+			const ref = m[1];
+			if (!published.has(ref) && !(HTML_ENTRY_POINTS as readonly string[]).includes(ref.slice(1))
+				&& ref !== '/') {
+				throw new Error(`web/live.html loads ${ref}, which neither WEB_ASSETS nor LIVE_ASSETS `
+					+ `publishes. Add it to LIVE_ASSETS.`);
+			}
+		}
+		fs.writeFileSync(path.join(out, 'live'), livePage);
+		for (const f of LIVE_ASSETS) {
+			fs.mkdirSync(path.dirname(path.join(out, f)), { recursive: true });
+			fs.copyFileSync(path.join(WEB, f), path.join(out, f));
+		}
+	}
+
+	fs.writeFileSync(path.join(out, 'index.html'), landingPage(cfg, withLive));
 
 	// Every extensionless entry point must be one this stack knows to declare a Content-Type
 	// for, or it deploys as binary/octet-stream and downloads instead of rendering. Checked
 	// at synth, because the alternative is finding out in a browser.
-	for (const f of HTML_ENTRY_POINTS) {
+	for (const f of entryPoints(withLive)) {
 		if (!fs.existsSync(path.join(out, f))) {
 			throw new Error(`buildSite() did not write the entry point "${f}" that `
 				+ `HTML_ENTRY_POINTS promises. The two lists have drifted.`);
 		}
 	}
 	for (const f of fs.readdirSync(out)) {
-		// Directories are exempt: `v/` holds the pinned bundles, whose files all carry
-		// extensions. This check is about OBJECTS whose key would arrive without a Content-Type.
+		// Directories are exempt: `v/` holds the pinned bundles and `vendor/` the live page's MQTT
+		// client, whose files all carry extensions. This check is about OBJECTS whose key would
+		// arrive without a Content-Type.
 		if (fs.statSync(path.join(out, f)).isDirectory()) continue;
 		if (!path.extname(f) && !(HTML_ENTRY_POINTS as readonly string[]).includes(f)) {
 			throw new Error(`buildSite() wrote "${f}", which has no file extension and is `
@@ -653,7 +747,13 @@ function pinAssets(html: string, version: string): string {
 }
 
 /** The public landing page. Deliberately says what this is and what it is not. */
-function landingPage(cfg: CloudConfig): string {
+function landingPage(cfg: CloudConfig, withLive: boolean): string {
+	// The live view is linked only while it is public: a link to a sign-in wall is not a thing
+	// an anonymous visitor to this page can use.
+	const liveLink = withLive && cfg.livePublic
+		? `\n  <p><a class="btn ghost" href="/live">Watch it live</a> <span class="sub">the last five `
+			+ `minutes, updating every two seconds -- no sign-in</span></p>`
+		: '';
 	return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -667,6 +767,8 @@ function landingPage(cfg: CloudConfig): string {
   p.sub{color:#666;margin:0 0 2rem}
   a.btn{display:inline-block;background:#1c1c1c;color:#fff;text-decoration:none;
         padding:.55rem 1.1rem;border-radius:6px;font-size:.95rem}
+  a.btn.ghost{background:transparent;color:inherit;border:1px solid currentColor}
+  span.sub{color:#666;font-size:.9rem}
   ul{color:#444;padding-left:1.2em}
   footer{margin-top:3rem;color:#888;font-size:.85rem}
   @media(prefers-color-scheme:dark){body{background:#151515;color:#e8e8e8}
@@ -674,7 +776,7 @@ function landingPage(cfg: CloudConfig): string {
 </style></head><body><main>
   <h1>SigenStor telemetry</h1>
   <p class="sub">Read-only solar and battery data from one house, captured over Modbus.</p>
-  <p><a class="btn" href="/view">Open the viewer</a></p>
+  <p><a class="btn" href="/view">Open the viewer</a></p>${liveLink}
   <ul>
     <li>The viewer is shared with a few specific people and needs a Google sign-in.</li>
     <li>Individual views can be shared publicly as <code>/p/&lt;id&gt;</code> links, which
@@ -682,8 +784,8 @@ function landingPage(cfg: CloudConfig): string {
     <li>Nothing here can change anything: the capture is read-only by construction, and
         this site only ever reads what it already recorded.</li>
   </ul>
-  <footer>Data is up to an hour behind — it is published when the logger rotates its
-  archive. Source: <a href="https://github.com/zachmueller/sigen-modbus-logger">
+  <footer>The viewer's data is up to an hour behind — it is published when the logger rotates
+  its archive${withLive ? '; the live view is the exception, and keeps only five minutes' : ''}. Source: <a href="https://github.com/zachmueller/sigen-modbus-logger">
   sigen-modbus-logger</a>.</footer>
 </main></body></html>
 `;

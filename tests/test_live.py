@@ -15,7 +15,11 @@ the record of truth, so most of what matters here is negative:
 
 Each of those is a test rather than a comment.
 """
+import base64
+import datetime
 import gzip
+import hashlib
+import importlib.util
 import io
 import itertools
 import json
@@ -49,6 +53,11 @@ from test_offline import DeadModbus, FakeModbus, base_cfg   # noqa: E402
 from test_web import ViewerFixture                          # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# sha256 prefix of a presigned URL for fixed inputs (TestPresign). Recorded only after the
+# signature it contains matched botocore's independent SigV4 chain, and after the same code
+# connected to the real IoT endpoint; it pins that output so a refactor cannot drift from it.
+KNOWN_PRESIGN = "a24b60bd8149b619"
 
 # One fast-tier record: the 12-byte header plus plant_live, plant_energy and inv_ac_dc.
 FAST_RECORD = 12 + (124 + 87 + 106) * 2
@@ -904,6 +913,387 @@ class TestTheLiveStack(unittest.TestCase):
             sh = fh.read()
         for key in ("live_iot_endpoint", "live_cert_id", "live_api_domain"):
             self.assertIn(f'"{key}"', sh)
+
+
+# ------------------------------------------------------------------- the live API
+
+def load_live_handler(**env):
+    """cloud/lambda/live/handler.py as a module, with its environment set first."""
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update({k: str(v) for k, v in env.items()})
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "live_handler", os.path.join(HERE, "cloud", "lambda", "live", "handler.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class FakeStore:
+    """The live table's two partitions, in memory, with the real conditions."""
+
+    def __init__(self, live=()):
+        self.live = list(live)
+        self.slots = {}
+
+    def query_live(self, lo, hi):
+        return [m for m in self.live if lo <= m["t"] <= hi]
+
+    def claim(self, slot, lease, exp, auth, now):
+        cur = self.slots.get(slot)
+        if cur and cur["exp"] >= now:
+            return False
+        self.slots[slot] = {"lease": lease, "exp": exp, "auth": auth}
+        return True
+
+    def renew(self, slot, lease, exp, now):
+        cur = self.slots.get(slot)
+        if not cur or cur["lease"] != lease or cur["exp"] < now:
+            return False
+        cur["exp"] = exp
+        return True
+
+    def release(self, slot, lease):
+        cur = self.slots.get(slot)
+        if cur and cur["lease"] == lease:
+            del self.slots[slot]
+            return True
+        return False
+
+    def soonest_expiry(self):
+        return min((v["exp"] for v in self.slots.values()), default=None)
+
+
+class LiveApiFixture(unittest.TestCase):
+    def setUp(self):
+        self.h = load_live_handler(SLOTS=10, PUBLIC_SLOTS=8, LEASE_S=150,
+                                   CLIENT_PREFIX="sigen-view-", TOPIC="sigen/live")
+        self.store = FakeStore()
+        self.assumed = []
+
+    def assume(self, slot):
+        self.assumed.append(slot)
+        return "AKIDEXAMPLE", "secret", "token"
+
+    def session(self, body, authed=False, now=1_000_000):
+        return self.h.session(self.store, body, authed, now, assume=self.assume,
+                              sign=lambda ak, sk, tok: f"wss://example/mqtt?{ak}")
+
+
+class TestAdmission(LiveApiFixture):
+    def test_an_anonymous_viewer_gets_a_public_slot_and_a_url_for_it(self):
+        r = self.session({"op": "connect"})
+        self.assertEqual(r["slot"], 0)
+        self.assertEqual(r["clientId"], "sigen-view-0")
+        self.assertTrue(r["url"].startswith("wss://"))
+        self.assertEqual(self.assumed, [0], "credentials are minted for the slot granted")
+
+    def test_ten_is_the_cap_and_two_of_them_are_kept_for_the_household(self):
+        got = [self.session({"op": "connect"})["slot"] for _ in range(8)]
+        self.assertEqual(got, list(range(8)))
+        with self.assertRaises(self.h.Refused) as cm:
+            self.session({"op": "connect"})
+        self.assertEqual(cm.exception.status, 429)
+        self.assertTrue(cm.exception.extra["full"])
+        self.assertGreater(cm.exception.extra["retry_s"], 0)
+        # A signed-in caller still gets in -- to a reserved slot, first.
+        self.assertEqual(self.session({"op": "connect"}, authed=True)["slot"], 8)
+        self.assertEqual(self.session({"op": "connect"}, authed=True)["slot"], 9)
+        with self.assertRaises(self.h.Refused):
+            self.session({"op": "connect"}, authed=True)
+
+    def test_a_signed_in_caller_prefers_a_reserved_slot(self):
+        self.assertEqual(self.session({"op": "connect"}, authed=True)["slot"], 8)
+
+    def test_a_reload_keeps_its_slot(self):
+        first = self.session({"op": "connect"})
+        again = self.session({"op": "connect", "slot": first["slot"], "lease": first["lease"]})
+        self.assertEqual((again["slot"], again["lease"]), (first["slot"], first["lease"]))
+        self.assertEqual(len(self.store.slots), 1)
+
+    def test_an_anonymous_caller_cannot_hold_a_reserved_slot_by_naming_it(self):
+        mine = self.session({"op": "connect"}, authed=True)       # slot 8
+        r = self.session({"op": "connect", "slot": mine["slot"], "lease": mine["lease"]})
+        self.assertLess(r["slot"], 8)
+
+    def test_a_lapsed_lease_frees_the_slot(self):
+        for _ in range(8):
+            self.session({"op": "connect"}, now=1000)
+        r = self.session({"op": "connect"}, now=1000 + 151)
+        self.assertEqual(r["slot"], 0)
+
+    def test_renew_and_release(self):
+        a = self.session({"op": "connect"})
+        self.assertTrue(self.session({"op": "renew", "slot": a["slot"], "lease": a["lease"]})["ok"])
+        with self.assertRaises(self.h.Refused) as cm:
+            self.session({"op": "renew", "slot": a["slot"], "lease": "not-mine"})
+        self.assertEqual(cm.exception.status, 409)
+        self.assertTrue(cm.exception.extra["lost"])
+        self.assertTrue(self.session({"op": "release", "slot": a["slot"],
+                                      "lease": a["lease"]})["released"])
+        self.assertEqual(self.store.slots, {})
+
+    def test_bad_requests_are_400_not_500(self):
+        for body in ({"op": "steal"}, {"op": "connect", "slot": 10},
+                     {"op": "connect", "slot": True}, {"op": "renew"},
+                     {"op": "connect", "slot": 1, "lease": "x" * 100}):
+            with self.assertRaises(self.h.Refused, msg=body) as cm:
+                self.session(body)
+            self.assertEqual(cm.exception.status, 400)
+
+
+class TestSeed(LiveApiFixture):
+    def test_only_the_window_and_never_the_storage_fields(self):
+        now = 2_000_000_000_000
+        from decimal import Decimal
+        self.store.live = [
+            {"pk": "live", "t": Decimal(now - 400_000), "ttl": Decimal(1), "m": Decimal(7)},
+            {"pk": "live", "t": Decimal(now - 1000), "ttl": Decimal(1), "m": Decimal(7),
+             "plant_ess_soc": Decimal("55.5")},
+            {"pk": "live", "t": Decimal(now - 3000), "ttl": Decimal(1), "m": Decimal(0),
+             "q": Decimal(42)},
+        ]
+        # The fake's window check runs on the Decimals the real table returns.
+        out = self.h.seed(self.store, now)
+        self.assertEqual([m["t"] for m in out["msgs"]], [now - 3000, now - 1000])
+        self.assertNotIn("pk", out["msgs"][0])
+        self.assertNotIn("ttl", out["msgs"][0])
+        self.assertIsInstance(out["msgs"][1]["plant_ess_soc"], float)
+        self.assertIsInstance(out["msgs"][1]["t"], int)
+        self.assertEqual([s["key"] for s in out["series"]], list(livefields.KEYS))
+        self.assertTrue(out["tz"] and len(out["tz"][0]) == 3)
+        json.dumps(out)                                  # it must serialise
+
+    def test_the_handler_routes_and_caches_the_seed_briefly(self):
+        ev = {"rawPath": "/api/live/seed", "requestContext": {"http": {"method": "GET"}}}
+        r = self.h.lambda_handler(ev, None, store=self.store)
+        self.assertEqual(r["statusCode"], 200)
+        self.assertEqual(r["headers"]["Cache-Control"], "public, max-age=2")
+        ev = {"rawPath": "/api/live/session", "body": '{"op":"nope"}',
+              "requestContext": {"http": {"method": "POST"}, "timeEpoch": 5}}
+        r = self.h.lambda_handler(ev, None, store=self.store)
+        self.assertEqual(r["statusCode"], 400)
+        self.assertEqual(r["headers"]["Cache-Control"], "no-store")
+        self.assertFalse(json.loads(r["body"])["ok"])
+        ev = {"rawPath": "/api/live/other", "requestContext": {"http": {"method": "GET"}}}
+        self.assertEqual(self.h.lambda_handler(ev, None, store=self.store)["statusCode"], 404)
+
+    def test_the_session_answer_carries_both_server_timestamps(self):
+        self.h.assume_viewer = self.assume
+        self.h.presign = lambda *a, **k: "wss://example/mqtt"
+        ev = {"rawPath": "/api/live/session", "body": '{"op":"connect"}',
+              "requestContext": {"http": {"method": "POST"}, "timeEpoch": 1234}}
+        body = json.loads(self.h.lambda_handler(ev, None, store=self.store)["body"])
+        self.assertEqual(body["recv"], 1234)
+        self.assertGreaterEqual(body["send"], body["recv"])
+
+    def test_only_the_authorizer_makes_a_caller_signed_in(self):
+        self.assertFalse(self.h.authed_of({}))
+        self.assertFalse(self.h.authed_of({"requestContext": {"authorizer": {}}}))
+        self.assertTrue(self.h.authed_of(
+            {"requestContext": {"authorizer": {"lambda": {"email_hash": "ab12"}}}}))
+
+
+class TestPresign(LiveApiFixture):
+    NOW = datetime.datetime(2026, 11, 21, 8, 30, 0, tzinfo=datetime.timezone.utc)
+
+    def test_the_token_is_appended_after_signing(self):
+        # Measured against the real endpoint: signed into the canonical query, the handshake is
+        # refused. So the URL without the token must carry the same signature as with it.
+        a = self.h.presign("h.example", "ap-southeast-2", "AKID", "SECRET", None, now=self.NOW)
+        b = self.h.presign("h.example", "ap-southeast-2", "AKID", "SECRET", "TOK/+=", now=self.NOW)
+        self.assertTrue(b.startswith(a + "&X-Amz-Security-Token="))
+        self.assertTrue(b.endswith("TOK%2F%2B%3D"))
+        self.assertIn("%2Fap-southeast-2%2Fiotdevicegateway%2Faws4_request", a)
+
+    def test_the_signature_matches_botocore(self):
+        # An independent implementation of the same SigV4 chain, over the same canonical request.
+        try:
+            from botocore.auth import SigV4Auth
+            from botocore.awsrequest import AWSRequest
+            from botocore.credentials import Credentials
+        except ImportError:
+            self.skipTest("botocore not installed")
+        url = self.h.presign("h.example", "ap-southeast-2", "AKID", "SECRET", None, now=self.NOW)
+        query = url.split("?", 1)[1]
+        mine = query.rsplit("&X-Amz-Signature=", 1)[1]
+        canonical_query = query.rsplit("&X-Amz-Signature=", 1)[0]
+        canonical = "\n".join(["GET", "/mqtt", canonical_query, "host:h.example\n", "host",
+                               hashlib.sha256(b"").hexdigest()])
+        auth = SigV4Auth(Credentials("AKID", "SECRET"), "iotdevicegateway", "ap-southeast-2")
+        req = AWSRequest(method="GET", url="https://h.example/mqtt")
+        req.context["timestamp"] = self.NOW.strftime("%Y%m%dT%H%M%SZ")
+        sts = auth.string_to_sign(req, canonical)
+        self.assertEqual(mine, auth.signature(sts, req))
+
+    def test_a_known_answer(self):
+        # Pinned, so a refactor of the presigner that changes its output fails here and not
+        # as an unexplained handshake refusal in a browser.
+        url = self.h.presign("h.example", "ap-southeast-2", "AKID", "SECRET", None, now=self.NOW)
+        self.assertEqual(hashlib.sha256(url.encode()).hexdigest()[:16], KNOWN_PRESIGN)
+
+
+class TestTheLivePackage(unittest.TestCase):
+    """cloud/lambda/live/PACKAGE.txt is the live handler's import closure, exactly."""
+
+    def test_the_list_is_the_closure(self):
+        import ast
+        local = {f[:-3] for f in os.listdir(HERE) if f.endswith(".py")}
+
+        def imports(path):
+            with open(path) as fh:
+                tree = ast.parse(fh.read())
+            out = set()
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Import):
+                    out |= {a.name.split(".")[0] for a in n.names}
+                elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+                    out.add(n.module.split(".")[0])
+            return out & local
+        seen, stack = set(), [os.path.join(HERE, "cloud", "lambda", "live", "handler.py")]
+        while stack:
+            for dep in imports(stack.pop()):
+                if dep not in seen:
+                    seen.add(dep)
+                    stack.append(os.path.join(HERE, dep + ".py"))
+        with open(os.path.join(HERE, "cloud", "lambda", "live", "PACKAGE.txt")) as fh:
+            listed = {l.strip() for l in fh if l.strip() and not l.startswith("#")}
+        self.assertEqual(listed, {m + ".py" for m in seen})
+
+
+class TestTheViewerCap(unittest.TestCase):
+    """The cost cap, read out of live-stack.ts and the handler."""
+
+    def setUp(self):
+        with open(os.path.join(HERE, "cloud", "infrastructure", "lib", "live-stack.ts")) as fh:
+            self.ts = fh.read()
+        with open(os.path.join(HERE, "cloud", "lambda", "live", "handler.py")) as fh:
+            self.py = fh.read()
+
+    def test_ten_enumerated_client_ids_and_no_wildcard(self):
+        self.assertIn("export const VIEWER_SLOTS = 10;", self.ts)
+        self.assertIn("Array.from({ length: VIEWER_SLOTS }", self.ts)
+        role = self.ts[self.ts.index("'ViewerRole'"):self.ts.index("// ---- the function")]
+        self.assertNotIn("*", re.sub(r"/\*.*?\*/|//[^\n]*", "", role))
+        self.assertEqual(sorted(set(re.findall(r"actions: \['([^']+)'\]", role))),
+                         ["iot:Connect", "iot:Receive", "iot:Subscribe"])
+
+    def test_the_session_policy_names_exactly_one_client(self):
+        # Behaviour, not source text: capture what assume_viewer() actually asks STS for.
+        h = load_live_handler(VIEWER_ROLE_ARN="arn:aws:iam::123456789012:role/viewer",
+                              AWS_REGION="ap-southeast-2", TOPIC="sigen/live",
+                              CLIENT_PREFIX="sigen-view-")
+        calls = []
+
+        class FakeSTS:
+            def assume_role(self, **kw):
+                calls.append(kw)
+                return {"Credentials": {"AccessKeyId": "A", "SecretAccessKey": "S",
+                                        "SessionToken": "T"}}
+        fake = type(sys)("boto3")
+        fake.client = lambda name: FakeSTS()
+        with mock.patch.dict(sys.modules, {"boto3": fake}):
+            self.assertEqual(h.assume_viewer(3), ("A", "S", "T"))
+        policy = json.loads(calls[0]["Policy"])
+        connect = [st for st in policy["Statement"] if st["Action"] == "iot:Connect"]
+        self.assertEqual([st["Resource"] for st in connect],
+                         ["arn:aws:iot:ap-southeast-2:123456789012:client/sigen-view-3"])
+        self.assertNotIn("*", calls[0]["Policy"])
+        self.assertEqual({st["Action"] for st in policy["Statement"]},
+                         {"iot:Connect", "iot:Subscribe", "iot:Receive"})
+        self.assertEqual(calls[0]["DurationSeconds"], 900)
+
+    def test_the_public_routes_are_throttled(self):
+        for route in ("'GET /api/live/seed'", "'POST /api/live/session'"):
+            self.assertRegex(self.ts, re.escape(route) + r", '[^']+', \d+, \d+\]")
+        self.assertIn("defaultRouteSettings: { throttlingRateLimit: 1", self.ts)
+
+    def test_the_function_writes_only_slot_leases(self):
+        self.assertIn("'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'", self.ts)
+        self.assertIn("'dynamodb:LeadingKeys': ['slot']", self.ts)
+
+
+class TestTheLivePage(unittest.TestCase):
+    """What the site stack publishes for the live view, and what the page loads."""
+
+    SITE = os.path.join(HERE, "cloud", "infrastructure", "lib", "site-stack.ts")
+
+    def setUp(self):
+        with open(self.SITE) as fh:
+            self.ts = fh.read()
+
+    def listed(self, name):
+        m = re.search(rf"const {name} = \[(.*?)\] as const;", self.ts, re.S)
+        self.assertIsNotNone(m, name)
+        return re.findall(r"'([^']+)'", m.group(1))
+
+    def test_every_file_the_page_loads_is_published(self):
+        with open(os.path.join(HERE, "web", "live.html")) as fh:
+            refs = re.findall(r'(?:src|href)="(/[^"]*)"', fh.read())
+        published = {"/" + f for f in self.listed("WEB_ASSETS") + self.listed("LIVE_ASSETS")}
+        self.assertTrue(refs)
+        self.assertEqual({r for r in refs if r != "/"} - published, set())
+
+    def test_the_live_files_stay_out_of_the_share_bundle(self):
+        self.assertRegex(self.ts, r"VIEWER_SOURCES = \['index\.html', \.\.\.WEB_ASSETS\] as const;")
+        self.assertFalse(set(self.listed("LIVE_ASSETS")) & set(self.listed("WEB_ASSETS")))
+        self.assertIn("live", self.listed("HTML_ENTRY_POINTS"))
+
+    def test_dev_files_are_never_published(self):
+        for name in ("WEB_ASSETS", "LIVE_ASSETS"):
+            self.assertFalse([f for f in self.listed(name) if f.startswith("dev/")])
+        with open(os.path.join(HERE, "web", "live.html")) as fh:
+            self.assertNotIn("/dev/", fh.read(), "the published page must not load the mock")
+
+    def test_one_expression_gates_the_page_and_its_api(self):
+        self.assertEqual(self.ts.count("const livePublic = cfg.livePublic;"), 1)
+        self.assertIn("...(livePublic ? {} : { edgeLambdas: gate }),", self.ts)
+        self.assertIn("...(livePublic ? {} : { edgeLambdas: gateSigningBody }),", self.ts)
+
+    def test_the_archive_viewer_does_not_link_to_it(self):
+        # Two tests treat every root-absolute link in index.html as a bundle asset.
+        with open(os.path.join(HERE, "web", "index.html")) as fh:
+            self.assertNotIn('href="/live"', fh.read())
+
+    def test_the_vendored_client_is_the_one_the_notices_describe(self):
+        path = os.path.join(HERE, "web", "vendor", "mqtt.min.js")
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        self.assertEqual(len(blob), 340797)
+        self.assertEqual(hashlib.sha256(blob).hexdigest(),
+                         "75873d04a6400bbbac093b3602caf06f44ed92ee032925e1f4f21c03eba05a4e")
+        with open(os.path.join(HERE, "THIRD_PARTY_NOTICES.md")) as fh:
+            notices = fh.read()
+        self.assertIn("mqtt@5.16.1", notices)
+        self.assertIn("75873d04a6400bbbac093b3602caf06f44ed92ee032925e1f4f21c03eba05a4e", notices)
+
+    @staticmethod
+    def code_of(path):
+        """JS with comments removed, so an assertion cannot be satisfied by prose about it."""
+        with open(path) as fh:
+            js = fh.read()
+        return re.sub(r"/\*.*?\*/|//[^\n]*", "", js, flags=re.S)
+
+    def test_the_page_hands_mqtt_js_the_url_verbatim_and_reconnects_itself(self):
+        js = self.code_of(os.path.join(HERE, "web", "livechart.js"))
+        self.assertIn("transformWsUrl: () => url", js)
+        self.assertIn("reconnectPeriod: 0", js)
+        self.assertIn("granted[0].qos === 128", js, "a refused SUBACK must not read as quiet")
+
+    def test_one_gap_rule_for_both_renderers(self):
+        with open(os.path.join(HERE, "web", "charts.js")) as fh:
+            charts = fh.read()
+        self.assertIn("Math.ceil(GAP_CADENCES * (cadenceS || bucketS) / bucketS)", charts)
+        self.assertIn("return (GAP_CADENCES + 0.5) * (cadenceS || 2);", charts)
+        with open(os.path.join(HERE, "web", "livechart.js")) as fh:
+            js = fh.read()
+        self.assertGreaterEqual(js.count("C.gapLimitS("), 2, "line breaks and hatches")
 
 
 if __name__ == "__main__":

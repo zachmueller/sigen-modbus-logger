@@ -2767,8 +2767,13 @@ class TestAShareIsPinnedToTheViewerThatMadeIt(unittest.TestCase):
         self.assertIsNotNone(behaviour, "the /p/* behaviour should still be here")
         self.assertIn("origin: dataOrigin", behaviour.group(1),
                       "siteOrigin prepends /site, which cannot reach share/")
-        # And the retired entry point is gone rather than left deployed and unreachable.
-        self.assertIn("const HTML_ENTRY_POINTS = ['view'] as const;", ts)
+        # And the retired entry point is gone rather than left deployed and unreachable. Parsed
+        # rather than matched literally since the live view added an entry point of its own.
+        entry = re.search(r"const HTML_ENTRY_POINTS = \[([^\]]*)\] as const;", ts)
+        self.assertIsNotNone(entry)
+        names = re.findall(r"'([^']+)'", entry.group(1))
+        self.assertIn("view", names)
+        self.assertNotIn("share-view", names)
 
     def test_a_url_that_is_not_a_share_id_is_answered_at_the_edge(self):
         # Not with a distribution error response, for the reason below -- and not by serving a

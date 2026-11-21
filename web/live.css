@@ -1,0 +1,89 @@
+/*
+ * The live view and the device tracker, on top of style.css. Kept out of style.css on purpose:
+ * style.css is part of every frozen share's pinned bundle, and nothing a share renders uses these.
+ */
+
+.live-page main { max-width: 1180px; margin: 0 auto; padding: 0 12px 24px; }
+
+.live-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.live-card .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.live-card h2 { margin: 0; }
+.now-val {
+  font-variant-numeric: tabular-nums;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.live-card .chart { width: 100%; }
+.chart-svg { width: 100%; height: auto; display: block; overflow: hidden; }
+.chart-svg .grid { stroke: var(--grid); stroke-width: 1; }
+.chart-svg .zeroline { stroke: var(--baseline); stroke-width: 1; }
+.chart-svg .tick { fill: var(--text-muted); font-size: 10px; }
+.chart-svg .tick.unit { fill: var(--text-secondary); }
+.chart-svg .now-line { stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 2 3; }
+.chart-svg .event { stroke: var(--text-primary); stroke-width: 1.2; stroke-dasharray: 3 2; }
+.chart-svg .event-label { fill: var(--text-primary); font-size: 10px; }
+
+.live-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; margin-top: 12px; }
+.live-foot .hint { font-variant-numeric: tabular-nums; }
+
+/* ------------------------------------------------------------------ device tracker */
+
+.tracker main { max-width: 760px; }
+.tracker .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.tracker select, .tracker input[type="text"], .tracker input[type="datetime-local"] {
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  min-height: 40px;
+}
+.tracker select { min-width: 12em; }
+.tracker input[type="text"] { flex: 1 1 12em; }
+
+/* State buttons: big enough to hit while holding a kettle. */
+.states { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin: 12px 0; }
+.states button {
+  min-height: 64px;
+  font-size: 1.05rem;
+  font-weight: 600;
+  border-radius: var(--radius);
+}
+.states button[aria-pressed="true"] { outline: 3px solid var(--series-1); outline-offset: 1px; }
+.states button.off { border-style: dashed; }
+
+button.primary { background: var(--series-1); color: #fff; border-color: transparent; }
+button.danger { color: var(--critical); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.tracker button { min-height: 40px; }
+
+.events-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.events-table th, .events-table td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--grid); }
+.events-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.events-table tr.deleted td { text-decoration: line-through; color: var(--text-muted); }
+.events-table tr.pending td { color: var(--text-muted); font-style: italic; }
+.events-table .edit { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.events-table .edit button { min-height: 32px; padding: 2px 8px; }
+
+.toast {
+  position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+  background: var(--text-primary); color: var(--surface-1);
+  padding: 10px 14px; border-radius: var(--radius);
+  display: flex; gap: 12px; align-items: center; z-index: 10;
+}
+.toast button { background: transparent; color: inherit; border-color: currentColor; }
+
+@media (max-width: 620px) {
+  .live-grid { grid-template-columns: 1fr; }
+  .topbar .brand .sub { display: none; }
+}

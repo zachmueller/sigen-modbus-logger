@@ -64,14 +64,14 @@ new AuditStack(app, 'SigenAudit', {
 });
 
 // The live stream, in its own region. Its own env, and the same tags.
-if (cfg.liveRegion) {
-	new LiveStack(app, 'SigenLive', {
+const live = cfg.liveRegion
+	? new LiveStack(app, 'SigenLive', {
 		env: { account: cfg.accountId, region: cfg.liveRegion },
 		tags: commonProps.tags,
 		cfg,
-		description: 'Live stream: IoT policy and rule, the five-minute table',
-	});
-}
+		description: 'Live stream: IoT policy and rule, the five-minute table, the live API',
+	})
+	: null;
 
 const pool = new AuthPoolStack(app, 'SigenAuthPool', {
 	...commonProps, cfg,
@@ -93,6 +93,11 @@ if (edge) {
 		...commonProps, cfg,
 		edgeVersionArn: edge.edgeVersion.edgeArn,
 		callbackApiDomain: pool.callbackApiDomain,
+		// Across regions: SigenSite is us-east-1 and the API is in live_region. A weak
+		// reference resolves that with Fn::GetStackOutput naming the producer's region, and
+		// orders the deploy -- SigenLive first. live_api_domain is the escape hatch if that
+		// ever stops resolving: set it and the reference is not made at all.
+		liveApiDomain: cfg.liveApiDomain || live?.apiDomain,
 		description: 'CloudFront distribution, behaviours and the published page',
 	});
 }

@@ -21,8 +21,12 @@
  * through CloudFormation or a stack output; this stack only attaches a policy to it, by id.
  */
 import * as cdk from 'aws-cdk-lib';
+import * as path from 'path';
 import { Construct } from 'constructs';
+import { ownPackageLambdaCode } from './archive-bundle';
 import { CloudConfig } from './config';
+
+const LAMBDA_DIR = path.resolve(__dirname, '../../lambda');
 
 /** The one topic. live.py's live_topic default in config.py must equal it; a test checks. */
 export const LIVE_TOPIC = 'sigen/live';
@@ -30,6 +34,12 @@ export const LIVE_TOPIC = 'sigen/live';
 export const PI_CLIENT_ID = 'sigen-pi';
 /** How long a message stays in the table: the width of the live chart. */
 export const LIVE_WINDOW_S = 300;
+/** Concurrent viewers, all told. IoT allows one connection per client id, so this is a hard cap. */
+export const VIEWER_SLOTS = 10;
+/** Of those, how many an anonymous visitor may take. The rest are for signed-in callers. */
+export const PUBLIC_SLOTS = 8;
+/** Viewer client ids are this plus the slot number. */
+export const VIEWER_CLIENT_PREFIX = 'sigen-view-';
 
 export interface LiveStackProps extends cdk.StackProps {
 	cfg: CloudConfig;
@@ -37,6 +47,8 @@ export interface LiveStackProps extends cdk.StackProps {
 
 export class LiveStack extends cdk.Stack {
 	readonly table: cdk.aws_dynamodb.Table;
+	/** `<id>.execute-api.<region>.amazonaws.com`, for SigenSite's /api/live/* origin. */
+	readonly apiDomain: string;
 
 	constructor(scope: Construct, id: string, props: LiveStackProps) {
 		super(scope, id, props);
@@ -159,6 +171,131 @@ export class LiveStack extends cdk.Stack {
 					cloudwatchLogs: { logGroupName: ruleErrors.logGroupName, roleArn: ruleRole.roleArn },
 				},
 			},
+		});
+
+
+		// ==== the API a page talks to ====================================================
+		// Seed (read the last five minutes) and session (admit a viewer to the stream), both
+		// through CloudFront so they are same-origin with the page.
+		if (!cfg.liveIotEndpoint) {
+			throw new Error('cloud.json: live_iot_endpoint is empty, so the live API would hand '
+				+ 'out URLs to nowhere. aws iot describe-endpoint --endpoint-type iot:Data-ATS '
+				+ `--region ${this.region}`);
+		}
+		if (!cfg.livePublic) {
+			throw new Error('cloud.json: live_public is false, but the authorizer that locks the '
+				+ 'live API behind sign-in is not built yet. Leave it true for now.');
+		}
+
+		// ---- what a viewer may do, before the session policy narrows it to one id -------
+		const liveFnRole = new cdk.aws_iam.Role(this, 'LiveFnRole', {
+			assumedBy: new cdk.aws_iam.ServicePrincipal('lambda.amazonaws.com'),
+			managedPolicies: [cdk.aws_iam.ManagedPolicy.fromAwsManagedPolicyName(
+				'service-role/AWSLambdaBasicExecutionRole')],
+		});
+		// The ten ids ENUMERATED, not `sigen-view-*`. The cap is the number of ids a viewer
+		// can ever connect as, so it is written out where it can be counted.
+		const viewerClients = Array.from({ length: VIEWER_SLOTS },
+			(_, i) => arn(`client/${VIEWER_CLIENT_PREFIX}${i}`));
+		const viewerRole = new cdk.aws_iam.Role(this, 'ViewerRole', {
+			assumedBy: new cdk.aws_iam.ArnPrincipal(liveFnRole.roleArn),
+			description: 'Subscribe-only access to the live topic, as one of ten client ids',
+			maxSessionDuration: cdk.Duration.hours(1),
+		});
+		viewerRole.addToPolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['iot:Connect'], resources: viewerClients,
+		}));
+		viewerRole.addToPolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['iot:Subscribe'], resources: [arn(`topicfilter/${LIVE_TOPIC}`)],
+		}));
+		viewerRole.addToPolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['iot:Receive'], resources: [arn(`topic/${LIVE_TOPIC}`)],
+		}));
+
+		// ---- the function ------------------------------------------------------------------
+		const liveFn = new cdk.aws_lambda.Function(this, 'LiveFn', {
+			runtime: cdk.aws_lambda.Runtime.PYTHON_3_12,
+			handler: 'handler.lambda_handler',
+			code: ownPackageLambdaCode(path.join(LAMBDA_DIR, 'live')),
+			role: liveFnRole,
+			memorySize: 256,
+			timeout: cdk.Duration.seconds(10),
+			environment: {
+				TABLE: this.table.tableName,
+				VIEWER_ROLE_ARN: viewerRole.roleArn,
+				IOT_ENDPOINT: cfg.liveIotEndpoint,
+				TOPIC: LIVE_TOPIC,
+				CLIENT_PREFIX: VIEWER_CLIENT_PREFIX,
+				SLOTS: String(VIEWER_SLOTS),
+				PUBLIC_SLOTS: String(PUBLIC_SLOTS),
+				WINDOW_S: String(LIVE_WINDOW_S),
+				// Same reason as the ingest Lambda's: TZ is reserved, so the handler copies it.
+				CAPTURE_TZ: cfg.captureTz,
+			},
+			logGroup: new cdk.aws_logs.LogGroup(this, 'LiveFnLogs', {
+				retention: cdk.aws_logs.RetentionDays.ONE_MONTH,
+				removalPolicy: cdk.RemovalPolicy.DESTROY,
+			}),
+			description: 'Live seed and viewer admission. See cloud/lambda/live/handler.py.',
+		});
+		// Read both partitions; write only the slot leases. It can no more write a live point
+		// than the rule can write a lease.
+		liveFnRole.addToPolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['dynamodb:Query'],
+			resources: [this.table.tableArn],
+			conditions: { 'ForAllValues:StringEquals': { 'dynamodb:LeadingKeys': ['live', 'slot'] } },
+		}));
+		liveFnRole.addToPolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'],
+			resources: [this.table.tableArn],
+			conditions: { 'ForAllValues:StringEquals': { 'dynamodb:LeadingKeys': ['slot'] } },
+		}));
+		liveFnRole.addToPolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['sts:AssumeRole'], resources: [viewerRole.roleArn],
+		}));
+
+		// ---- HTTP API ------------------------------------------------------------------------
+		// API Gateway rather than a function URL for the one thing a function URL lacks:
+		// throttling. The session route is public and each call can cost an AssumeRole, so it
+		// is the route a stranger could lean on; the stage refuses past these rates with a 429
+		// before the function -- or the bill -- sees it.
+		const api = new cdk.aws_apigatewayv2.CfnApi(this, 'LiveApi', {
+			name: `sigen-live-${this.stackName}`, protocolType: 'HTTP',
+		});
+		const integration = new cdk.aws_apigatewayv2.CfnIntegration(this, 'LiveIntegration', {
+			apiId: api.ref, integrationType: 'AWS_PROXY',
+			integrationUri: liveFn.functionArn,
+			integrationMethod: 'POST', payloadFormatVersion: '2.0',
+		});
+		const routes: Array<[string, string, string, number, number]> = [
+			// [construct id, route key, permission path, rate/s, burst]
+			['SeedRoute', 'GET /api/live/seed', 'api/live/seed', 2, 10],
+			['SessionRoute', 'POST /api/live/session', 'api/live/session', 1, 10],
+		];
+		const routeSettings: Record<string, unknown> = {};
+		for (const [id, routeKey, permPath, rate, burst] of routes) {
+			new cdk.aws_apigatewayv2.CfnRoute(this, id, {
+				apiId: api.ref, routeKey,
+				target: cdk.Fn.join('', ['integrations/', integration.ref]),
+			});
+			liveFn.addPermission(`${id}Invoke`, {
+				principal: new cdk.aws_iam.ServicePrincipal('apigateway.amazonaws.com'),
+				sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${api.ref}/*/*/${permPath}`,
+			});
+			routeSettings[routeKey] = { ThrottlingRateLimit: rate, ThrottlingBurstLimit: burst };
+		}
+		new cdk.aws_apigatewayv2.CfnStage(this, 'LiveStage', {
+			apiId: api.ref, stageName: '$default', autoDeploy: true,
+			// Anything without its own line above -- a route added later and forgotten -- gets the
+			// tightest setting rather than the account default of thousands a second.
+			defaultRouteSettings: { throttlingRateLimit: 1, throttlingBurstLimit: 5 },
+			routeSettings,
+		});
+		this.apiDomain = `${api.ref}.execute-api.${this.region}.amazonaws.com`;
+		new cdk.CfnOutput(this, 'LiveApiDomain', {
+			value: this.apiDomain,
+			description: 'SigenSite reads this across regions; live_api_domain in cloud.json is '
+				+ 'the fallback if that reference ever fails',
 		});
 
 		new cdk.CfnOutput(this, 'LiveTableName', { value: this.table.tableName });

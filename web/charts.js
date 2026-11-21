@@ -182,10 +182,18 @@ const Charts = (function () {
   }
 
   // -- gap rule: how many empty buckets may be bridged before the line breaks.
+  // -- GAP_CADENCES is the one number both renderers share: the bucketed rule here joins
+  // -- samples exactly GAP_CADENCES cadences apart and breaks one bucket later, and
+  // -- gapLimitS() is the same rule for raw timestamps (web/livechart.js), which jitter --
+  // -- so its threshold sits half a cadence past, between the join and the break.
+
+  const GAP_CADENCES = 3;
 
   function maxGapBuckets(bucketS, cadenceS) {
-    return Math.max(2, Math.ceil(3 * (cadenceS || bucketS) / bucketS));
+    return Math.max(2, Math.ceil(GAP_CADENCES * (cadenceS || bucketS) / bucketS));
   }
+
+  function gapLimitS(cadenceS) { return (GAP_CADENCES + 0.5) * (cadenceS || 2); }
 
   function segments(values, bucketS, cadenceS) {
     const limit = maxGapBuckets(bucketS, cadenceS);
@@ -608,5 +616,8 @@ const Charts = (function () {
 
   return { el, svg, clear, LineChart, BandChart, CrosshairGroup, sparkline,
            fmtTime, fmtVal, toLocalInput, fromLocalInput, zoneName,
-           palette, slotColor };
+           palette, slotColor,
+           // For web/livechart.js, which draws a scrolling window rather than a bucketed one
+           // but must look like the same charts: same margins, ticks, hatches and gap rule.
+           margins: M, niceTicks, tickDec, hatchDefs, gapLimitS, offsetAt };
 })();

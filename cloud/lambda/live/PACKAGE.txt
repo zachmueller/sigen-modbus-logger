@@ -1,0 +1,5 @@
+# Repository modules the live handler imports, copied flat beside handler.py at synth by
+# ownPackageLambdaCode() in cloud/infrastructure/lib/archive-bundle.ts. tests/test_live.py
+# asserts this is exactly the handler's import closure.
+livefields.py
+panels.py

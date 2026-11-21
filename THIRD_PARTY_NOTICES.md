@@ -12,6 +12,15 @@ standard library only, and `tests/` asserts that. Two optional parts do have the
 Both are ordinary AWS SDKs under Apache 2.0, installed from their own registries rather
 than vendored here, so their notices travel with those installs.
 
+The live stream adds two more, neither on the capture or decode path:
+
+  - `live.py`, the live sidecar, imports **paho-mqtt** (EPL 2.0 / EDL 1.0) from Debian's
+    `python3-paho-mqtt` package. Imported lazily and only there, the way boto3 is in
+    `sync.py`; its notices travel with the package.
+  - `web/vendor/mqtt.min.js` is **MQTT.js 5.16.1** (MIT), the browser's MQTT client for the
+    live view. It IS vendored -- the viewer has no build step and fetches nothing from a CDN
+    -- so its licence is reproduced in full below. See the next section.
+
 One *data* file is derived from third-party source, and its licence travels with it.
 
 ## `regmap.json`
@@ -60,3 +69,36 @@ correction is annotated in `lib.DTYPE_OVERRIDE` rather than silently applied.
 
 Sigenergy and SigenStor are trademarks of their owner. This project is not
 affiliated with, endorsed by or supported by Sigenergy.
+
+## `web/vendor/mqtt.min.js`
+
+The browser build `dist/mqtt.min.js` from the npm package
+[`mqtt@5.16.1`](https://www.npmjs.com/package/mqtt/v/5.16.1)
+([mqttjs/MQTT.js](https://github.com/mqttjs/MQTT.js)), unmodified: 340,797 bytes, sha256
+`75873d04a6400bbbac093b3602caf06f44ed92ee032925e1f4f21c03eba05a4e`. Taken from the registry
+tarball after checking it against the registry's own sha512 integrity value, and compared
+byte-for-byte with jsDelivr's copy of the same file. `tests/test_live.py` pins the size and
+hash, so a changed file is a failing test rather than a silent upgrade.
+
+It is loaded only by the live view and the device tracker (`web/live.html`,
+`web/devices.html`), never by the archive viewer, and it is not part of any share's pinned
+bundle. Its licence, as shipped in the package:
+
+```
+The MIT License (MIT)
+=====================
+
+Copyright (c) 2015-2016 MQTT.js contributors
+---------------------------------------
+
+*MQTT.js contributors listed at <https://github.com/mqttjs/MQTT.js#contributors>*
+
+Copyright 2011-2014 by Adam Rudd
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
