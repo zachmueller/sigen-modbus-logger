@@ -1506,6 +1506,94 @@ for an unrelated reason. **A feature that announces itself at startup is a featu
 absence is visible; one that only speaks when it acts is indistinguishable from one that was
 never enabled.**
 
+### 46. IoT Core does not enforce a presigned URL's expiry, so the URL cannot be the gate
+
+The live view hands each browser a SigV4-presigned `wss://<endpoint>/mqtt` URL. Three things
+about that URL were measured against the real endpoint before any of it was written down,
+because none of them is stated where it can be found:
+
+```
+token appended AFTER signing,  X-Amz-Expires=60   -> CONNACK success, SUBACK granted
+token INSIDE the canonical query                   -> "WebSocket handshake error, connection not upgraded"
+URL used 20 s after a 10 s X-Amz-Expires           -> CONNACK success, SUBACK granted
+```
+
+The service name is `iotdevicegateway`; that one is documented. The token placement is not,
+and getting it wrong is a refused handshake that says nothing about why. And the expiry is
+simply not checked: a URL is good for as long as the credentials that signed it, which for the
+shortest STS session is fifteen minutes, and anyone it is copied to can use it for that long.
+
+So the design does not rest on the URL. Each URL is signed with STS credentials whose session
+policy allows `iot:Connect` as **one** client id, and IoT allows **one** connection per client
+id -- also measured: a second connection with the same id connected and the first was dropped.
+A copied URL is therefore always slot N, and using it knocks slot N's owner off rather than
+adding an eleventh viewer. The cap is ten client ids, enforced by IoT, and nothing about the
+URL's lifetime enters into it.
+
+**A presigned URL's expiry is a claim the server may not check. Gate on what the credential
+behind it is allowed to do, and test the expiry before relying on it.**
+
+### 47. A stage that names routes by key does not wait for them
+
+The live API's first deploy failed and rolled back:
+
+```
+CREATE_FAILED  AWS::ApiGatewayV2::Stage  LiveStage  Unable to find Route by key
+               POST /api/live/session within the provided RouteSettings
+```
+
+`RouteSettings` -- the per-route throttles -- is a map keyed by route KEY, a plain string. A
+string is not a reference, so CloudFormation saw no dependency from the stage to the routes and
+created the stage first, at which point the keys it named did not exist. Nothing in synth, in
+`tsc`, or in the diff could have shown it: the template was correct, only its order was not.
+
+The fix is one line, `stage.node.addDependency(route)` for each route, and a test pins it. The
+rollback was clean -- the stream's first leg, deployed earlier in the same stack, was untouched,
+because a failed update restores the previous template rather than deleting anything.
+
+**A reference made by name is not a dependency CloudFormation can see. Where one resource
+names another by a string, declare the order.**
+
+### 48. A full Unix datagram queue blocks the sender on Linux and not on macOS
+
+The live tap must never make the capture loop wait, so its socket is non-blocking, and a test
+fills the receiver's queue and times every send. On the Mac that test passed with the socket
+switched to BLOCKING -- a mutation that should have failed it. macOS answers a send to a full
+`AF_UNIX` datagram queue with `ENOBUFS` at once, blocking or not; Linux, which is what the Pi
+runs, blocks the sender until the reader drains. The timing test could only ever prove the
+property on the platform the code does not run on.
+
+The test now also asserts the socket's mode directly (`gettimeout() == 0.0`), which holds on
+both. The timing part stays, because on Linux it is the behavioural check.
+
+The same session found the opposite trap on the Pi, and it was a relief rather than a bug: a
+sender under the logger's exact hardening (`ProtectSystem=strict`, `PrivateTmp=yes`) can
+`sendto()` a socket in another unit's `RuntimeDirectory=`. A read-only mount does not stop a
+socket connect, which needs write permission on the socket inode, not on the filesystem.
+Checked with two throwaway `systemd-run` units before the design depended on it.
+
+**A test of a platform-dependent property, run on the other platform, can pass for the wrong
+reason. Mutation-test it there, and assert the property itself, not only its effect.**
+
+### 49. Headless Chrome will not make a window narrower than 500 px
+
+A screenshot of the device tracker at `--window-size=400,…` showed the page running off the
+right edge: state buttons cut in half, the status pill missing. Measured over the DevTools
+protocol, there was no overflow at all -- `innerWidth` was **500**, and the document was exactly
+500 wide. Headless Chrome clamps the window to a 500 px minimum, so the screenshot was the left
+400 px of a correct 500 px layout.
+
+Emulating the device instead (`Emulation.setDeviceMetricsOverride`, 390 × 844, `mobile: true`)
+gave `innerWidth` 390 and a page that fitted. A real fix landed along the way -- `main` is a flex
+column, and a flex child's default `min-width: auto` lets one wide table row stretch its card,
+which `min-width: 0` prevents -- but it was not what the screenshot was showing.
+
+This is FINDINGS 36's lesson again from another side: a headless screenshot is a picture of the
+renderer's viewport, which is not necessarily the one asked for.
+
+**Before calling a layout broken in a headless browser, measure `innerWidth` and the document's
+`scrollWidth` in the same session. Emulate a phone; do not imitate one with a window size.**
+
 ---
 
 ## Known limits
@@ -1538,11 +1626,13 @@ never enabled.**
   than the Mac's `pmset autorestart`. But no reboot has been tested, and the thing to watch on
   the first one is not whether it starts: it is whether `systemd-time-wait-sync` held it until
   the clock was right (FINDINGS 38).
-- **Capture latency has not been measured on the Pi.** Every number in this file comes from a
-  Mac Studio. A Pi 4 is a slower machine on a 100/1000 Mbit NIC, and the logger's budget is a
-  2000 ms tick against a ~30 ms request, so there is a lot of headroom — but "a lot of headroom"
-  is an argument, not a measurement. Run `decode.py --latency 10` over a day of Pi-captured
-  archive and compare against the 70–133 ms medians above before believing the port was free.
+- **Capture latency on the Pi: measured once, before the live tap.** Over the 26 hours ending
+  2026-11-21 21:00 NZDT, `decode.py --latency 60` on the Pi's own archive gave hourly medians of
+  **54–97.5 ms** (1.8x spread, oscillating, no trend) and p95 of 99–225 ms, with one isolated
+  15 s tick. That is inside the Mac's 70–133 ms range. The same measurement over a day with the
+  live tap and sidecar running has **not been made yet**; until it has, "the live stream costs
+  the logger nothing" is an argument (one non-blocking `sendto()` a tick, a `Nice=10` sidecar),
+  not a measurement.
 - **Thumb-drive wear is bounded by argument, not by observation.** The open `.bin` is flushed
   every record, which is ~28 MB a day, ~10 GB a year. `bootstrap.sh` removes the avoidable
   writers — journal to RAM, no swapfile, `noatime`, logrotate — and `keep_days` bounds the
@@ -1583,3 +1673,9 @@ never enabled.**
   asserts they stay gated, and names the two dead routes explicitly.
 - The smart-load span `30124..30199` is deliberately uncaptured, and `30163+124` is
   rejected by the device, so folding it in would need a 4th request.
+- **The live stream has no history and no replay.** It keeps five minutes, drops everything
+  while the Pi is disconnected from IoT, and a viewer who opens the page after an outage sees the
+  gap hatched rather than filled. The archive is the record; the live view is a window.
+- **The live view's cost is an estimate.** IoT Core and DynamoDB pricing was not checked against
+  a bill when the stream went live. The first month's invoice is the measurement.
+

@@ -1649,9 +1649,9 @@ class TestTheHostedViewerDoesNotPoll(unittest.TestCase):
     that tile is normally not published yet, so the 404 was cached as "no data here" for the
     life of the page.
 
-    `cloud/README.md` has always said so: *"No live view. Tiles appear when the logger
-    rotates."* The page was contradicting it with a box that was checked by default. See
-    FINDINGS 34.
+    `cloud/README.md` has always said so -- now *"No live view in the archive viewer. Tiles
+    appear when the logger rotates"*, since /live is a separate page on a separate path. The
+    page was contradicting it with a box that was checked by default. See FINDINGS 34.
 
     When this was written the functionality was scoped rather than deleted, because serve.py
     on the LAN decoded on demand and polling it was exactly right. The local viewer is gone

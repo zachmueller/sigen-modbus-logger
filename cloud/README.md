@@ -35,7 +35,9 @@ before the script loads. The page here is byte-for-byte the page `serve.py` serv
 | `/p/{uid}`, `/share/*` | **public** — a shared view, copied at share time |
 | `/v/{version}/*` | public, immutable — the pinned viewer bundles a share renders with |
 | `/auth/*` | public; `/auth/callback` sets the cookies, `/auth/refresh` renews them |
-| everything else | public: `index.html`, `app.js`, `tiles.js`, `charts.js`, `style.css` |
+| `/live`, `/api/live/*` | **public while `live_public` is true** (the default); the same gate when false. One flag moves both, and the API's authorizer with them |
+| `/devices`, `/api/tracker/*` | the gate, always -- the tracker writes -- **and** an API Gateway authorizer, because the API's own hostname is reachable beside CloudFront |
+| everything else | public: `index.html`, `app.js`, `tiles.js`, `charts.js`, `style.css`, the live pages' scripts |
 
 There is no `/login`. The gate redirects straight to the Cognito Hosted UI, so there is
 nothing for such a path to do.
@@ -189,7 +191,7 @@ aws acm wait certificate-validated --certificate-arn <arn> --profile <profile> \
 
 ### The stacks
 
-There are **five**. Four form an ordered chain, and auth is two of them:
+There are **six**. Four form an ordered chain, and auth is two of them:
 
 ```sh
 npx cdk deploy SigenData     --profile <profile>   # bucket, ingest Lambda, S3 events
@@ -217,6 +219,10 @@ stacks rather than one.
 
 `SigenSite` prints the distribution domain. That is the target for the second `CNAME`
 above, and it is the last manual step — after it propagates, the site is live.
+
+The sixth, `SigenLive`, is the live stream, and the one stack not in us-east-1 -- see
+[The live stream](#the-live-stream) below. It exists only once `live_region` is set, and once it
+does `SigenSite` depends on it, so `cdk deploy SigenSite` deploys it first.
 
 ### A share is pinned to the viewer that made it
 
@@ -363,6 +369,69 @@ aws lambda invoke --function-name <IngestFunctionName> --cli-read-timeout 420 \
     --cli-binary-format raw-in-base64-out /dev/stdout
 ```
 
+## The live stream
+
+The archive viewer is up to an hour behind by design. The live view is a second, parallel path
+that is two seconds behind and keeps five minutes:
+
+```
+Pi:  log.py --unix datagram--> live.py --MQTT/TLS, X.509--> AWS IoT Core (ap-southeast-2)
+                                                               |  topic sigen/live
+                                         topic rule -> DynamoDB, pk "live", 5-minute TTL
+browser:  POST /api/live/session -> a presigned wss:// URL for ONE viewer slot
+          MQTT subscribe, then GET /api/live/seed (the table) -> merge on the record timestamp
+```
+
+**Sydney, not Auckland**: IoT Core is not offered in ap-southeast-6. Everything in `SigenLive`
+is in `live_region`, and `SigenSite` reads the API's domain across regions with a weak
+reference (`Fn::GetStackOutput` naming that region). `live_api_domain` in `cloud.json` is the
+fallback if that ever stops resolving.
+
+**What the Pi may do: connect as `sigen-pi`, publish to `sigen/live`.** No subscribe, no
+DynamoDB -- the rule writes the table with its own role, and that role may write only the
+`live` partition. The certificate is made by hand so its private key goes from IoT straight to
+a gitignored file and never through CloudFormation:
+
+```sh
+umask 077; mkdir -p live-cert
+aws iot create-keys-and-certificate --set-as-active --region ap-southeast-2 --profile <profile> \
+  --certificate-pem-outfile live-cert/certificate.pem.crt \
+  --private-key-outfile live-cert/private.pem.key --query certificateId --output text
+#   -> put that id in cloud.json as live_cert_id; the endpoint is
+aws iot describe-endpoint --endpoint-type iot:Data-ATS --region ap-southeast-2 --profile <profile>
+#   -> live_iot_endpoint in cloud.json, and live_endpoint in the Pi's config.json
+```
+
+`deploy/pi/provision.sh` pushes `live-cert/` to the Pi, mode 600. The key is PKCS#1, whose PEM
+header has the word RSA between BEGIN and PRIVATE, which is why `bin/leak-check.sh`'s pattern
+allows one there.
+
+**Ten viewers, enforced by IoT.** `POST /api/live/session` leases one of ten slots -- a
+conditional write in the live table, 150 s, renewed every 60 s, released by a hidden tab -- and
+returns a URL presigned with STS credentials whose session policy allows connecting as that
+slot's client id and no other. IoT allows one connection per client id, so ten ids is ten
+viewers, however a URL is shared. Eight are open to anonymous visitors; two are kept for
+signed-in callers, so a full public page cannot lock the household out of the tracker. The
+URL's own `X-Amz-Expires` is not enforced by IoT (FINDINGS 46), which is why the session
+policy, not the URL, is the gate. The session route is throttled to 1 request/s, the seed to
+2/s, and CloudFront caches the seed for two seconds.
+
+**Locking it.** Set `"live_public": false` in `cloud.json` and `cdk deploy SigenSite`. That one
+flag puts the edge gate on `/live` and `/api/live/*` and the authorizer on the live API's
+routes; the landing page stops linking to `/live`. It is also the kill switch if the bill
+ever moves.
+
+**The device tracker** (`/devices`) is a phone page for logging when an appliance changes
+state, against the same live house load. Devices and per-device states have generated ids, so
+renames break nothing; one state per device is its *off* state and cannot be archived; nothing
+is ever deleted. Each tap records the phone's clock, its measured offset from the server and how
+good that estimate was, when the gateway received it, and the newest point the Pi's stream had
+delivered -- `tEst` is computed once from those, and a correction is a separate `tEdit`.
+`GET /api/tracker/export` returns everything as JSON for offline analysis. The authorizer is
+the edge gate's own verifier (`auth-edge/jwt.js`) and config (`gateConfig()`), copied in at
+synth, so the two gates are one decision made twice; events record a 12-hex hash of the
+caller's address, never the address.
+
 ## Cost
 
 Well under **$1/month**. There is no Route53 hosted zone — DNS lives at the registrar
@@ -372,10 +441,18 @@ its tiles (a few cents), an ingest Lambda that runs 24 times a day and sits well
 the free tier, and CloudFront traffic for a handful of viewers, which does not register.
 Cognito is free under 50 monthly active users; ACM certificates are free.
 
+**The live stream changes that, and is the part to watch.** An estimate, not a bill: IoT Core
+messaging and the rule's action at one message every two seconds come to roughly US$2–3 a
+month; each viewer adds about 1,800 delivered messages an hour. The two DynamoDB tables are
+provisioned inside the always-free allowance (on-demand has none). The worst case is above the
+$10 budget alarm: ten viewers held all month would add roughly $13–16, and a flood pinned at
+the session route's throttle roughly $5–9 more. `"live_public": false` stops both.
+
 ## What is deliberately not here
 
-- **No live view.** Tiles appear when the logger rotates, so the hosted page is up to an
-  hour behind and says so. `serve.py` on the LAN is the live one. The page now agrees: the
+- **No live view in the archive viewer.** Tiles appear when the logger rotates, so `/view` is
+  up to an hour behind and says so; `/live` is the live one, a separate page on a separate path
+  (above), and it keeps five minutes rather than history. The page now agrees: the
   *Updates* group and `Download CSV` are `data-server-only` and hidden here, because a poll
   cannot return anything new (`web/tiles.js` caches for the life of the page) and `/api/csv`
   is not a route a tile source has. A browser reload is what picks up a new batch, and the

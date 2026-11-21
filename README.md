@@ -42,7 +42,7 @@ Developed against, and tested on, exactly one unit:
 |---|---|
 | Model | SigenStor EC 10.0 SP AU — single phase, one battery pack |
 | Firmware | `V100R001C22SPC116` |
-| Host | Raspberry Pi 4, booting from USB, Raspberry Pi OS Lite (Bookworm), `/usr/bin/python3` 3.11, two systemd units |
+| Host | Raspberry Pi 4, booting from USB, Raspberry Pi OS Lite (Bookworm), `/usr/bin/python3` 3.11, four systemd units |
 | Cadence | 0.5 Hz fast tier, indefinitely |
 
 Every latency measurement in [docs/FINDINGS.md](docs/FINDINGS.md) was taken on the previous
@@ -78,8 +78,15 @@ Worth reading once before pointing this at your own hardware.
   writes the serial in plain text too; `.gitignore` covers both by default.
 - **The capture host listens on nothing.** It used to run a local viewer on `0.0.0.0:8787`
   with no authentication, which meant anyone who could reach the host could read your
-  telemetry. That is gone. The Pi opens one *outbound* connection to the inverter and one to
-  S3, and accepts nothing but SSH. **Never port-forward either the inverter or the host.**
+  telemetry. That is gone. The Pi opens one *outbound* connection to the inverter, one to S3
+  and -- with the live stream on -- one to AWS IoT Core, and accepts nothing but SSH. The live
+  sidecar's Unix socket is a file under `/run`, mode 600, reachable only by the run-as user;
+  it is not a network listener. **Never port-forward either the inverter or the host.**
+- **The live stream is public by default.** `/live` shows the last five minutes of house
+  load, which says whether someone is home. It carries `noindex`, admits at most eight
+  anonymous viewers at once, and `"live_public": false` in `cloud.json` puts it behind the same
+  Google sign-in as everything else. The device tracker at `/devices` is gated from the start.
+  See [cloud/README.md](cloud/README.md).
 - **The telemetry leaves your LAN, and that is the design.** `sync.py` uploads to a bucket
   you own, under a credential that can `PutObject` and nothing else — no `GetObject`, no
   `ListBucket` — so a key lifted off the Pi cannot read the archive back or enumerate it.
@@ -178,6 +185,19 @@ then `~/.config/sigen/config.json`.
 | `s3_prefix` | `raw/` | Key prefix. Must end with `/`. |
 | `aws_profile` | — | Named `~/.aws` profile. Credentials never live in `config.json`. |
 | `sync_enabled` | `false` | Master switch for `sync.py`. Off in the defaults; **true** in the shipped example, because on a capture host the upload is the only path the data has. |
+| `watchdog_unit` | `sigen-watchdog` | Staleness check unit name: `<name>.service` plus `<name>.timer`. |
+| `live_enabled` | `false` | The live stream: `log.py` offers each record to `live.py`, which publishes it. Off by default and in the example; the Pi's own config sets it true. |
+| `live_unit` | `sigen-live` | Live sidecar unit name. All four unit names must differ. |
+| `live_socket` | `/run/<live_unit>/live.sock` | Where `log.py` sends and `live.py` listens. The unit's `RuntimeDirectory=` creates it. |
+| `live_endpoint` | — | IoT Core data endpoint, host only (`aws iot describe-endpoint --endpoint-type iot:Data-ATS`). |
+| `live_port` | `8883` | MQTT over TLS. |
+| `live_topic` | `sigen/live` | Must match `LIVE_TOPIC` in `cloud/infrastructure/lib/live-stack.ts`; a test checks. |
+| `live_client_id` | `sigen-pi` | Must match the IoT policy; a test checks. |
+| `live_cert`, `live_key` | `<install_dir>/live-cert/…` | The device certificate and its key, as **files** -- pushed mode 600 by `provision.sh`, gitignored. |
+
+**Nothing in the `live_*` block can stop the logger.** `config.py` is the first thing `log.py`
+loads, so it validates only their types (and that `live_unit` differs from the other units);
+everything else is checked by `python3 live.py --check`, which refuses only `live.py`.
 
 ### `keep_days` is a deletion policy
 
@@ -223,22 +243,26 @@ python3 config.py --render deploy/systemd/sigen-logger.service.template
 | `decode.py` | Offline decode of the raw archive into CSV/JSONL/derived series. |
 | `dump.py` | One-shot full-map decode: what every documented register returns on this unit. |
 | `sync.py` | Copies rotated archive files to S3. The one module that needs `boto3`, imported lazily inside it. Off unless `sync_enabled` — and on a capture host it is the only path the data has. |
+| `livetap.py` | The logger's side of the live stream: offers each archived record to a Unix datagram socket and forgets it. Never raises, never blocks, logs only a change of state. Stdlib only; imported by `log.py`. |
+| `live.py` | The live sidecar: receives the tap, decodes seven metrics against the plan's own manifest, publishes to AWS IoT Core over MQTT. Never touches the inverter. The one module that needs `paho-mqtt`, imported lazily. `--stdout` and `--check` work without it. |
+| `livefields.py` | Which seven metrics the stream carries and how each is drawn -- labels and colours read from `panels.py`, not restated. Shared by `live.py` and the live Lambda. |
 | `panels.py` | The presentation contract: which fields make up which chart, and which are "live". Data only; imports nothing. Read by `ingest.py` and shipped to the page in `meta.json`. |
 | `tiles.py` | The wire format the page reads, so a live window and a frozen share cannot disagree. Not a CLI. |
 | `series.py` | Archive index, bucket aggregation and health scan. Not a CLI. |
 | `ingest.py` | An archive directory to a directory of precomputed tiles. Knows nothing about S3, which is what makes it testable. Not a CLI. |
 | `cloud/` | The hosted viewer: CDK stacks, the ingest and share Lambdas, and the maintenance scripts — a raw backfill, a tile rebuild, and one that gives older shares their own page. Deploy-time only; see [cloud/README.md](cloud/README.md). |
-| `web/` | The page: one HTML file, one stylesheet, three scripts — the renderer, the charts, and the tile adapter. Published by the site stack. No framework, no CDN. |
+| `web/` | The archive viewer -- one HTML file, one stylesheet, three scripts: the renderer, the charts and the tile adapter -- plus the live view (`live.html`, `live.js`) and the device tracker (`devices.html`, `devices.js`), which share `livechart.js`, `live.css` and the vendored MQTT client in `web/vendor/`. Published by the site stack. No framework, no build step, no CDN. `web/dev/` holds mocks for checking the live pages headlessly and is never published. |
 | `regmap_gen.py` | Regenerates `regmap.json` from the upstream register definitions. |
 | `regmap.json` | The register map: 358 fields, 10 alarm appendices, 6 enums. Generated, not hand-written. |
-| `bin/status.sh` | Health check: clock sync, all three units, recent heartbeats, gap/degraded counts, the timers, which address is actually being polled, archive size, free space. No sudo. |
+| `bin/status.sh` | Health check: clock sync, all four units, recent heartbeats, gap/degraded counts, the timers, which address is actually being polled, the live tap and sidecar, archive size, free space. No sudo. |
 | `bin/latest.sh` | Newest values, vertically. The "is it working right now?" view. No sudo. |
 | `bin/watchdog.py` | The check that pushes rather than waiting to be read. Tells "the inverter stopped answering" apart from "the capture process is stuck", and notifies on a change of state. No sudo. |
 | `bin/leak-check.sh` | Run before every push: does anything installation-specific appear in a tracked file, now or in history? |
-| `deploy/systemd/*.template` | The three units and the two timers, rendered from config at install time. |
+| `deploy/systemd/*.template` | The four units and the two timers, rendered from config at install time. |
 | `deploy/systemd/install-logger.sh`, `uninstall-logger.sh` | Unit install/removal for the logger. Verifies the rendered unit *before* installing it. Needs sudo. |
 | `deploy/systemd/install-sync.sh`, `uninstall-sync.sh` | The same for the uploader's service and timer. Checks boto3 and the credential *as the user the unit will run as*. |
 | `deploy/systemd/install-watchdog.sh`, `uninstall-watchdog.sh` | The same for the staleness check. Warns rather than fails when `alert.conf` is missing or too readable — a check that cannot tell you anything is worth installing loudly, not quietly. |
+| `deploy/systemd/install-live.sh`, `uninstall-live.sh` | The same for the live sidecar. Refuses unless `live_enabled` is true and `live.py --check` passes as the run-as user. `bootstrap.sh` runs it last and carries on if it fails. |
 | `deploy/systemd/_lib.sh` | The render → verify → install → enable → prove-it sequence both installers share. |
 | `deploy/pi/bootstrap.sh` | Runs **on the Pi**: packages, timezone, the clock, flash-wear settings, the watchdog, logrotate, the units. The one description of a configured host. |
 | `deploy/pi/provision.sh` | Runs **on your workstation**: rsyncs the code, pushes `config.json` and one AWS profile over SSH, then runs `bootstrap.sh`. Idempotent; re-running is how you deploy a change. |
@@ -575,6 +599,15 @@ survives the capture host being off, and costs the inverter nothing. For anythin
 that, `decode.py` reads the raw archive at the full 2 s cadence over all 358 documented
 registers.
 
+**The live view is the other half of that trade.** `/live` draws seven metrics over the last
+five minutes, a point every two seconds, from a separate path: `log.py` offers each record to
+`live.py` on the Pi, which publishes it to AWS IoT Core; a topic rule keeps five minutes in
+DynamoDB to seed a page that has just opened; the browser subscribes over MQTT-over-WebSocket.
+It adds no reads of the inverter, replays nothing after an outage -- the archive is where gaps
+are filled -- and keeps nothing beyond five minutes. `/devices`, behind sign-in, logs when an
+appliance changes state against that same live load. Both are described in
+[cloud/README.md](cloud/README.md).
+
 > **There used to be a local viewer**, `serve.py`, on `0.0.0.0:8787`. It was removed with the
 > move to a Pi: it was the host's only listening port and its only unauthenticated exposure,
 > and the hosted page had made it redundant for everything except a close look at an odd
@@ -796,27 +829,32 @@ Retention never prunes it: `keep_days` only touches `*.bin.gz`.
 
 ## Deployment
 
-A **Raspberry Pi 4 booting from a USB drive**, running two systemd units as an ordinary user.
+A **Raspberry Pi 4 booting from a USB drive**, running four systemd units as an ordinary user.
 Nothing here needs privilege, and the host listens on nothing but SSH.
 
 ```
 <install_dir>/               code (rsync'd by provision.sh)
 <install_dir>/config.json    local config — pushed separately, never rsync'd over
 <install_dir>/data/          archive: the open .bin, rotated .bin.gz, manifests, .uploaded.json
-<install_dir>/logs/          sigen.log, sigen.err, sync.log, sync.err, watchdog.log, watchdog.err
+<install_dir>/logs/          sigen.log, sigen.err, sync.log, sync.err, watchdog.log, watchdog.err,
+                             live.log, live.err
 <install_dir>/logs/watchdog.state   what the last check reported, so the next one does not repeat it
 <install_dir>/logs/logger-host      the address actually being polled (see Rediscovery)
+<install_dir>/logs/live.state       the live sidecar's counts and its newest published message
+<install_dir>/live-cert/     IoT certificate and key, mode 600 -- pushed separately, never rsync'd
+/run/sigen-live/live.sock    the tap's socket, created and removed by the live unit
 <install_dir>/alert.conf     notification target, mode 600 — pushed separately, never rsync'd
 ~/.aws/credentials           one profile, PutObject only — pushed separately
 ```
 
-### The three units
+### The four units
 
 | Unit | What it is | Why it is its own unit |
 |---|---|---|
 | `sigen-logger.service` | `log.py --seconds 0 --discover`, `Restart=always`, `Nice=-5` | The latency-sensitive one. It must win contention and nothing may be able to restart it as a side effect. |
 | `sigen-sync.timer` → `sigen-sync.service` | `sync.py --once`, `Type=oneshot`, every 5 minutes | A job that finishes, not a daemon. Separate so restarting the uploader cannot interrupt capture; it reads rotated files and writes only its own ledger. |
 | `sigen-watchdog.timer` → `sigen-watchdog.service` | `bin/watchdog.py --stale-after 1800`, `Type=oneshot`, every 15 minutes | Separate from the logger for the reason that matters: **a check inside the process it is checking cannot report that process being wedged.** Distinguishing that from "the inverter stopped answering" is the whole job. |
+| `sigen-live.service` | `live.py`, `Restart=on-failure`, `Nice=10`, `CPUQuota=25%`, `MemoryMax=128M` | The opposite of the logger: the process that must lose every contention. It names the logger in no ordering or requirement directive in either direction -- the two meet only at a socket, and either can be absent. Stopping it needs no logger restart. |
 
 Four details in those units are load-bearing:
 
@@ -957,7 +995,7 @@ the identifier a second time.
 ### Monitoring
 
 ```sh
-bin/status.sh                          # clock, all three units, heartbeats, timers, archive, space
+bin/status.sh                          # clock, all four units, heartbeats, timers, live, archive, space
 bin/latest.sh                          # newest record, vertical
 python3 sync.py --status               # uploaded, pending, stranded, when it last ran
 python3 bin/watchdog.py --dry-run      # is capture stale, and which of the device or logger
