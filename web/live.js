@@ -34,6 +34,11 @@
     window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   let charts = [];
   let tz = [];
+  // 'grid' (the default: every chart at a glance) or 'column' (one per row, each as large as
+  // the window allows). ?layout= overrides, so a link can ask for either; the choice is kept.
+  const LAYOUT_KEY = 'sigen.live.layout';
+  let layout = (new URLSearchParams(location.search).get('layout')
+                || localStorage.getItem(LAYOUT_KEY) || 'grid') === 'column' ? 'column' : 'grid';
   let lastDraw = 0;
   let drawnVersion = -1;
 
@@ -71,10 +76,28 @@
     }
   }
 
+  /**
+   * How tall a chart should be. In the grid, a tile. In a column, as large as the window allows:
+   * the smaller of "the viewport, less the sticky header and the card's own heading" and the
+   * chart's width -- so on a wide screen each chart is one screen tall, and on a phone held
+   * upright it is square rather than a strip.
+   */
+  function heightFor(c) {
+    if (layout !== 'column') return 150;
+    const top = document.querySelector('.topbar');
+    const chrome = (c.card.offsetHeight - c.host.offsetHeight) + (top ? top.offsetHeight : 0) + 28;
+    const width = c.host.clientWidth || window.innerWidth;
+    return Math.max(180, Math.min(window.innerHeight - chrome, width));
+  }
+
   function build(series) {
     const root = $('charts');
     C.clear(root);
-    charts = series.map((spec) => {
+    // Every card first, and only then the charts. A chart takes its width from its host when
+    // it is built, and while the grid held only the first card, auto-fit gave that card the
+    // whole row: the first chart was built ~1900 px wide and then squeezed into a third of
+    // that, with its text shrunk to match. The second was built at half width.
+    const made = series.map((spec) => {
       const value = C.el('span', { class: 'now-val', text: '—' });
       const host = C.el('div', { class: 'chart' });
       const card = C.el('article', { class: 'card live-card', 'data-key': spec.key }, [
@@ -82,11 +105,50 @@
         host,
       ]);
       root.appendChild(card);
-      const chart = new Live.LiveChart(host, Object.assign({ windowS: WINDOW_S }, spec));
-      return { spec, chart, value, host };
+      return { spec, value, host, card };
     });
+    charts = made.map((c) => Object.assign(c, {
+      chart: new Live.LiveChart(c.host, Object.assign({ windowS: WINDOW_S }, c.spec,
+                                                      { height: heightFor(c) })),
+    }));
+    for (const c of charts) observer.observe(c.host);
     document.body.dataset.charts = String(charts.length);
   }
+
+  // Any chart whose host changed width, or whose height the layout now wants different, is
+  // rebuilt -- one pass per frame however many resize events arrive.
+  let relayoutQueued = false;
+  function relayout() {
+    if (relayoutQueued) return;
+    relayoutQueued = true;
+    requestAnimationFrame(() => {
+      relayoutQueued = false;
+      let changed = false;
+      for (const c of charts) {
+        const h = heightFor(c);
+        if (c.chart.stale() || h !== c.chart.height) { c.chart.resize(h); changed = true; }
+      }
+      if (changed) redraw();
+    });
+  }
+  const observer = window.ResizeObserver ? new ResizeObserver(relayout) : { observe() {} };
+
+  function setLayout(mode) {
+    layout = mode === 'column' ? 'column' : 'grid';
+    localStorage.setItem(LAYOUT_KEY, layout);
+    document.body.dataset.layout = layout;
+    $('charts').classList.toggle('column', layout === 'column');
+    for (const b of document.querySelectorAll('#layout button')) {
+      b.setAttribute('aria-pressed', String(b.dataset.layout === layout));
+    }
+    // Now, not on the next frame: the column changes every card's width at once.
+    for (const c of charts) c.chart.resize(heightFor(c));
+    if (charts.length) redraw();
+  }
+  for (const b of document.querySelectorAll('#layout button')) {
+    b.addEventListener('click', () => setLayout(b.dataset.layout));
+  }
+  setLayout(layout);
 
   function redraw() {
     const now = clock.now();
@@ -174,10 +236,8 @@
     },
   });
 
-  window.addEventListener('resize', () => {
-    for (const c of charts) { c.chart.build(); }
-    redraw();
-  });
+  // A window resize changes the column's heights even where no card's width moved.
+  window.addEventListener('resize', relayout);
 
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {

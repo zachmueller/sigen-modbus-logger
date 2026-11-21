@@ -12,6 +12,15 @@
   margin-top: 12px;
 }
 
+.topbar-right { display: flex; align-items: center; gap: 10px; }
+
+/* Column layout: one chart per row, nearly the full width of the window -- so the grid's
+   max-width does not apply -- and live.js sets each chart's height. */
+.live-page[data-layout="column"] main { max-width: none; }
+.live-grid.column { grid-template-columns: 1fr; }
+.live-grid.column .chart-svg .tick { font-size: 12px; }
+.live-grid.column .now-val { font-size: 1.25rem; }
+
 .live-card .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
 .live-card h2 { margin: 0; }
 .now-val {

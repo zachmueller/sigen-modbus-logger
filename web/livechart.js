@@ -416,6 +416,9 @@ const Live = (function () {
       this.width = Math.max(320, this.host.clientWidth || 640);
       this.pw = this.width - M.l - M.r;
       this.ph = this.height - M.t - M.b;
+      // About one y gridline per 45 px, so a chart drawn a screen tall gets a finer scale
+      // than a 150 px tile rather than four lines stretched across it.
+      this.yTicks = Math.max(3, Math.min(10, Math.round(this.ph / 45)));
       this.pxPerMs = this.pw / this.windowMs;
       C.clear(this.host);
       const id = 'lc-' + this.spec.key + '-' + Math.random().toString(36).slice(2, 8);
@@ -450,7 +453,7 @@ const Live = (function () {
     yDomain(values) {
       const s = this.spec;
       if (s.domain) {
-        const t = C.niceTicks(s.domain[0], s.domain[1], 4);
+        const t = C.niceTicks(s.domain[0], s.domain[1], this.yTicks || 4);
         return [s.domain[0], s.domain[1], t.length > 1 ? t[1] - t[0] : s.domain[1] - s.domain[0]];
       }
       let lo = Math.min(...values), hi = Math.max(...values);
@@ -471,7 +474,7 @@ const Live = (function () {
         const tooLoose = (hi - lo) < 0.5 * (this.hi - this.lo);
         if (fits && !tooLoose) return [this.lo, this.hi, this.step];
       }
-      const ticks = C.niceTicks(lo, hi, 4);
+      const ticks = C.niceTicks(lo, hi, this.yTicks || 4);
       const step = ticks.length > 1 ? ticks[1] - ticks[0] : (hi - lo);
       return [Math.min(lo, Math.floor(lo / step) * step),
               Math.max(hi, Math.ceil(hi / step) * step), step];
@@ -580,6 +583,15 @@ const Live = (function () {
     }
 
     setEvents(list) { this.events = list || []; }
+
+    /** Rebuild at a new height (or the same one, at the host's current width). */
+    resize(height) {
+      if (height) this.height = Math.round(height);
+      this.build();
+    }
+
+    /** True if the host is no longer the width this chart was built for. */
+    stale() { return Math.abs(Math.max(320, this.host.clientWidth || 640) - this.width) > 2; }
   }
 
   // --------------------------------------------------------------- formatting

@@ -432,7 +432,11 @@
     }
   });
   window.addEventListener('online', flush);
-  window.addEventListener('resize', () => { if (chart) { chart.build(); drawn = -1; } });
+  // Rebuilt when its card changes width (rotation, a resize), as the live page does.
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => { if (chart && chart.stale()) { chart.resize(); draw(); } })
+      .observe($('load-chart'));
+  }
   setInterval(flush, 5000);
 
   (async function boot() {

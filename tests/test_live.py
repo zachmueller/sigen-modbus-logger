@@ -1304,6 +1304,30 @@ class TestTheLivePage(unittest.TestCase):
         self.assertIn("if (!subscribed) this.failures++;", lc)
         self.assertIn("everLive: this.everLive", lc)
 
+    def test_grid_is_the_default_and_column_is_one_toggle_away(self):
+        with open(os.path.join(HERE, "web", "live.html")) as fh:
+            html = fh.read()
+        self.assertIn('data-layout="grid" aria-pressed="true"', html)
+        self.assertIn('data-layout="column" aria-pressed="false"', html)
+        js = self.code_of(os.path.join(HERE, "web", "live.js"))
+        self.assertIn("|| localStorage.getItem(LAYOUT_KEY) || 'grid') === 'column' ? 'column' : 'grid';", js)
+        # Column: the smaller of the room on screen and the chart's own width.
+        self.assertIn("Math.min(window.innerHeight - chrome, width)", js)
+        with open(os.path.join(HERE, "web", "live.css")) as fh:
+            css = fh.read()
+        self.assertIn('.live-page[data-layout="column"] main { max-width: none; }', css)
+
+    def test_charts_are_sized_after_every_card_exists_and_follow_their_card(self):
+        # Built one by one, the first chart took its width from a grid holding one card --
+        # the whole row -- and was then squeezed, text and all, to a third of it.
+        js = self.code_of(os.path.join(HERE, "web", "live.js"))
+        b = js[js.index("function build(series)"):js.index("function relayout()")]
+        self.assertLess(b.index("root.appendChild(card);"), b.index("new Live.LiveChart("))
+        self.assertIn("new ResizeObserver(relayout)", js)
+        self.assertIn("observer.observe(c.host)", js)
+        lc = self.code_of(os.path.join(HERE, "web", "livechart.js"))
+        self.assertIn("stale() { return Math.abs(Math.max(320, this.host.clientWidth || 640) - this.width) > 2; }", lc)
+
     def test_one_gap_rule_for_both_renderers(self):
         with open(os.path.join(HERE, "web", "charts.js")) as fh:
             charts = fh.read()

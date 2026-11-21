@@ -28,7 +28,13 @@
     <h1>SigenStor live</h1>
     <p class="sub">The last five minutes, as the logger reads it. <a href="/">About</a></p>
   </div>
-  <span class="pill" id="status"><span class="dot"></span><span id="status-text">starting</span></span>
+  <div class="topbar-right">
+    <div class="presets" id="layout" role="group" aria-label="Layout">
+      <button type="button" data-layout="grid" aria-pressed="true" title="Every chart at a glance">Grid</button>
+      <button type="button" data-layout="column" aria-pressed="false" title="One chart per row, as large as the window allows">Column</button>
+    </div>
+    <span class="pill" id="status"><span class="dot"></span><span id="status-text">starting</span></span>
+  </div>
 </header>
 <main>
   <div id="notice" class="notice" hidden></div>
