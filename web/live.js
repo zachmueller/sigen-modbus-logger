@@ -3,12 +3,19 @@
  * /live: seven charts, scrolling, fed by the stream (livechart.js).
  *
  * The order of events is the design:
- *   1. claim a slot and subscribe;
- *   2. once IoT acknowledges the subscription, fetch the seed -- the last five minutes;
- *   3. merge the two by `t`, so the overlap is drawn once.
- * Seeding first would leave a gap between the seed and the first streamed message. If the
- * seed came from CloudFront's two-second cache and predates the subscription, it is fetched
- * once more after the cache has turned over, which closes the last possible hole.
+ *   1. fetch the seed -- the last five minutes -- straight away, and claim a slot and subscribe
+ *      at the same time;
+ *   2. once IoT acknowledges the subscription, fetch the seed AGAIN;
+ *   3. merge everything by `t`, so the overlap is drawn once.
+ * The second seed is what closes the gap between the first seed and the first streamed
+ * message; if it came from CloudFront's two-second cache and predates the subscription, it is
+ * fetched once more after the cache has turned over.
+ *
+ * The first seed does NOT wait for the stream. It used to, and a browser that could not open
+ * the WebSocket at all -- a content blocker, a VPN, a work network refusing *.amazonaws.com --
+ * then drew nothing whatever, behind a pill saying "reconnecting". The data was there the whole
+ * time. Now the page always shows the last five minutes, polls the (cached) seed every ten
+ * seconds while the stream is not live, and says why the stream is not.
  *
  * The tab hidden stops the stream and frees the slot; visible again starts over, seed and all.
  */
@@ -18,6 +25,7 @@
   const SEED = SRC.seed || '/api/live/seed';
   const SESSION = SRC.session || '/api/live/session';
   const WINDOW_S = 300;
+  const POLL_MS = 10000;             // the seed, while the stream is not live
 
   const $ = (id) => document.getElementById(id);
   const clock = new Live.Clock();
@@ -45,6 +53,15 @@
     if (state === 'full') {
       n.textContent = 'The live view is full: every viewer slot is taken. Showing the last ' +
         'five minutes; it will join the stream when a slot frees up.';
+      n.hidden = false;
+    } else if (detail && !detail.everLive && detail.failures >= 2) {
+      // Never connected, more than once: almost always something between this browser and
+      // AWS IoT refusing the WebSocket, not the stream being down. Say which host, so it can be
+      // allowed.
+      n.textContent = 'The live stream cannot connect from this browser: the WebSocket to ' +
+        'AWS IoT (*.iot.ap-southeast-2.amazonaws.com) is being refused or blocked -- often by a ' +
+        'content blocker, a VPN or a work network. Showing the last five minutes instead, ' +
+        'refreshed every ten seconds.' + (detail.error ? ' (' + detail.error + ')' : '');
       n.hidden = false;
     } else if (state === 'error' && detail && detail.error) {
       n.textContent = detail.error;
@@ -135,12 +152,19 @@
     if (subscribedAt && r.body.gen < subscribedAt) setTimeout(() => seed(null), 2500);
   }
 
+  // While the stream is not live -- connecting, refused, full, failing -- the seed is the data.
+  // CloudFront caches it for two seconds, so a page polling it costs the table nothing extra.
+  let pollTimer = null;
+  function polling(on) {
+    if (on && !pollTimer) pollTimer = setInterval(() => seed(null), POLL_MS);
+    if (!on && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
   const stream = new Live.Stream({
     session: SESSION, clock,
     onState: (s, d) => {
       status(s, d);
-      // Full: still show the last five minutes, refreshed from the (cached) seed.
-      if (s === 'full') seed(null);
+      polling(s !== 'live' && s !== 'paused');
     },
     onSubscribed: (at) => seed(at),
     onMessage: (m) => {
@@ -159,11 +183,13 @@
     if (document.hidden) {
       stream.stop(true);
     } else {
+      seed(null);
       stream.start();
       tick();
     }
   });
 
+  seed(null);                          // first, and whatever the stream does
   stream.start();
   window.SIGEN_LIVE_PAGE = { stream, store, clock, seed, redraw };
   tick();

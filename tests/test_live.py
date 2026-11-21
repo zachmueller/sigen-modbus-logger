@@ -1289,6 +1289,21 @@ class TestTheLivePage(unittest.TestCase):
         self.assertIn("reconnectPeriod: 0", js)
         self.assertIn("granted[0].qos === 128", js, "a refused SUBACK must not read as quiet")
 
+    def test_the_seed_never_waits_for_the_stream(self):
+        # A browser that could not open the WebSocket used to draw nothing at all, behind a pill
+        # saying "reconnecting" -- the seed was only fetched after IoT acknowledged a
+        # subscription that never came. Both pages now seed before starting the stream, and
+        # poll the seed whenever the stream is not live.
+        for name in ("live.js", "devices.js"):
+            js = self.code_of(os.path.join(HERE, "web", name))
+            # Immediately before BOTH starts: on load, and on the tab becoming visible again.
+            self.assertEqual(len(re.findall(r"seed\(null\);\s*stream\.start\(\);", js)), 2,
+                             f"{name} must seed before every stream.start()")
+            self.assertIn("polling(s !== 'live' && s !== 'paused');", js, name)
+        lc = self.code_of(os.path.join(HERE, "web", "livechart.js"))
+        self.assertIn("if (!subscribed) this.failures++;", lc)
+        self.assertIn("everLive: this.everLive", lc)
+
     def test_one_gap_rule_for_both_renderers(self):
         with open(os.path.join(HERE, "web", "charts.js")) as fh:
             charts = fh.read()

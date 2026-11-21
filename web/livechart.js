@@ -225,6 +225,12 @@ const Live = (function () {
       this.state = 'idle';
       this.lastMessageAt = null;
       this.subscribedAt = null;
+      // Attempts since the last acknowledged subscription, and whether there has ever been one.
+      // A page that has NEVER connected is in a different situation from one that dropped: the
+      // first is usually something between this browser and IoT refusing the WebSocket (a
+      // content blocker, a VPN, a work network), and the page says so rather than spinning.
+      this.failures = 0;
+      this.everLive = false;
     }
 
     set(state, detail) {
@@ -256,7 +262,8 @@ const Live = (function () {
 
     retry(state, ms, detail) {
       if (!this.running) return;
-      this.set(state, Object.assign({ retryInMs: ms }, detail || {}));
+      this.set(state, Object.assign({ retryInMs: ms, failures: this.failures,
+                                      everLive: this.everLive }, detail || {}));
       this.after(ms, () => this.connect());
     }
 
@@ -273,6 +280,7 @@ const Live = (function () {
         return this.retry('full', Math.min(60, r.body.retry_s || 30) * 1000);
       }
       if (!r.body.ok) {
+        this.failures++;
         const ms = this.backoff;
         this.backoff = Math.min(60000, this.backoff * 2);
         return this.retry('error', ms, { error: r.body.error, status: r.status });
@@ -297,6 +305,7 @@ const Live = (function () {
         transformWsUrl: () => url,
       });
       this.client = client;
+      let subscribed = false;
       client.on('connect', () => {
         client.subscribe(s.topic, { qos: 0 }, (err, granted) => {
           // A SUBACK of 128 is IoT saying "not authorised" -- a subscription refused while the
@@ -307,6 +316,9 @@ const Live = (function () {
             return;
           }
           this.backoff = 2000;
+          subscribed = true;
+          this.failures = 0;
+          this.everLive = true;
           this.subscribedAt = this.clock.now();
           this.set('live', { slot: s.slot });
           this.onSubscribed(this.subscribedAt);
@@ -322,8 +334,10 @@ const Live = (function () {
       });
       client.on('close', () => {
         if (this.client !== client || !this.running) return;
-        // Dropped -- by the network, by IoT, or by another tab taking this slot's client id.
-        // Reconnect asks for a fresh URL and, holding the lease, the same slot.
+        // Dropped -- by the network, by IoT, or by another tab taking this slot's client id --
+        // or never opened at all. Reconnect asks for a fresh URL and, holding the lease, the
+        // same slot.
+        if (!subscribed) this.failures++;
         const ms = this.backoff;
         this.backoff = Math.min(60000, this.backoff * 2);
         this.client = null;

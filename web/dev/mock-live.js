@@ -10,6 +10,7 @@
  *   an inverter outage (markers every ~36 s)   -> orange, "device not answering"
  *   a stretch with nothing at all              -> grey, "no live data"
  * and the stream then repeats the seed's newest point once, which must be drawn once.
+ * `?fail=1` makes every connect fail instead, the way a blocked WebSocket does.
  */
 (function () {
   const series = [
@@ -58,6 +59,10 @@
   };
   Live.Stream.prototype.connect = function () {
     if (!this.running) return;
+    if (/[?&]fail=1/.test(location.search)) {           // a WebSocket that never opens
+      this.failures++;
+      return this.retry('reconnecting', 3000);
+    }
     this.set('live', { slot: 0 });
     this.subscribedAt = this.clock.now();
     this.onSubscribed(this.subscribedAt);

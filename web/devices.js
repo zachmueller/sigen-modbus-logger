@@ -338,9 +338,26 @@
     if (subscribedAt && r.body.gen < subscribedAt) setTimeout(() => seed(null), 2500);
   }
 
+  // The same rule as live.js: the seed never waits for the stream, and while the stream is not
+  // live the (cached) seed is polled, so a browser that cannot open the WebSocket still sees
+  // the load it is logging against.
+  let pollTimer = null;
+  function polling(on) {
+    if (on && !pollTimer) pollTimer = setInterval(() => seed(null), 10000);
+    if (!on && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
   const stream = new Live.Stream({
     session: API + 'live', clock,
-    onState: (s, d) => status(s, d),
+    onState: (s, d) => {
+      status(s, d);
+      polling(s !== 'live' && s !== 'paused');
+      if (d && !d.everLive && d.failures >= 2) {
+        notice('The live stream cannot connect from this browser (the WebSocket to ' +
+               '*.iot.ap-southeast-2.amazonaws.com is refused or blocked). Logging still works; ' +
+               'the load chart refreshes every ten seconds instead.');
+      }
+    },
     onSubscribed: (at) => seed(at),
     onMessage: (m) => { m._seenPhone = Date.now(); store.add(m); },
   });
@@ -408,6 +425,7 @@
     if (document.hidden) {
       stream.stop(true);
     } else {
+      seed(null);
       stream.start();
       flush();
       tick();
@@ -421,6 +439,7 @@
     status('connecting');
     await sync();
     await loadDevices();
+    seed(null);
     stream.start();
     flush();
     tick();
