@@ -23,7 +23,7 @@ const WEB = path.join(REPO_ROOT, 'web');
  * the pinned bundle. Being absent from this list is also what lets the Site deployment prune the
  * object it left behind.
  */
-const HTML_ENTRY_POINTS = ['view', 'live'] as const;
+const HTML_ENTRY_POINTS = ['view', 'live', 'devices'] as const;
 
 /** Copied verbatim; their extensions tell S3 what they are. */
 const WEB_ASSETS = ['app.js', 'tiles.js', 'charts.js', 'style.css', 'favicon.svg'] as const;
@@ -48,7 +48,8 @@ const VIEWER_SOURCES = ['index.html', ...WEB_ASSETS] as const;
  * Only published once SigenLive exists (props.liveApiDomain), so a deployment without the live
  * stack has no page that would fail on its first fetch.
  */
-const LIVE_ASSETS = ['live.js', 'livechart.js', 'live.css', 'vendor/mqtt.min.js'] as const;
+const LIVE_ASSETS = ['live.js', 'livechart.js', 'live.css', 'vendor/mqtt.min.js',
+	'devices.js'] as const;
 
 /**
  * The identity of the viewer bundle: sha256 over the name and bytes of every file above,
@@ -187,6 +188,27 @@ export class SiteStack extends cdk.Stack {
 				// view is locked); the Host header does not, or API Gateway cannot route it.
 				originRequestPolicy: cdk.aws_cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
 				...(livePublic ? {} : { edgeLambdas: gateSigningBody }),
+			};
+			// The device tracker: gated from the first deploy, whatever live_public says --
+			// it WRITES, and everyone on the allowlist may. The page and its API are gated
+			// together for the same reason /view and /agg/* are.
+			liveBehaviors['/devices'] = {
+				origin: siteOrigin,
+				viewerProtocolPolicy: cdk.aws_cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+				cachePolicy: cdk.aws_cloudfront.CachePolicy.CACHING_DISABLED,
+				compress: true,
+				edgeLambdas: gate,
+			};
+			liveBehaviors['/api/tracker/*'] = {
+				origin: liveOrigin,
+				viewerProtocolPolicy: cdk.aws_cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+				allowedMethods: cdk.aws_cloudfront.AllowedMethods.ALLOW_ALL,
+				cachePolicy: cdk.aws_cloudfront.CachePolicy.CACHING_DISABLED,
+				originRequestPolicy: cdk.aws_cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+				// gateSigningBody, not gate: the edge logs "no body exposed; a POST will be refused
+				// unsigned" for any /api/ request it is not given the body of, which here would be
+				// a false alarm on every tap. The header it adds is harmless to API Gateway.
+				edgeLambdas: gateSigningBody,
 			};
 		}
 
@@ -613,9 +635,12 @@ function handler(event) {
  * in its data and live in its code, and a link sent in August was drawn by whatever existed when
  * it was opened. The bundle below is the other half of that promise.
  */
-/** The extensionless pages this deployment writes. `live` only when the live stack exists. */
+/** The pages that exist only once SigenLive does, and the web/ file each is built from. */
+const LIVE_PAGES: Record<string, string> = { live: 'live.html', devices: 'devices.html' };
+
+/** The extensionless pages this deployment writes. The live ones only with the live stack. */
 function entryPoints(withLive: boolean): string[] {
-	return HTML_ENTRY_POINTS.filter((f) => withLive || f !== 'live');
+	return HTML_ENTRY_POINTS.filter((f) => withLive || !(f in LIVE_PAGES));
 }
 
 function buildSite(out: string, cfg: CloudConfig, version: string, withLive: boolean): boolean {
@@ -672,17 +697,22 @@ function buildSite(out: string, cfg: CloudConfig, version: string, withLive: boo
 	// be one this function publishes, checked here because a missing one is a page that renders
 	// blank with a 404 in the console and nothing on the screen.
 	if (withLive) {
-		const livePage = fs.readFileSync(path.join(WEB, 'live.html'), 'utf-8');
 		const published = new Set<string>([...WEB_ASSETS, ...LIVE_ASSETS].map((f) => '/' + f));
-		for (const m of livePage.matchAll(/(?:src|href)="(\/[^"]*)"/g)) {
-			const ref = m[1];
-			if (!published.has(ref) && !(HTML_ENTRY_POINTS as readonly string[]).includes(ref.slice(1))
-				&& ref !== '/') {
-				throw new Error(`web/live.html loads ${ref}, which neither WEB_ASSETS nor LIVE_ASSETS `
-					+ `publishes. Add it to LIVE_ASSETS.`);
+		for (const [entry, source] of Object.entries(LIVE_PAGES)) {
+			const page = fs.readFileSync(path.join(WEB, source), 'utf-8');
+			for (const m of page.matchAll(/(?:src|href)="(\/[^"]*)"/g)) {
+				const ref = m[1];
+				// API routes are data, not files this function could publish; the tracker links
+				// its own export for download.
+				if (ref.startsWith('/api/')) continue;
+				if (!published.has(ref) && !(HTML_ENTRY_POINTS as readonly string[]).includes(ref.slice(1))
+					&& ref !== '/') {
+					throw new Error(`web/${source} loads ${ref}, which neither WEB_ASSETS nor `
+						+ `LIVE_ASSETS publishes. Add it to LIVE_ASSETS.`);
+				}
 			}
+			fs.writeFileSync(path.join(out, entry), page);
 		}
-		fs.writeFileSync(path.join(out, 'live'), livePage);
 		for (const f of LIVE_ASSETS) {
 			fs.mkdirSync(path.dirname(path.join(out, f)), { recursive: true });
 			fs.copyFileSync(path.join(WEB, f), path.join(out, f));

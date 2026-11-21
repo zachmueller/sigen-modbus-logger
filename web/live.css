@@ -67,7 +67,16 @@ button.danger { color: var(--critical); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 .tracker button { min-height: 40px; }
 
-.events-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+/* style.css makes main a flex column, whose children default to min-width: auto -- so one wide
+   table row stretches its card past a phone's screen, and the page scrolls sideways. */
+.live-page main > * { min-width: 0; }
+
+.events-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; table-layout: fixed; }
+#events th:nth-child(1), #events td:nth-child(1) { width: 7.4em; }
+#events th:nth-child(2), #events td:nth-child(2) { width: 5.5em; overflow-wrap: anywhere; }
+#events input[type="datetime-local"] { min-width: 0; width: 100%; max-width: 15em; min-height: 32px; padding: 4px 6px; }
+#state-table td:first-child { width: 45%; }
+#state-table input[type="text"] { width: 100%; box-sizing: border-box; }
 .events-table th, .events-table td { text-align: left; padding: 6px 4px; border-bottom: 1px solid var(--grid); }
 .events-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .events-table tr.deleted td { text-decoration: line-through; color: var(--text-muted); }

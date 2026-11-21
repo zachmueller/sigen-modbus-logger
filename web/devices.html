@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<!--
+  The device tracker: pick a device, tap its state as you change it in real life, and the time
+  of every tap is logged -- by every clock available -- to line up later against whole-house
+  load from the archive. Built for a phone held in one hand next to an appliance.
+
+  Served as the extensionless /devices entry point by SigenSite, and ALWAYS behind the edge gate
+  (and its API behind the authorizer), whatever live_public says: it writes. See site-stack.ts.
+-->
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex, nofollow">
+<title>SigenStor devices</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+<link rel="stylesheet" href="/live.css">
+</head>
+<body class="viz-root live-page tracker" data-state="loading">
+<header class="topbar">
+  <div class="brand">
+    <h1>Device tracker</h1>
+    <p class="sub">Tap a state as you change it. <a href="/live">Live view</a></p>
+  </div>
+  <span class="pill" id="status"><span class="dot"></span><span id="status-text">starting</span></span>
+</header>
+<main>
+  <div id="notice" class="notice" hidden></div>
+
+  <section class="card">
+    <div class="row">
+      <select id="device" aria-label="Device"></select>
+      <button id="new-device-btn" type="button">New device</button>
+    </div>
+    <form id="new-device" class="row" hidden>
+      <input type="text" id="new-name" placeholder="Name, e.g. Heat pump" maxlength="60" required>
+      <input type="text" id="new-desc" placeholder="Description (optional)" maxlength="300">
+      <button type="submit" class="primary">Create</button>
+      <button type="button" id="new-cancel">Cancel</button>
+    </form>
+    <p class="hint" id="device-desc"></p>
+    <div class="states" id="states" role="group" aria-label="States"></div>
+    <details id="manage">
+      <summary>Manage this device</summary>
+      <form id="rename" class="row">
+        <input type="text" id="rename-name" maxlength="60" aria-label="Device name">
+        <input type="text" id="rename-desc" maxlength="300" aria-label="Description">
+        <button type="submit">Save</button>
+        <button type="button" id="archive-device" class="danger">Archive device</button>
+      </form>
+      <form id="add-state" class="row">
+        <input type="text" id="state-name" placeholder="New state, e.g. defrosting" maxlength="60" required>
+        <button type="submit">Add state</button>
+      </form>
+      <table class="events-table" id="state-table"><tbody></tbody></table>
+    </details>
+  </section>
+
+  <section class="card live-card">
+    <div class="card-head"><h2>House load</h2><span class="now-val" id="load-now">—</span></div>
+    <div class="chart" id="load-chart"></div>
+    <div class="legend">
+      <span class="item"><span class="swatch box key-nodata"></span>inverter not answering</span>
+      <span class="item"><span class="swatch box key-norecords"></span>no live data</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head"><h2>Logged changes</h2><span class="hint" id="outbox-note"></span></div>
+    <table class="events-table" id="events">
+      <thead><tr><th>Time</th><th>State</th><th>Adjust</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="hint">
+      <span id="clock-note"></span> ·
+      <a href="/api/tracker/export" download="sigen-device-events.json">Export everything (JSON)</a>
+    </p>
+  </section>
+</main>
+<div class="toast" id="toast" hidden><span id="toast-text"></span><button type="button" id="toast-undo">Undo</button></div>
+<script src="/charts.js"></script>
+<script src="/vendor/mqtt.min.js"></script>
+<script src="/livechart.js"></script>
+<script src="/devices.js"></script>
+</body>
+</html>

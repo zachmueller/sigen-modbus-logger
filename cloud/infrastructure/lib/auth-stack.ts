@@ -276,6 +276,39 @@ export class AuthPoolStack extends cdk.Stack {
 	}
 }
 
+/**
+ * What a gate needs to know to verify a session: the pool, the client, the allowlist, the cookie
+ * names. Baked into the edge gate's config.js at synth, and into the live API's authorizer
+ * (live-stack.ts) the same way -- one function, so the two gates cannot disagree about who is
+ * allowed in.
+ *
+ * The key ORDER is load-bearing as well as the values: this object is JSON.stringify'd into the
+ * edge bundle, whose hash decides whether a deploy publishes a new Lambda@Edge version. Factoring
+ * it out of AuthEdgeStack had to leave that file byte-identical, and did.
+ */
+export function gateConfig(cfg: CloudConfig) {
+	requirePool(cfg);
+	// cfg.region, not props.env.region: bin/app.ts sets the latter FROM the former, so
+	// they are the same string, and deriving the gate's issuer from the same field the
+	// Hosted UI domain comes from means there is one place a region can be wrong.
+	const issuer =
+		`https://cognito-idp.${cfg.region}.amazonaws.com/${cfg.cognitoUserPoolId}`;
+	// Every value here is a literal from cloud.json, which is the whole point of the
+	// two-stack split: nothing below is a CloudFormation token, so it survives being
+	// written to a file at synth time.
+	return {
+		clientId: cfg.cognitoClientId,
+		issuer: issuer,
+		jwksUri: issuer + '/.well-known/jwks.json',
+		hostedUiDomain: hostedUiDomain(cfg),
+		allowedEmails: cfg.allowedEmails,
+		// The same object the callback Lambda is given as environment variables, so the
+		// function that READS the cookies and the function that SETS them cannot disagree
+		// about what they are called. See COOKIES at the top of this file.
+		cookies: COOKIES,
+	};
+}
+
 /** The read gate: a viewer-request Lambda@Edge with the ids and the allowlist baked in. */
 export class AuthEdgeStack extends cdk.Stack {
 	public readonly edgeVersion: cdk.aws_lambda.IVersion;
@@ -286,25 +319,7 @@ export class AuthEdgeStack extends cdk.Stack {
 		requireAuth(cfg);
 		requirePool(cfg);
 
-		// cfg.region, not props.env.region: bin/app.ts sets the latter FROM the former, so
-		// they are the same string, and deriving the gate's issuer from the same field the
-		// Hosted UI domain comes from means there is one place a region can be wrong.
-		const issuer =
-			`https://cognito-idp.${cfg.region}.amazonaws.com/${cfg.cognitoUserPoolId}`;
-		// Every value here is a literal from cloud.json, which is the whole point of the
-		// two-stack split: nothing below is a CloudFormation token, so it survives being
-		// written to a file at synth time.
-		const config = {
-			clientId: cfg.cognitoClientId,
-			issuer: issuer,
-			jwksUri: issuer + '/.well-known/jwks.json',
-			hostedUiDomain: hostedUiDomain(cfg),
-			allowedEmails: cfg.allowedEmails,
-			// The same object the callback Lambda is given as environment variables, so the
-			// function that READS the cookies and the function that SETS them cannot disagree
-			// about what they are called. See COOKIES at the top of this file.
-			cookies: COOKIES,
-		};
+		const config = gateConfig(cfg);
 
 		const code = cdk.aws_lambda.Code.fromAsset(path.join(LAMBDA_DIR, 'auth-edge'), {
 			assetHashType: cdk.AssetHashType.OUTPUT,

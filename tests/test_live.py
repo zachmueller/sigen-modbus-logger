@@ -1211,11 +1211,11 @@ class TestTheViewerCap(unittest.TestCase):
 
     def test_the_public_routes_are_throttled(self):
         for route in ("'GET /api/live/seed'", "'POST /api/live/session'"):
-            self.assertRegex(self.ts, re.escape(route) + r", '[^']+', \d+, \d+\]")
+            self.assertRegex(self.ts, re.escape(route) + r"[^\]]*, \d+, \d+\]")
         self.assertIn("defaultRouteSettings: { throttlingRateLimit: 1", self.ts)
         # The stage names routes by key, which CloudFormation cannot see as a dependency; the
         # first deploy created the stage first and was refused. The order is now explicit.
-        self.assertIn("for (const r of routeResources) stage.addDependency(r);", self.ts)
+        self.assertIn("for (const r of routeResources) stage.node.addDependency(r);", self.ts)
 
     def test_the_function_writes_only_slot_leases(self):
         self.assertIn("'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'", self.ts)
@@ -1297,6 +1297,281 @@ class TestTheLivePage(unittest.TestCase):
         with open(os.path.join(HERE, "web", "livechart.js")) as fh:
             js = fh.read()
         self.assertGreaterEqual(js.count("C.gapLimitS("), 2, "line breaks and hatches")
+
+
+# ---------------------------------------------------------------- the device tracker
+
+def load_tracker():
+    spec = importlib.util.spec_from_file_location(
+        "tracker_handler", os.path.join(HERE, "cloud", "lambda", "tracker", "handler.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class FakeTrackerStore:
+    """The tracker table in memory: (pk, sk) -> item, with the real conditions."""
+
+    def __init__(self):
+        self.items = {}
+
+    def config(self):
+        return [dict(v) for (pk, _), v in sorted(self.items.items()) if pk == "CFG"]
+
+    def get(self, pk, sk):
+        v = self.items.get((pk, sk))
+        return dict(v) if v else None
+
+    def put_new(self, item):
+        key = (item["pk"], item["sk"])
+        if key in self.items:
+            return False
+        self.items[key] = dict(item)
+        return True
+
+    def update(self, pk, sk, fields, remove=()):
+        cur = self.items.get((pk, sk))
+        if cur is None:
+            return None
+        cur.update(fields)
+        for k in remove:
+            cur.pop(k, None)
+        return dict(cur)
+
+    def events(self, device, since=None, limit=None, newest_first=True):
+        out = sorted((v for (pk, sk), v in self.items.items() if pk == "EV#" + device
+                      and (since is None or sk >= f"{int(since):013d}")),
+                     key=lambda v: v["sk"], reverse=newest_first)
+        return [dict(v) for v in out[:limit] if True] if limit else [dict(v) for v in out]
+
+
+class TrackerFixture(unittest.TestCase):
+    def setUp(self):
+        self.h = load_tracker()
+        self.store = FakeTrackerStore()
+
+    def call(self, method, route, body=None, params=None, who="abc123def456", t_gw=1_000_000):
+        ev = {"rawPath": "/api/tracker/" + route,
+              "requestContext": {"http": {"method": method}, "timeEpoch": t_gw}}
+        if who:
+            ev["requestContext"]["authorizer"] = {"lambda": {"email_hash": who}}
+        if body is not None:
+            ev["body"] = json.dumps(body)
+        if params:
+            ev["queryStringParameters"] = params
+        r = self.h.lambda_handler(ev, None, store=self.store)
+        return r["statusCode"], json.loads(r["body"])
+
+    def device(self, name="Heat pump"):
+        st, b = self.call("POST", "devices", {"name": name, "desc": "outdoor unit"})
+        self.assertEqual(st, 200, b)
+        return b["device"]
+
+
+class TestTheTrackerFailsClosed(TrackerFixture):
+    def test_no_authorizer_context_is_a_refusal(self):
+        # A route wired up without the authorizer must not become a public write endpoint.
+        for method, route in (("GET", "devices"), ("POST", "events"), ("GET", "export")):
+            st, b = self.call(method, route, {}, who=None)
+            self.assertEqual(st, 401, route)
+        self.assertEqual(self.store.items, {})
+
+
+class TestDevicesAndStates(TrackerFixture):
+    def test_a_new_device_has_off_and_on_and_off_is_its_default(self):
+        d = self.device()
+        names = {s["name"]: s["id"] for s in d["states"]}
+        self.assertEqual(set(names), {"off", "on"})
+        self.assertEqual(d["off"], names["off"])
+
+    def test_renaming_changes_a_name_and_never_an_id(self):
+        d = self.device()
+        sid = d["states"][1]["id"]
+        st, b = self.call("PATCH", "states", {"device": d["id"], "state": sid, "name": "cooling"})
+        self.assertEqual(st, 200)
+        renamed = next(s for s in b["device"]["states"] if s["id"] == sid)
+        self.assertEqual(renamed["name"], "cooling")
+        st, b = self.call("PATCH", "devices", {"device": d["id"], "name": "Heat pump (lounge)"})
+        self.assertEqual((b["device"]["id"], b["device"]["name"]), (d["id"], "Heat pump (lounge)"))
+
+    def test_states_are_arbitrary_and_the_off_one_cannot_be_archived(self):
+        d = self.device()
+        st, b = self.call("POST", "states", {"device": d["id"], "name": "defrost cycle"})
+        self.assertEqual(st, 200)
+        self.assertIn("defrost cycle", [s["name"] for s in b["device"]["states"]])
+        st, b = self.call("PATCH", "states", {"device": d["id"], "state": d["off"], "archived": True})
+        self.assertEqual(st, 400)
+        self.assertIn("off state", b["error"])
+        on = next(s["id"] for s in d["states"] if s["name"] == "on")
+        st, b = self.call("PATCH", "devices", {"device": d["id"], "off": on})
+        self.assertEqual(b["device"]["off"], on)
+        st, _ = self.call("PATCH", "states", {"device": d["id"], "state": d["off"], "archived": True})
+        self.assertEqual(st, 200, "once it is not the off state, it may go")
+
+    def test_nothing_is_ever_deleted(self):
+        with open(os.path.join(HERE, "cloud", "lambda", "tracker", "handler.py")) as fh:
+            src = fh.read()
+        self.assertNotIn("delete_item", src)
+        with open(os.path.join(HERE, "cloud", "infrastructure", "lib", "live-stack.ts")) as fh:
+            ts = fh.read()
+        grant = ts[ts.index("// No Delete: nothing in the tracker"):]
+        grant = grant[:grant.index("}));")]
+        self.assertNotIn("DeleteItem", grant)
+
+
+class TestEvents(TrackerFixture):
+    def tap(self, d, sid, eid="eabc123456", **extra):
+        body = dict({"id": eid, "device": d["id"], "state": sid, "tPhone": 2_000_000_000_000,
+                     "sent": 2_000_000_000_500, "off": -1200, "rtt": 80, "syncAge": 3000,
+                     "piT": 1_999_999_999_000, "piSeenPhone": 2_000_000_000_100, "piLat": 70},
+                    **extra)
+        return self.call("POST", "events", body, t_gw=2_000_000_000_200)
+
+    def test_every_clock_is_recorded_and_the_estimate_uses_the_measured_offset(self):
+        d = self.device()
+        st, b = self.tap(d, d["states"][1]["id"])
+        self.assertEqual(st, 200, b)
+        e = b["event"]
+        self.assertEqual(e["tEst"], 2_000_000_000_000 - 1200)
+        for k in ("tPhone", "sent", "off", "rtt", "syncAge", "piT", "piSeenPhone", "piLat",
+                  "tGw", "tServer", "by"):
+            self.assertIn(k, e, k)
+        self.assertEqual(e["tGw"], 2_000_000_000_200)
+        self.assertEqual(e["by"], "abc123def456")
+        self.assertTrue(e["sk"].startswith(f"{e['tEst']:013d}#"))
+
+    def test_without_a_sync_the_estimate_is_the_gateways_less_the_wait(self):
+        d = self.device()
+        body = {"id": "enosync001", "device": d["id"], "state": d["off"],
+                "tPhone": 5000, "sent": 7000}
+        st, b = self.call("POST", "events", body, t_gw=1_000_000)
+        self.assertEqual(b["event"]["tEst"], 1_000_000 - 2000)
+
+    def test_a_retried_tap_is_the_same_event(self):
+        d = self.device()
+        self.tap(d, d["off"])
+        st, b = self.tap(d, d["off"])
+        self.assertEqual(st, 200)
+        self.assertTrue(b["event"]["duplicate"])
+        st, b = self.call("GET", "events", params={"device": d["id"]})
+        self.assertEqual(len(b["events"]), 1)
+
+    def test_an_edit_sits_beside_the_evidence_and_undo_is_soft(self):
+        d = self.device()
+        e = self.tap(d, d["off"])[1]["event"]
+        st, b = self.call("PATCH", "events", {"device": d["id"], "sk": e["sk"],
+                                              "tEdit": e["tEst"] - 4000, "tEst": 1, "tPhone": 1})
+        self.assertEqual(st, 200, b)
+        out = b["event"]
+        self.assertEqual(out["tEdit"], e["tEst"] - 4000)
+        self.assertEqual((out["tEst"], out["tPhone"]), (e["tEst"], e["tPhone"]),
+                         "what was recorded at the tap is never overwritten")
+        st, b = self.call("PATCH", "events", {"device": d["id"], "sk": e["sk"], "deleted": True})
+        self.assertTrue(b["event"]["deleted"])
+        st, b = self.call("GET", "events", params={"device": d["id"]})
+        self.assertEqual(len(b["events"]), 1, "an undone event is kept, marked")
+        st, b = self.call("PATCH", "events", {"device": d["id"], "sk": e["sk"], "tEdit": None})
+        self.assertNotIn("tEdit", b["event"])
+
+    def test_a_state_from_another_device_is_refused(self):
+        a, b_dev = self.device("Kettle"), self.device("Oven")
+        st, b = self.tap(a, b_dev["off"])
+        self.assertEqual(st, 400)
+
+    def test_bad_input_is_400(self):
+        d = self.device()
+        for body in ({"id": "x", "device": d["id"], "state": d["off"], "tPhone": 1},
+                     {"id": "eabcdefgh", "device": d["id"], "state": d["off"]},
+                     {"id": "eabcdefgh", "device": d["id"], "state": d["off"], "tPhone": "soon"},
+                     {"id": "eabcdefgh", "device": d["id"], "state": d["off"], "tPhone": True}):
+            st, _ = self.call("POST", "events", body)
+            self.assertEqual(st, 400, body)
+
+    def test_export_has_everything(self):
+        d = self.device()
+        self.tap(d, d["off"])
+        self.tap(d, d["off"], eid="esecond0001", tPhone=2_000_000_005_000)
+        st, b = self.call("GET", "export")
+        self.assertEqual(st, 200)
+        self.assertEqual(len(b["devices"]), 1)
+        self.assertEqual([e["id"] for e in b["events"]], ["eabc123456", "esecond0001"])
+
+    def test_the_clock_sync_route_answers_both_timestamps(self):
+        st, b = self.call("GET", "time", t_gw=4242)
+        self.assertEqual((st, b["recv"]), (200, 4242))
+        self.assertGreaterEqual(b["send"], 0)
+
+
+class TestTheAuthorizer(unittest.TestCase):
+    """cloud/lambda/authorizer/index.js: the edge gate's decision, made for the API's hostname."""
+
+    def setUp(self):
+        with open(os.path.join(HERE, "cloud", "lambda", "authorizer", "index.js")) as fh:
+            self.js = re.sub(r"/\*.*?\*/|//[^\n]*", "", fh.read(), flags=re.S)
+        with open(os.path.join(HERE, "cloud", "infrastructure", "lib", "live-stack.ts")) as fh:
+            self.ts = fh.read()
+
+    def test_it_reuses_the_gates_verifier_and_config(self):
+        self.assertIn("require('./jwt')", self.js)
+        self.assertIn("require('./config')", self.js)
+        self.assertIn("path.join(LAMBDA_DIR, 'auth-edge', 'jwt.js')", self.ts)
+        self.assertIn("const authConfig = gateConfig(cfg);", self.ts)
+
+    def test_it_checks_what_the_gate_checks(self):
+        self.assertIn("verifyIdToken(token, cfg)", self.js)
+        self.assertIn("claims.email_verified === false", self.js)
+        self.assertIn("cfg.allowedEmails.includes(email)", self.js)
+        self.assertIn("readCookie(header, cfg.cookies.id)", self.js)
+        self.assertNotIn("sigen_id", self.js, "cookie names come from COOKIES, never a literal")
+
+    def test_it_records_who_without_recording_the_address(self):
+        self.assertIn("email_hash", self.js)
+        self.assertNotRegex(self.js, r"context:\s*\{\s*email\s*:", "the address itself")
+
+    def test_the_tracker_routes_are_always_behind_it(self):
+        for route in ("'POST /api/tracker/live'", "'ANY /api/tracker/{proxy+}'"):
+            line = re.search(re.escape(route) + r"[^\]]*\]", self.ts).group(0)
+            self.assertRegex(line, r", true, \d+, \d+\]$", route)
+        self.assertIn("const liveGated = !cfg.livePublic;", self.ts)
+        self.assertIn("...(gated ? { authorizationType: 'CUSTOM', authorizerId: authorizer.ref } : {}),",
+                      self.ts)
+
+    def test_the_tracker_table_is_kept(self):
+        block = self.ts[self.ts.index("'TrackerTable'"):]
+        block = block[:block.index("});")]
+        self.assertIn("removalPolicy: cdk.RemovalPolicy.RETAIN", block)
+        self.assertIn("pointInTimeRecoveryEnabled: true", block)
+
+
+class TestTheTrackerPage(unittest.TestCase):
+    SITE = os.path.join(HERE, "cloud", "infrastructure", "lib", "site-stack.ts")
+
+    def setUp(self):
+        with open(self.SITE) as fh:
+            self.ts = fh.read()
+
+    def test_the_page_and_its_api_are_gated_whatever_live_public_says(self):
+        devices = self.ts[self.ts.index("liveBehaviors['/devices'] = {"):]
+        devices = devices[:devices.index("};")]
+        self.assertIn("edgeLambdas: gate,", devices)
+        self.assertNotIn("livePublic", devices)
+        api = self.ts[self.ts.index("liveBehaviors['/api/tracker/*'] = {"):]
+        api = api[:api.index("};")]
+        self.assertIn("edgeLambdas: gateSigningBody,", api)
+        self.assertIn("CACHING_DISABLED", api)
+        self.assertIn("ALLOW_ALL", api)
+
+    def test_every_file_it_loads_is_published(self):
+        with open(os.path.join(HERE, "web", "devices.html")) as fh:
+            refs = re.findall(r'(?:src|href)="(/[^"]*)"', fh.read())
+        lists = []
+        for name in ("WEB_ASSETS", "LIVE_ASSETS", "HTML_ENTRY_POINTS"):
+            m = re.search(rf"const {name} = \[(.*?)\] as const;", self.ts, re.S)
+            lists += re.findall(r"'([^']+)'", m.group(1))
+        published = {"/" + f for f in lists} | {"/"}
+        api = {r for r in refs if r.startswith("/api/")}
+        self.assertEqual(set(refs) - published - api, set())
+        self.assertIn("devices: 'devices.html'", self.ts)
 
 
 if __name__ == "__main__":

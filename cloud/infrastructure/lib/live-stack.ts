@@ -21,9 +21,11 @@
  * through CloudFormation or a stack output; this stack only attaches a policy to it, by id.
  */
 import * as cdk from 'aws-cdk-lib';
+import * as fs from 'fs';
 import * as path from 'path';
 import { Construct } from 'constructs';
 import { ownPackageLambdaCode } from './archive-bundle';
+import { gateConfig } from './auth-stack';
 import { CloudConfig } from './config';
 
 const LAMBDA_DIR = path.resolve(__dirname, '../../lambda');
@@ -182,10 +184,6 @@ export class LiveStack extends cdk.Stack {
 				+ 'out URLs to nowhere. aws iot describe-endpoint --endpoint-type iot:Data-ATS '
 				+ `--region ${this.region}`);
 		}
-		if (!cfg.livePublic) {
-			throw new Error('cloud.json: live_public is false, but the authorizer that locks the '
-				+ 'live API behind sign-in is not built yet. Leave it true for now.');
-		}
 
 		// ---- what a viewer may do, before the session policy narrows it to one id -------
 		const liveFnRole = new cdk.aws_iam.Role(this, 'LiveFnRole', {
@@ -254,6 +252,78 @@ export class LiveStack extends cdk.Stack {
 			actions: ['sts:AssumeRole'], resources: [viewerRole.roleArn],
 		}));
 
+		// ==== the device tracker ===========================================================
+		// Devices, their states, and every state change someone tapped -- the only thing in this
+		// stack that is not a copy of something the archive holds. So: RETAIN, and point-in-time
+		// recovery, which for a table this size costs cents.
+		//
+		// One table, two kinds of partition: CFG holds every device and state (a handful of items,
+		// read in one Query), and EV#<device> holds that device's events, sorted by their best
+		// time estimate so a window is one Query too. Ids are generated, never derived from names,
+		// so renaming a device or a state is one attribute and breaks nothing that refers to it.
+		const trackerTable = new cdk.aws_dynamodb.Table(this, 'TrackerTable', {
+			partitionKey: { name: 'pk', type: cdk.aws_dynamodb.AttributeType.STRING },
+			sortKey: { name: 'sk', type: cdk.aws_dynamodb.AttributeType.STRING },
+			billingMode: cdk.aws_dynamodb.BillingMode.PROVISIONED,
+			readCapacity: 2,
+			writeCapacity: 2,
+			pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+			removalPolicy: cdk.RemovalPolicy.RETAIN,
+		});
+
+		// The authorizer: the edge gate's check, for the API's own hostname. Same verifier
+		// (auth-edge/jwt.js), same generated config (gateConfig), so the two gates are one
+		// decision made twice rather than two decisions that could drift.
+		const authConfig = gateConfig(cfg);
+		const authorizerFn = new cdk.aws_lambda.Function(this, 'AuthorizerFn', {
+			runtime: cdk.aws_lambda.Runtime.NODEJS_22_X,
+			handler: 'index.handler',
+			code: cdk.aws_lambda.Code.fromAsset(path.join(LAMBDA_DIR, 'authorizer'), {
+				assetHashType: cdk.AssetHashType.OUTPUT,
+				bundling: {
+					image: cdk.DockerImage.fromRegistry('scratch'),
+					local: {
+						tryBundle(outputDir: string): boolean {
+							fs.copyFileSync(path.join(LAMBDA_DIR, 'authorizer', 'index.js'),
+								path.join(outputDir, 'index.js'));
+							fs.copyFileSync(path.join(LAMBDA_DIR, 'auth-edge', 'jwt.js'),
+								path.join(outputDir, 'jwt.js'));
+							fs.writeFileSync(path.join(outputDir, 'config.js'),
+								'// GENERATED AT SYNTH from cloud.json. Do not edit.\n'
+								+ 'module.exports = ' + JSON.stringify(authConfig, null, 2) + ';\n');
+							return true;
+						},
+					},
+				},
+			}),
+			memorySize: 128,
+			timeout: cdk.Duration.seconds(5),
+			logGroup: new cdk.aws_logs.LogGroup(this, 'AuthorizerLogs', {
+				retention: cdk.aws_logs.RetentionDays.ONE_MONTH,
+				removalPolicy: cdk.RemovalPolicy.DESTROY,
+			}),
+			description: 'Live API authorizer: the edge gate\'s token and allowlist check',
+		});
+
+		const trackerFn = new cdk.aws_lambda.Function(this, 'TrackerFn', {
+			runtime: cdk.aws_lambda.Runtime.PYTHON_3_12,
+			handler: 'handler.lambda_handler',
+			code: cdk.aws_lambda.Code.fromAsset(path.join(LAMBDA_DIR, 'tracker')),
+			memorySize: 256,
+			timeout: cdk.Duration.seconds(10),
+			environment: { TABLE: trackerTable.tableName },
+			logGroup: new cdk.aws_logs.LogGroup(this, 'TrackerFnLogs', {
+				retention: cdk.aws_logs.RetentionDays.ONE_MONTH,
+				removalPolicy: cdk.RemovalPolicy.DESTROY,
+			}),
+			description: 'Device tracker: devices, states, state-change events. Behind the authorizer.',
+		});
+		// No Delete: nothing in the tracker is ever deleted, only archived or marked.
+		trackerFn.addToRolePolicy(new cdk.aws_iam.PolicyStatement({
+			actions: ['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:PutItem', 'dynamodb:UpdateItem'],
+			resources: [trackerTable.tableArn],
+		}));
+
 		// ---- HTTP API ------------------------------------------------------------------------
 		// API Gateway rather than a function URL for the one thing a function URL lacks:
 		// throttling. The session route is public and each call can cost an AssumeRole, so it
@@ -262,24 +332,59 @@ export class LiveStack extends cdk.Stack {
 		const api = new cdk.aws_apigatewayv2.CfnApi(this, 'LiveApi', {
 			name: `sigen-live-${this.stackName}`, protocolType: 'HTTP',
 		});
-		const integration = new cdk.aws_apigatewayv2.CfnIntegration(this, 'LiveIntegration', {
-			apiId: api.ref, integrationType: 'AWS_PROXY',
-			integrationUri: liveFn.functionArn,
-			integrationMethod: 'POST', payloadFormatVersion: '2.0',
+		const integrate = (id: string, fn: cdk.aws_lambda.Function) =>
+			new cdk.aws_apigatewayv2.CfnIntegration(this, id, {
+				apiId: api.ref, integrationType: 'AWS_PROXY',
+				integrationUri: fn.functionArn,
+				integrationMethod: 'POST', payloadFormatVersion: '2.0',
+			});
+		const liveIntegration = integrate('LiveIntegration', liveFn);
+		const trackerIntegration = integrate('TrackerIntegration', trackerFn);
+
+		const authorizer = new cdk.aws_apigatewayv2.CfnAuthorizer(this, 'Authorizer', {
+			apiId: api.ref, name: 'session-cookie', authorizerType: 'REQUEST',
+			authorizerUri: `arn:${this.partition}:apigateway:${this.region}:lambda:path/2015-03-31/`
+				+ `functions/${authorizerFn.functionArn}/invocations`,
+			authorizerPayloadFormatVersion: '2.0',
+			enableSimpleResponses: true,
+			// No cookie, no invocation: API Gateway answers 401 itself.
+			identitySource: ['$request.header.Cookie'],
+			// Cached per cookie header, briefly. The allowlist is baked in at deploy, so a cached
+			// "yes" can only be as stale as the cookie it was keyed on.
+			authorizerResultTtlInSeconds: 60,
 		});
-		const routes: Array<[string, string, string, number, number]> = [
-			// [construct id, route key, permission path, rate/s, burst]
-			['SeedRoute', 'GET /api/live/seed', 'api/live/seed', 2, 10],
-			['SessionRoute', 'POST /api/live/session', 'api/live/session', 1, 10],
+		authorizerFn.addPermission('ApiInvokeAuthorizer', {
+			principal: new cdk.aws_iam.ServicePrincipal('apigateway.amazonaws.com'),
+			sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${api.ref}/authorizers/`
+				+ authorizer.ref,
+		});
+
+		// The live routes take the authorizer exactly when the view is locked -- the same
+		// cfg.livePublic that gates /live and /api/live/* at the edge (site-stack.ts).
+		const liveGated = !cfg.livePublic;
+		const routes: Array<[string, string, string, cdk.aws_lambda.Function,
+			cdk.aws_apigatewayv2.CfnIntegration, boolean, number, number]> = [
+			// [construct id, route key, permission path, function, integration, gated, rate/s, burst]
+			['SeedRoute', 'GET /api/live/seed', 'api/live/seed', liveFn, liveIntegration,
+				liveGated, 2, 10],
+			['SessionRoute', 'POST /api/live/session', 'api/live/session', liveFn, liveIntegration,
+				liveGated, 1, 10],
+			// The tracker page's own stream: the same handler, but behind the authorizer always,
+			// which is what entitles it to the two reserved slots.
+			['TrackerLiveRoute', 'POST /api/tracker/live', 'api/tracker/live', liveFn,
+				liveIntegration, true, 2, 10],
+			['TrackerRoute', 'ANY /api/tracker/{proxy+}', 'api/tracker/*', trackerFn,
+				trackerIntegration, true, 5, 20],
 		];
 		const routeSettings: Record<string, unknown> = {};
 		const routeResources: cdk.CfnResource[] = [];
-		for (const [id, routeKey, permPath, rate, burst] of routes) {
+		for (const [id, routeKey, permPath, fn, integration, gated, rate, burst] of routes) {
 			routeResources.push(new cdk.aws_apigatewayv2.CfnRoute(this, id, {
 				apiId: api.ref, routeKey,
 				target: cdk.Fn.join('', ['integrations/', integration.ref]),
+				...(gated ? { authorizationType: 'CUSTOM', authorizerId: authorizer.ref } : {}),
 			}));
-			liveFn.addPermission(`${id}Invoke`, {
+			fn.addPermission(`${id}Invoke`, {
 				principal: new cdk.aws_iam.ServicePrincipal('apigateway.amazonaws.com'),
 				sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${api.ref}/*/*/${permPath}`,
 			});
@@ -295,7 +400,7 @@ export class LiveStack extends cdk.Stack {
 		// routeSettings names routes by KEY, a string, so CloudFormation sees no reference and is
 		// free to create the stage first -- and the stage is then refused: "Unable to find Route
 		// by key POST /api/live/session". The first deploy of this stack failed exactly so.
-		for (const r of routeResources) stage.addDependency(r);
+		for (const r of routeResources) stage.node.addDependency(r);
 		this.apiDomain = `${api.ref}.execute-api.${this.region}.amazonaws.com`;
 		new cdk.CfnOutput(this, 'LiveApiDomain', {
 			value: this.apiDomain,
@@ -303,6 +408,7 @@ export class LiveStack extends cdk.Stack {
 				+ 'the fallback if that reference ever fails',
 		});
 
+		new cdk.CfnOutput(this, 'TrackerTableName', { value: trackerTable.tableName });
 		new cdk.CfnOutput(this, 'LiveTableName', { value: this.table.tableName });
 		new cdk.CfnOutput(this, 'PiPolicyName', {
 			value: piPolicy.ref,
