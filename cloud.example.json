@@ -28,5 +28,12 @@
 
  "__pool": "Filled in AFTER `cdk deploy SigenAuthPool`, from its UserPoolId and ClientId outputs. Leave them empty on a first deploy: SigenAuthEdge and SigenSite do not even appear in `cdk ls` until both are set, which is deliberate -- a Lambda@Edge cannot be given them as environment variables, so they are baked into its code at synth, and synthesizing before the pool exists would bake a CloudFormation token and reject every valid login.",
  "cognito_user_pool_id": "",
- "cognito_client_id": ""
+ "cognito_client_id": "",
+
+ "__live": "The live stream: cloud/infrastructure/lib/live-stack.ts, deployed as SigenLive in live_region rather than us-east-1 -- for latency to the house, and Sydney because AWS IoT Core is not offered in ap-southeast-6 (Auckland). Leave live_region empty and SigenLive is not synthesized at all. It needs its own `cdk bootstrap aws://<account>/<live_region>`. live_iot_endpoint is the account's IoT data endpoint in that region (aws iot describe-endpoint --endpoint-type iot:Data-ATS); live_cert_id is the id of the Pi's certificate, created by hand so the private key never passes through CloudFormation -- cloud/README.md has the command. Both exist before the stack does, which is why they are literals here. live_public is the one switch between 'anyone may watch' and 'only the allowlist may': it moves the page gate, the API gate and the API's authorizer together. live_api_domain is a fallback only, for if the cross-region reference SigenSite reads ever fails to resolve.",
+ "live_region": "ap-southeast-2",
+ "live_iot_endpoint": "",
+ "live_cert_id": "",
+ "live_public": true,
+ "live_api_domain": ""
 }

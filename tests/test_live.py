@@ -830,5 +830,81 @@ class TestEveryPlaceThatListsUnitsKnowsTheLiveOne(unittest.TestCase):
             self.assertTrue(any(re.search(p, header) for p in pats), header)
 
 
+# ------------------------------------------------------------------- the cloud stack
+
+class TestTheLiveStack(unittest.TestCase):
+    """cloud/infrastructure/lib/live-stack.ts, read as source: there is no CDK test harness."""
+
+    STACK = os.path.join(HERE, "cloud", "infrastructure", "lib", "live-stack.ts")
+    CONFIG_TS = os.path.join(HERE, "cloud", "infrastructure", "lib", "config.ts")
+
+    def setUp(self):
+        with open(self.STACK) as fh:
+            self.src = fh.read()
+
+    def const(self, name):
+        m = re.search(rf"export const {name} = '([^']*)';", self.src)
+        self.assertIsNotNone(m, name)
+        return m.group(1)
+
+    def test_the_pi_and_the_stack_agree_on_the_topic_and_client_id(self):
+        # Two copies by necessity -- one in Python on the Pi, one in TypeScript in the cloud --
+        # and a mismatch fails as "not authorized" at connect time, with nothing saying why.
+        self.assertEqual(self.const("LIVE_TOPIC"), config.DEFAULTS["live_topic"])
+        self.assertEqual(self.const("PI_CLIENT_ID"), config.DEFAULTS["live_client_id"])
+
+    def test_the_pi_may_connect_and_publish_and_nothing_else(self):
+        policy = self.src[self.src.index("'PiPolicy'"):self.src.index("// Attached by id")]
+        self.assertEqual(sorted(set(re.findall(r"Action: '([^']+)'", policy))),
+                         ["iot:Connect", "iot:Publish"])
+        self.assertNotIn("*", re.sub(r"/\*.*?\*/|//[^\n]*", "", policy),
+                         "no wildcard in the Pi's policy")
+        self.assertNotIn("dynamodb", policy.lower())
+
+    def test_the_rule_adds_the_keys_the_message_does_not_carry(self):
+        sql = re.search(r"sql: `([^`]*)`\s*\+\s*`([^`]*)`", self.src)
+        self.assertIsNotNone(sql)
+        text = sql.group(1) + sql.group(2)
+        self.assertIn("'live' AS pk", text)
+        self.assertIn("floor(timestamp() / 1000) + ${LIVE_WINDOW_S} AS ttl", text)
+        self.assertIn("FROM '${LIVE_TOPIC}'", text)
+        self.assertIn("timeToLiveAttribute: 'ttl'", self.src)
+        self.assertIn("name: 'pk', type: cdk.aws_dynamodb.AttributeType.STRING", self.src)
+        self.assertIn("name: 't', type: cdk.aws_dynamodb.AttributeType.NUMBER", self.src)
+
+    def test_the_rule_can_write_only_the_live_partition(self):
+        self.assertIn("'dynamodb:LeadingKeys': ['live']", self.src)
+        self.assertIn("errorAction", self.src, "a rejected write must leave a trace")
+
+    def test_the_tables_are_provisioned_inside_the_free_allowance(self):
+        # On-demand has no free tier. 25 RCU and 25 WCU are always free, across all tables.
+        rcu = sum(int(x) for x in re.findall(r"readCapacity: (\d+)", self.src))
+        wcu = sum(int(x) for x in re.findall(r"writeCapacity: (\d+)", self.src))
+        self.assertNotIn("PAY_PER_REQUEST", self.src)
+        self.assertLessEqual(rcu, 25)
+        self.assertLessEqual(wcu, 25)
+
+    def test_no_reserved_concurrency(self):
+        # The account's Lambda quota was 10, and reserving any of it is rejected outright
+        # (data-stack.ts). Asserted so the first function this stack grows cannot try.
+        self.assertNotIn("reservedConcurrentExecutions", self.src)
+
+    def test_cloud_example_names_exactly_the_keys_config_ts_accepts(self):
+        with open(os.path.join(HERE, "cloud.example.json")) as fh:
+            example = {k for k in json.load(fh) if not k.startswith("_")}
+        with open(self.CONFIG_TS) as fh:
+            ts = fh.read()
+        block = ts[ts.index("const known = new Set(["):]
+        block = block[:block.index("]);")]
+        known = set(re.findall(r"'([a-z_]+)'", block))
+        self.assertEqual(example, known)
+
+    def test_leak_check_knows_the_live_identifiers(self):
+        with open(os.path.join(HERE, "bin", "leak-check.sh")) as fh:
+            sh = fh.read()
+        for key in ("live_iot_endpoint", "live_cert_id", "live_api_domain"):
+            self.assertIn(f'"{key}"', sh)
+
+
 if __name__ == "__main__":
     unittest.main()

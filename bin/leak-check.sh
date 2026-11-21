@@ -56,7 +56,8 @@ except Exception:
 out = []
 for key in ("account_id", "bucket", "domain", "auth_domain_prefix",
             "certificate_arn", "google_client_id",
-            "cognito_user_pool_id", "cognito_client_id"):
+            "cognito_user_pool_id", "cognito_client_id",
+            "live_iot_endpoint", "live_cert_id", "live_api_domain"):
     v = d.get(key)
     if not isinstance(v, str) or not v.strip():
         continue
@@ -67,6 +68,15 @@ for key in ("account_id", "bucket", "domain", "auth_domain_prefix",
         v = v.rsplit("/", 1)[-1].split("-")[0]
     elif key == "google_client_id":
         v = v.split("-")[0]
+    elif key == "live_iot_endpoint":
+        # The account's endpoint prefix; "-ats.iot.<region>.amazonaws.com" is generic.
+        v = v.split("-ats.")[0]
+    elif key == "live_cert_id":
+        # 64 hex. Sixteen of them are as identifying and survive being truncated in a log.
+        v = v[:16]
+    elif key == "live_api_domain":
+        # The API id, the first label of <id>.execute-api.<region>.amazonaws.com.
+        v = v.split(".")[0]
     elif key == "domain":
         # The registrable parent too: a leak of "muxu.nz" matters as much as the subdomain.
         parts = v.split(".")

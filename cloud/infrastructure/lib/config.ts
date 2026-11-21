@@ -29,6 +29,19 @@ export interface CloudConfig {
 	// auth-stack.ts for why a Lambda@Edge cannot be told them any other way.
 	cognitoUserPoolId: string;
 	cognitoClientId: string;
+	// The live stream (live-stack.ts). All optional: with no live_region, SigenLive is not
+	// synthesized at all and the five stacks above are exactly what they were.
+	liveRegion: string;
+	// Both exist before any stack does -- the endpoint is the account's, the certificate is
+	// created by hand so its private key never passes through CloudFormation -- which is what
+	// lets them be literals here rather than cross-stack references.
+	liveIotEndpoint: string;
+	liveCertId: string;
+	// The one switch between "anyone may watch" and "only the allowlist may". It moves the
+	// page gate, the API gate and the API's own authorizer together; see live-stack.ts.
+	livePublic: boolean;
+	// Fallback only, for if the cross-region reference ever fails to resolve.
+	liveApiDomain: string;
 }
 
 const ROOT = path.resolve(__dirname, '../../..');
@@ -64,6 +77,7 @@ export function load(): CloudConfig {
 		'account_id', 'region', 'profile', 'domain', 'bucket', 'certificate_arn',
 		'capture_tz', 'google_client_id', 'auth_domain_prefix', 'allowed_emails',
 		'cognito_user_pool_id', 'cognito_client_id',
+		'live_region', 'live_iot_endpoint', 'live_cert_id', 'live_public', 'live_api_domain',
 	]);
 	const unknown = Object.keys(raw).filter((k) => !k.startsWith('_') && !known.has(k));
 	if (unknown.length) {
@@ -123,6 +137,27 @@ export function load(): CloudConfig {
 		);
 	}
 
+	const liveRegion = opt(raw, 'live_region');
+	if (liveRegion && !/^[a-z]{2}(-[a-z]+)+-\d$/.test(liveRegion)) {
+		fail(`live_region ${liveRegion} is not a region name like "ap-southeast-2"`);
+	}
+	const liveIotEndpoint = opt(raw, 'live_iot_endpoint');
+	// The ATS endpoint, host only. The legacy VeriSign endpoint (no -ats) presents a chain the
+	// system trust store on the Pi and in a browser no longer accepts.
+	if (liveIotEndpoint && !new RegExp(`^[a-z0-9]+-ats\\.iot\\.${liveRegion || '[a-z0-9-]+'}`
+		+ `\\.amazonaws\\.com$`).test(liveIotEndpoint)) {
+		fail(`live_iot_endpoint ${liveIotEndpoint} is not an ATS data endpoint in live_region ` +
+			`(aws iot describe-endpoint --endpoint-type iot:Data-ATS --region ${liveRegion || '<live_region>'})`);
+	}
+	const liveCertId = opt(raw, 'live_cert_id');
+	if (liveCertId && !/^[0-9a-f]{64}$/.test(liveCertId)) {
+		fail(`live_cert_id ${liveCertId} is not an IoT certificate id (64 hex characters)`);
+	}
+	const livePublic = raw['live_public'];
+	if (livePublic !== undefined && typeof livePublic !== 'boolean') {
+		fail('live_public must be true or false');
+	}
+
 	return {
 		accountId,
 		region: str('region'),
@@ -138,6 +173,12 @@ export function load(): CloudConfig {
 		allowedEmails: (emails as string[]).map((e) => e.trim().toLowerCase()).filter(Boolean),
 		cognitoUserPoolId: opt(raw, 'cognito_user_pool_id'),
 		cognitoClientId: opt(raw, 'cognito_client_id'),
+		liveRegion,
+		liveIotEndpoint,
+		liveCertId,
+		// Public unless said otherwise: that is the state the live view launches in.
+		livePublic: livePublic === undefined ? true : livePublic as boolean,
+		liveApiDomain: opt(raw, 'live_api_domain'),
 	};
 }
 

@@ -21,6 +21,10 @@
  * SigenAudit is outside that sequence on purpose: it references nothing and nothing
  * references it, so it can go at any point.
  *
+ * SigenLive is the one exception to "every stack is in us-east-1": it is in live_region,
+ * for latency to the house, and exists only once live_region is set in cloud.json. It needs
+ * its own `cdk bootstrap aws://<account>/<live_region>` first. See lib/live-stack.ts.
+ *
  * Steps 2 and 3 are separate because a Lambda@Edge cannot have environment variables and
  * asset bundling happens before CloudFormation resolves tokens; auth-stack.ts explains it
  * at length. Step 2 needs the Google client secret:
@@ -34,6 +38,7 @@ import { DataStack } from '../lib/data-stack';
 import { AuditStack } from '../lib/audit-stack';
 import { AuthPoolStack, AuthEdgeStack } from '../lib/auth-stack';
 import { SiteStack } from '../lib/site-stack';
+import { LiveStack } from '../lib/live-stack';
 
 const cfg = load();
 const app = new cdk.App();
@@ -57,6 +62,16 @@ new AuditStack(app, 'SigenAudit', {
 	...commonProps, cfg,
 	description: 'CloudTrail management-event trail and its log bucket',
 });
+
+// The live stream, in its own region. Its own env, and the same tags.
+if (cfg.liveRegion) {
+	new LiveStack(app, 'SigenLive', {
+		env: { account: cfg.accountId, region: cfg.liveRegion },
+		tags: commonProps.tags,
+		cfg,
+		description: 'Live stream: IoT policy and rule, the five-minute table',
+	});
+}
 
 const pool = new AuthPoolStack(app, 'SigenAuthPool', {
 	...commonProps, cfg,
