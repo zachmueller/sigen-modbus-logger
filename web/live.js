@@ -148,6 +148,15 @@
   for (const b of document.querySelectorAll('#layout button')) {
     b.addEventListener('click', () => setLayout(b.dataset.layout));
   }
+
+  // Where a sticky chart heading stops: just under the page header, whose height changes when
+  // it wraps on a narrow screen. Kept current rather than guessed in CSS.
+  const topbar = document.querySelector('.topbar');
+  function syncTopbar() {
+    if (topbar) document.documentElement.style.setProperty('--topbar-h', topbar.offsetHeight + 'px');
+  }
+  syncTopbar();
+  if (window.ResizeObserver && topbar) new ResizeObserver(syncTopbar).observe(topbar);
   setLayout(layout);
 
   function redraw() {

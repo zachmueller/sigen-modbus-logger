@@ -1317,6 +1317,20 @@ class TestTheLivePage(unittest.TestCase):
             css = fh.read()
         self.assertIn('.live-page[data-layout="column"] main { max-width: none; }', css)
 
+    def test_in_the_column_a_charts_heading_stays_in_view_while_its_plot_does(self):
+        with open(os.path.join(HERE, "web", "live.css")) as fh:
+            css = fh.read()
+        rule = css[css.index(".live-grid.column .live-card .card-head {"):]
+        rule = rule[:rule.index("}")]
+        self.assertIn("position: sticky;", rule)
+        self.assertIn("top: var(--topbar-h", rule, "it must stop under the page header, not behind it")
+        self.assertIn("background: var(--surface-1);", rule, "the plot must not show through it")
+        # Sticky only in the column; a grid tile is short enough not to need it.
+        self.assertNotRegex(css, r"(?m)^\.live-card \.card-head \{[^}]*position: sticky")
+        js = self.code_of(os.path.join(HERE, "web", "live.js"))
+        self.assertIn("setProperty('--topbar-h', topbar.offsetHeight + 'px')", js)
+        self.assertIn("new ResizeObserver(syncTopbar).observe(topbar)", js)
+
     def test_charts_are_sized_after_every_card_exists_and_follow_their_card(self):
         # Built one by one, the first chart took its width from a grid holding one card --
         # the whole row -- and was then squeezed, text and all, to a third of it.

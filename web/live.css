@@ -19,6 +19,21 @@
 .live-page[data-layout="column"] main { max-width: none; }
 .live-grid.column { grid-template-columns: 1fr; }
 .live-grid.column .chart-svg .tick { font-size: 12px; }
+/* In the column, each chart's name and value stay in view while any of its plot is on screen:
+   sticky within its own card, so it rides just under the page header and leaves with the card
+   once the plot has scrolled past. The negative margin and matching padding let it cover the
+   card's top padding, so the plot never shows through above it; --topbar-h is set by live.js,
+   because the header wraps to a different height on narrow screens. */
+.live-grid.column .live-card .card-head {
+  position: sticky;
+  top: var(--topbar-h, 64px);
+  z-index: 5;
+  background: var(--surface-1);
+  margin: -0.7rem -0.85rem 0;
+  padding: 0.7rem 0.85rem 0.45rem;
+  border-bottom: 1px solid var(--grid);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
 .live-grid.column .now-val { font-size: 1.25rem; }
 
 .live-card .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
